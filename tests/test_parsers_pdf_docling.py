@@ -69,6 +69,16 @@ class FakePdfDoc:
         return None
 
 
+class CountingLoadPagePdfDoc(FakePdfDoc):
+    def __init__(self, **kwargs) -> None:  # noqa: ANN003
+        super().__init__(**kwargs)
+        self.load_page_calls = 0
+
+    def load_page(self, _idx: int) -> FakeRenderedPage:
+        self.load_page_calls += 1
+        return FakeRenderedPage()
+
+
 class FakeDocument:
     def __init__(self, markdown: str) -> None:
         self._markdown = markdown
@@ -248,6 +258,31 @@ def test_docling_parse_success(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) 
     assert parsed.metadata["formula_markers_total"] == 0
 
 
+def test_docling_parse_skips_page_loading_without_formula_markers(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    parser = DoclingPdfParser()
+    pdf = tmp_path / "no_formula.pdf"
+    pdf.write_bytes(b"pdf")
+
+    install_fake_docling(monkeypatch, SuccessfulConverter)
+    fake_doc = CountingLoadPagePdfDoc(
+        title="No Formula PDF",
+        page_count=5,
+        toc=[[1, "Intro", 1], [2, "Method", 3]],
+        page_texts=["a", "b", "c", "d", "e"],
+    )
+    monkeypatch.setattr(
+        "mcp_ebook_read.parsers.pdf_docling.fitz.open",
+        lambda _path: fake_doc,
+    )
+
+    parsed = parser.parse(str(pdf), "doc-no-formula")
+
+    assert parsed.metadata["formula_markers_total"] == 0
+    assert fake_doc.load_page_calls == 0
+
+
 def test_docling_parse_replaces_formula_marker(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -284,6 +319,33 @@ def test_docling_parse_replaces_formula_marker(
     assert parsed.metadata["formula_replaced_by_pix2text"] == 1
     assert "<!-- formula-not-decoded -->" not in parsed.chunks[0].text
     assert r"\frac{a}{b}" in parsed.chunks[0].text
+
+
+def test_docling_parse_formula_fallback_uses_page_text(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    parser = DoclingPdfParser()
+    pdf = tmp_path / "formula_fallback.pdf"
+    pdf.write_bytes(b"pdf")
+
+    install_fake_docling(monkeypatch, FormulaConverter)
+    install_fake_pix2text(monkeypatch, outputs=[])
+    monkeypatch.setattr(
+        "mcp_ebook_read.parsers.pdf_docling.fitz.open",
+        lambda _path: FakePdfDoc(
+            title="Formula Fallback PDF",
+            page_count=2,
+            toc=[[1, "Intro", 1]],
+            page_texts=["x(t) = sin(t)", "plain text"],
+        ),
+    )
+
+    parsed = parser.parse(str(pdf), "doc-formula-fallback")
+
+    assert parsed.metadata["formula_markers_total"] == 1
+    assert parsed.metadata["formula_replaced_by_pix2text"] == 0
+    assert parsed.metadata["formula_replaced_by_fallback"] == 1
+    assert "Formula fallback text" in parsed.chunks[0].text
 
 
 def test_docling_parse_formula_engine_missing_fails_fast(

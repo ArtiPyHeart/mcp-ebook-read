@@ -53,7 +53,8 @@ If startup preflight fails, the server exits with a structured error payload on 
 - Use `search_in_outline_node` when you need chapter-scoped retrieval (recommended for reading workflows).
 - Use `read_outline_node` to read a chapter/outline node directly without locator stitching.
 - Use `render_pdf_page` for PDF evidence rendering.
-- Use `pdf_list_images` to list extracted PDF figure/table images (optionally scoped to one outline node).
+- PDF image extraction is on-demand: ingest does not pre-extract PDF images.
+- Use `pdf_list_images` to trigger/list extracted PDF figure/table images (optionally scoped to one outline node).
 - Use `pdf_read_image` to get one extracted PDF image path plus nearby text context.
 - Use `epub_list_images` to list extracted EPUB images (optionally scoped to one outline node).
 - Use `epub_read_image` to get one EPUB image path plus nearby text context.
@@ -68,7 +69,7 @@ If startup preflight fails, the server exits with a structured error payload on 
 - Optional formula env controls:
   - `DOCLING_FORMULA_ENRICHMENT` (`true` by default)
   - `PDF_FORMULA_REQUIRE_ENGINE` (`true` by default)
-  - `PDF_FORMULA_BATCH_SIZE` (`1` by default)
+  - `PDF_FORMULA_BATCH_SIZE` (`auto` by default; auto-detected from CPU and memory, or set an explicit integer)
 - Sidecar cleanup is explicit:
   - `library_scan` no longer triggers threshold-based auto compaction.
   - Use `storage_cleanup_sidecars(..., compact_catalog=true)` when you want compaction.

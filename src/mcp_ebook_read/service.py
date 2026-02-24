@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 from collections import defaultdict
+import json
 import hashlib
 import logging
 import os
 import shutil
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -62,6 +65,70 @@ class AppService:
         }
         self._doc_catalog_index: dict[str, str] = {}
 
+    @staticmethod
+    def _detect_total_memory_bytes() -> int | None:
+        try:
+            page_size = int(os.sysconf("SC_PAGE_SIZE"))
+            pages = int(os.sysconf("SC_PHYS_PAGES"))
+            if page_size > 0 and pages > 0:
+                return page_size * pages
+        except (AttributeError, ValueError, OSError):
+            pass
+
+        if sys.platform == "darwin":
+            try:
+                output = subprocess.check_output(
+                    ["sysctl", "-n", "hw.memsize"],
+                    text=True,
+                ).strip()
+                memory_bytes = int(output)
+                if memory_bytes > 0:
+                    return memory_bytes
+            except (subprocess.SubprocessError, ValueError):
+                pass
+
+        return None
+
+    @classmethod
+    def _auto_formula_batch_size(cls) -> int:
+        cpu_count = max(1, os.cpu_count() or 1)
+        cpu_limit = min(cpu_count, 32)
+        memory_bytes = cls._detect_total_memory_bytes()
+        if memory_bytes is None:
+            memory_limit = min(cpu_limit, 8)
+        else:
+            memory_gib = memory_bytes / (1024**3)
+            memory_limit = max(1, int(memory_gib // 1.5))
+            memory_limit = min(memory_limit, 16)
+        return max(1, min(cpu_limit, memory_limit))
+
+    @classmethod
+    def _resolve_formula_batch_size(cls) -> int:
+        raw_value = os.environ.get("PDF_FORMULA_BATCH_SIZE")
+        if raw_value is None or not raw_value.strip():
+            return cls._auto_formula_batch_size()
+
+        normalized = raw_value.strip().lower()
+        if normalized == "auto":
+            return cls._auto_formula_batch_size()
+
+        try:
+            batch_size = int(raw_value)
+        except ValueError as exc:
+            raise AppError(
+                ErrorCode.STARTUP_DEPENDENCY_NOT_READY,
+                "PDF_FORMULA_BATCH_SIZE must be a positive integer or 'auto'.",
+                details={"env": "PDF_FORMULA_BATCH_SIZE", "value": raw_value},
+            ) from exc
+
+        if batch_size < 1:
+            raise AppError(
+                ErrorCode.STARTUP_DEPENDENCY_NOT_READY,
+                "PDF_FORMULA_BATCH_SIZE must be >= 1.",
+                details={"env": "PDF_FORMULA_BATCH_SIZE", "value": raw_value},
+            )
+        return batch_size
+
     @classmethod
     def from_env(cls) -> "AppService":
         bootstrap_data_dir = (Path.cwd() / ".mcp-ebook-read").resolve()
@@ -113,6 +180,19 @@ class AppService:
                 }
             )
 
+        try:
+            formula_batch_size = cls._resolve_formula_batch_size()
+        except AppError as exc:
+            preflight_errors.append(
+                {
+                    "component": "config",
+                    "code": exc.code,
+                    "message": exc.message,
+                    "details": exc.details or None,
+                }
+            )
+            formula_batch_size = 1
+
         if preflight_errors:
             raise AppError(
                 ErrorCode.STARTUP_DEPENDENCY_NOT_READY,
@@ -143,7 +223,7 @@ class AppService:
                     "DOCLING_FORMULA_ENRICHMENT", True
                 ),
                 require_formula_engine=env_bool("PDF_FORMULA_REQUIRE_ENGINE", True),
-                formula_batch_size=int(os.environ.get("PDF_FORMULA_BATCH_SIZE", "1")),
+                formula_batch_size=formula_batch_size,
             ),
             pdf_image_extractor=PdfImageExtractor(min_area_ratio=0.01),
             grobid_client=grobid_client,
@@ -468,16 +548,14 @@ class AppService:
                     images=parsed.images,
                     target_dir=workspace_dir / "assets" / "epub-images",
                 )
-            elif doc.type == DocumentType.PDF and self.pdf_image_extractor is not None:
+            elif doc.type == DocumentType.PDF:
                 pdf_image_dir = workspace_dir / "assets" / "pdf-images"
                 if pdf_image_dir.exists():
                     shutil.rmtree(pdf_image_dir)
-                image_records = self.pdf_image_extractor.extract(
-                    pdf_path=doc.path,
-                    doc_id=doc.doc_id,
-                    chunks=parsed.chunks,
-                    out_dir=pdf_image_dir,
-                )
+                parsed.metadata = {
+                    **parsed.metadata,
+                    "pdf_images_extraction_mode": "on_demand",
+                }
             catalog.replace_images(doc.doc_id, image_records)
             self.vector_index.rebuild_document(doc.doc_id, parsed.title, parsed.chunks)
             catalog.save_document_parse_output(
@@ -789,6 +867,67 @@ class AppService:
             "height": image.height,
         }
 
+    def _pdf_images_manifest_path(self, workspace_dir: Path) -> Path:
+        return workspace_dir / "assets" / "pdf-images" / ".extracted.json"
+
+    def _ensure_pdf_images_extracted(
+        self,
+        *,
+        doc: DocumentRecord,
+        catalog: CatalogStore,
+        force: bool = False,
+    ) -> list[ImageRecord]:
+        workspace_dir = self._doc_workspace_dir(doc, catalog)
+        images_dir = workspace_dir / "assets" / "pdf-images"
+        manifest_path = self._pdf_images_manifest_path(workspace_dir)
+
+        if force:
+            if images_dir.exists():
+                shutil.rmtree(images_dir)
+            catalog.replace_images(doc.doc_id, [])
+
+        existing_images = catalog.list_images(doc.doc_id)
+        if existing_images and not force:
+            return existing_images
+        if manifest_path.exists() and not force:
+            return existing_images
+        if self.pdf_image_extractor is None:
+            return existing_images
+
+        chunks = catalog.list_chunks(doc.doc_id)
+        if not chunks:
+            raise AppError(
+                ErrorCode.READ_IMAGE_NOT_FOUND,
+                "PDF images are unavailable because the document has no parsed chunks.",
+                details={
+                    "doc_id": doc.doc_id,
+                    "hint": "Run document_ingest_pdf_book or document_ingest_pdf_paper first.",
+                },
+            )
+
+        if images_dir.exists():
+            shutil.rmtree(images_dir)
+
+        extracted_images = self.pdf_image_extractor.extract(
+            pdf_path=doc.path,
+            doc_id=doc.doc_id,
+            chunks=chunks,
+            out_dir=images_dir,
+        )
+        catalog.replace_images(doc.doc_id, extracted_images)
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        manifest_path.write_text(
+            json.dumps(
+                {
+                    "doc_id": doc.doc_id,
+                    "images_count": len(extracted_images),
+                },
+                ensure_ascii=True,
+            ),
+            encoding="utf-8",
+        )
+        return extracted_images
+
     def epub_list_images(
         self,
         *,
@@ -896,6 +1035,7 @@ class AppService:
         limit: int,
     ) -> dict[str, Any]:
         doc, catalog = self._ensure_pdf_doc(doc_id)
+        self._ensure_pdf_images_extracted(doc=doc, catalog=catalog)
         images = catalog.list_images(doc_id)
 
         node_payload: dict[str, Any] | None = None
@@ -931,6 +1071,7 @@ class AppService:
 
     def pdf_read_image(self, *, doc_id: str, image_id: str) -> dict[str, Any]:
         doc, catalog = self._ensure_pdf_doc(doc_id)
+        self._ensure_pdf_images_extracted(doc=doc, catalog=catalog)
         image = catalog.get_image(image_id)
         if image is None or image.doc_id != doc_id:
             raise AppError(
@@ -945,11 +1086,21 @@ class AppService:
 
         image_path = Path(image.file_path)
         if not image_path.exists():
-            raise AppError(
-                ErrorCode.READ_IMAGE_NOT_FOUND,
-                f"Image file does not exist: {image.file_path}",
-                details={"doc_id": doc_id, "image_id": image_id},
-            )
+            self._ensure_pdf_images_extracted(doc=doc, catalog=catalog, force=True)
+            image = catalog.get_image(image_id)
+            if image is None or image.doc_id != doc_id:
+                raise AppError(
+                    ErrorCode.READ_IMAGE_NOT_FOUND,
+                    f"Unknown image_id: {image_id}",
+                    details={"doc_id": doc_id, "image_id": image_id},
+                )
+            image_path = Path(image.file_path)
+            if not image_path.exists():
+                raise AppError(
+                    ErrorCode.READ_IMAGE_NOT_FOUND,
+                    f"Image file does not exist: {image.file_path}",
+                    details={"doc_id": doc_id, "image_id": image_id},
+                )
 
         chunks = catalog.list_chunks(doc_id)
         matched_chunk: ChunkRecord | None = None

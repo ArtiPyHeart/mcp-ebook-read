@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import re
 from pathlib import Path
+from typing import Any
 
 import fitz
 
@@ -29,8 +30,11 @@ class PdfImageExtractor:
                 return chunk.section_path
         return []
 
-    def _caption_for_rect(self, page: fitz.Page, rect: fitz.Rect) -> str | None:
-        blocks = page.get_text("blocks")
+    def _caption_for_rect(
+        self,
+        blocks: list[tuple[Any, ...]],
+        rect: fitz.Rect,
+    ) -> str | None:
         candidates: list[tuple[float, str]] = []
         for block in blocks:
             if len(block) < 5:
@@ -76,6 +80,7 @@ class PdfImageExtractor:
         out_dir.mkdir(parents=True, exist_ok=True)
         records: list[ImageRecord] = []
         seen_rects: set[tuple[int, float, float, float, float]] = set()
+        section_cache: dict[int, list[str]] = {}
         order_index = 0
 
         with fitz.open(pdf_path) as pdf_doc:
@@ -84,6 +89,11 @@ class PdfImageExtractor:
                 page_num = page_index + 1
                 page_area = max(page.rect.width * page.rect.height, 1.0)
                 images = page.get_images(full=True)
+                caption_blocks = page.get_text("blocks")
+                if page_num not in section_cache:
+                    section_cache[page_num] = self._section_path_for_page(
+                        chunks, page_num
+                    )
 
                 for image_idx, image_info in enumerate(images):
                     if not image_info:
@@ -141,9 +151,7 @@ class PdfImageExtractor:
                                 image_id=image_id,
                                 doc_id=doc_id,
                                 order_index=order_index,
-                                section_path=self._section_path_for_page(
-                                    chunks, page_num
-                                ),
+                                section_path=section_cache[page_num],
                                 page=page_num,
                                 bbox=[
                                     round(float(clip.x0), 2),
@@ -151,7 +159,7 @@ class PdfImageExtractor:
                                     round(float(clip.x1), 2),
                                     round(float(clip.y1), 2),
                                 ],
-                                caption=self._caption_for_rect(page, clip),
+                                caption=self._caption_for_rect(caption_blocks, clip),
                                 media_type="image/png",
                                 file_path=str(output_path),
                                 width=pix.width,

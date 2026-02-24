@@ -51,6 +51,12 @@ def test_from_env_startup_preflight_success(
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("QDRANT_URL", "http://127.0.0.1:6333")
     monkeypatch.setenv("GROBID_URL", "http://127.0.0.1:8070")
+    monkeypatch.delenv("PDF_FORMULA_BATCH_SIZE", raising=False)
+    monkeypatch.setattr(
+        AppService,
+        "_auto_formula_batch_size",
+        classmethod(lambda cls: 7),
+    )
     monkeypatch.setattr(
         "mcp_ebook_read.service.QdrantVectorIndex.from_env",
         lambda **_kwargs: vector,
@@ -65,6 +71,35 @@ def test_from_env_startup_preflight_success(
     assert service.vector_index is vector
     assert service.grobid_client is grobid
     assert service.data_dir == (tmp_path / ".mcp-ebook-read").resolve()
+    assert service.pdf_parser.formula_extractor.batch_size == 7
+
+
+def test_from_env_formula_batch_size_env_override(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    vector = ReadyVectorIndex()
+    grobid = ReadyGrobid()
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("QDRANT_URL", "http://127.0.0.1:6333")
+    monkeypatch.setenv("GROBID_URL", "http://127.0.0.1:8070")
+    monkeypatch.setenv("PDF_FORMULA_BATCH_SIZE", "3")
+    monkeypatch.setattr(
+        AppService,
+        "_auto_formula_batch_size",
+        classmethod(lambda cls: 9),
+    )
+    monkeypatch.setattr(
+        "mcp_ebook_read.service.QdrantVectorIndex.from_env",
+        lambda **_kwargs: vector,
+    )
+    monkeypatch.setattr(
+        "mcp_ebook_read.service.GrobidClient.from_env",
+        lambda: grobid,
+    )
+
+    service = AppService.from_env()
+    assert service.pdf_parser.formula_extractor.batch_size == 3
 
 
 def test_from_env_startup_preflight_aggregates_failures(
@@ -102,3 +137,31 @@ def test_from_env_startup_preflight_aggregates_failures(
     assert required_env["QDRANT_URL"] == "http://127.0.0.1:6333"
     assert required_env["GROBID_URL"] == "http://127.0.0.1:8070"
     assert "quick_start" in details
+
+
+def test_from_env_invalid_formula_batch_size_fails_preflight(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    vector = ReadyVectorIndex()
+    grobid = ReadyGrobid()
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("QDRANT_URL", "http://127.0.0.1:6333")
+    monkeypatch.setenv("GROBID_URL", "http://127.0.0.1:8070")
+    monkeypatch.setenv("PDF_FORMULA_BATCH_SIZE", "0")
+    monkeypatch.setattr(
+        "mcp_ebook_read.service.QdrantVectorIndex.from_env",
+        lambda **_kwargs: vector,
+    )
+    monkeypatch.setattr(
+        "mcp_ebook_read.service.GrobidClient.from_env",
+        lambda: grobid,
+    )
+
+    with pytest.raises(AppError) as exc:
+        AppService.from_env()
+
+    details = exc.value.details
+    failed_components = details.get("failed_components")
+    assert isinstance(failed_components, list)
+    assert any(item["component"] == "config" for item in failed_components)

@@ -8,7 +8,7 @@ import re
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import fitz
 from PIL import Image
@@ -517,7 +517,7 @@ class DoclingPdfParser:
         *,
         text: str,
         page_range: list[int],
-        page_texts: list[str],
+        get_page_text: Callable[[int], str],
         pdf_doc: fitz.Document,
         formula_cache: dict[int, list[_FormulaCandidate]],
         formula_offsets: dict[int, int],
@@ -541,12 +541,11 @@ class DoclingPdfParser:
                 start, end = page_range
                 fallback_lines: list[str] = []
                 for page in range(start, end + 1):
-                    if page < 1 or page > len(page_texts):
+                    page_text = get_page_text(page)
+                    if not page_text:
                         continue
                     fallback_lines.extend(
-                        _extract_formula_candidates_from_text(
-                            page_texts[page - 1], limit=2
-                        )
+                        _extract_formula_candidates_from_text(page_text, limit=2)
                     )
                     if fallback_lines:
                         break
@@ -596,7 +595,43 @@ class DoclingPdfParser:
             title = pdf_doc.metadata.get("title") or path.stem
             page_count = pdf_doc.page_count
             toc = pdf_doc.get_toc()
-            page_texts = [page.get_text("text") for page in pdf_doc]
+            page_text_cache: dict[int, str] = {}
+            iter_pages_cache: list[Any] | None = None
+
+            def get_page_text(page: int) -> str:
+                nonlocal iter_pages_cache
+                if page < 1 or page > page_count:
+                    return ""
+                cached = page_text_cache.get(page)
+                if cached is not None:
+                    return cached
+
+                text = ""
+                try:
+                    page_obj = pdf_doc.load_page(page - 1)
+                    get_text = getattr(page_obj, "get_text", None)
+                    if callable(get_text):
+                        text = str(get_text("text"))
+                except Exception:  # noqa: BLE001
+                    text = ""
+
+                if not text:
+                    if iter_pages_cache is None:
+                        try:
+                            iter_pages_cache = list(pdf_doc)
+                        except Exception:  # noqa: BLE001
+                            iter_pages_cache = []
+                    index = page - 1
+                    if index < len(iter_pages_cache):
+                        get_text = getattr(iter_pages_cache[index], "get_text", None)
+                        if callable(get_text):
+                            try:
+                                text = str(get_text("text"))
+                            except Exception:  # noqa: BLE001
+                                text = ""
+
+                page_text_cache[page] = text
+                return text
 
             outline = _build_outline_from_toc(toc, page_count)
             pages_by_title = _build_toc_page_index(outline)
@@ -615,7 +650,7 @@ class DoclingPdfParser:
                 enhanced_text, section_stats = self._replace_formula_markers(
                     text=section.text,
                     page_range=page_range,
-                    page_texts=page_texts,
+                    get_page_text=get_page_text,
                     pdf_doc=pdf_doc,
                     formula_cache=formula_cache,
                     formula_offsets=formula_offsets,

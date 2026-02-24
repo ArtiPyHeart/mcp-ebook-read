@@ -85,6 +85,36 @@ class RecordingGrobid:
         return Result(self.metadata, self.outline)
 
 
+class RecordingPdfImageExtractor:
+    def __init__(self, images: list[ImageRecord] | None = None) -> None:
+        self.images = images or []
+        self.calls: list[dict[str, Any]] = []
+
+    def extract(
+        self,
+        *,
+        pdf_path: str,
+        doc_id: str,
+        chunks: list[ChunkRecord],
+        out_dir: Path,
+    ) -> list[ImageRecord]:
+        self.calls.append(
+            {
+                "pdf_path": pdf_path,
+                "doc_id": doc_id,
+                "chunks_count": len(chunks),
+                "out_dir": str(out_dir),
+            }
+        )
+        out_dir.mkdir(parents=True, exist_ok=True)
+        generated: list[ImageRecord] = []
+        for image in self.images:
+            image_path = out_dir / f"{image.image_id}.png"
+            image_path.write_bytes(b"\x89PNG")
+            generated.append(image.model_copy(update={"file_path": str(image_path)}))
+        return generated
+
+
 def _chunk(
     doc_id: str, chunk_id: str, idx: int, method: str = "docling"
 ) -> ChunkRecord:
@@ -136,6 +166,7 @@ def _build_service(
     epub_parser: RecordingParser,
     grobid: RecordingGrobid,
     vector: RecordingVectorIndex | None = None,
+    pdf_image_extractor: RecordingPdfImageExtractor | None = None,
 ) -> AppService:
     sidecar_dir = tmp_path / ".mcp-ebook-read"
     return AppService(
@@ -144,6 +175,7 @@ def _build_service(
         sidecar_dir_name=".mcp-ebook-read",
         vector_index=vector or RecordingVectorIndex(),
         pdf_parser=pdf_parser,
+        pdf_image_extractor=pdf_image_extractor,
         grobid_client=grobid,
         epub_parser=epub_parser,
     )
@@ -955,6 +987,60 @@ def test_pdf_list_images_and_read_image(tmp_path: Path) -> None:
     assert read["image"]["caption"] == "Figure 1: A"
     assert read["context"] is not None
     assert "context A" in read["context"]["text"]
+
+
+def test_pdf_images_are_extracted_on_demand(tmp_path: Path) -> None:
+    doc_id = "doc-pdf-lazy-images"
+    pdf_path = tmp_path / "lazy.pdf"
+    pdf_path.write_bytes(b"pdf")
+
+    extractor = RecordingPdfImageExtractor(
+        images=[
+            ImageRecord(
+                image_id="lazy-img-1",
+                doc_id=doc_id,
+                order_index=0,
+                section_path=["S0"],
+                page=1,
+                bbox=[1.0, 2.0, 3.0, 4.0],
+                caption="Figure Lazy",
+                media_type="image/png",
+                file_path="placeholder.png",
+                width=200,
+                height=100,
+                source="pdf-image-extractor",
+            )
+        ]
+    )
+    service = _build_service(
+        tmp_path,
+        pdf_parser=RecordingParser(
+            result=_parsed(doc_id, title="PDF Lazy", method="docling")
+        ),
+        epub_parser=RecordingParser(result=_parsed("x", title="X", method="ebooklib")),
+        grobid=RecordingGrobid(),
+        pdf_image_extractor=extractor,
+    )
+    _register_doc(service, doc_id, pdf_path, DocumentType.PDF)
+
+    ingest = service.document_ingest_pdf_book(doc_id=doc_id, path=None, force=True)
+    assert ingest["images_count"] == 0
+    assert extractor.calls == []
+
+    listed = service.pdf_list_images(doc_id=doc_id, node_id=None, limit=20)
+    assert listed["images_count"] == 1
+    assert listed["images"][0]["image_id"] == "lazy-img-1"
+    assert Path(listed["images"][0]["image_path"]).exists()
+    assert len(extractor.calls) == 1
+
+    read = service.pdf_read_image(doc_id=doc_id, image_id="lazy-img-1")
+    assert read["image"]["caption"] == "Figure Lazy"
+    assert len(extractor.calls) == 1
+
+    catalog = service._catalog_for_document_path(pdf_path)
+    workspace_dir = catalog.db_path.parent / "docs" / doc_id
+    marker = workspace_dir / "assets" / "pdf-images" / ".extracted.json"
+    assert marker.exists()
 
 
 def test_pdf_image_tools_errors(tmp_path: Path) -> None:
