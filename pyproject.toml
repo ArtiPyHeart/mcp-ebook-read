@@ -1,0 +1,46 @@
+[project]
+name = "mcp-ebook-read"
+version = "0.1.0"
+description = "MCP server for reading and searching EPUB/PDF documents"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+  "mcp>=1.13.0",
+  "pydantic>=2.11.7",
+  "httpx>=0.28.1",
+  "docling>=2.56.0",
+  "pix2text>=1.1.4",
+  "ebooklib>=0.19",
+  "lxml>=6.0.1",
+  "pymupdf>=1.26.3",
+  "qdrant-client[fastembed]>=1.15.1",
+  "fastembed>=0.7.3",
+]
+
+[project.scripts]
+mcp-ebook-read = "mcp_ebook_read.server:cli_entry"
+mcp-ebook-formula-benchmark = "mcp_ebook_read.benchmark.pdf_formula:main"
+
+[dependency-groups]
+dev = [
+  "ruff>=0.15.0",
+  "pytest>=8.4.1",
+]
+
+[build-system]
+requires = ["hatchling>=1.27.0"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mcp_ebook_read"]
+
+[tool.ruff]
+target-version = "py313"
+extend-exclude = ["extern"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+markers = [
+  "e2e: end-to-end integration tests requiring external services and sample docs",
+]
