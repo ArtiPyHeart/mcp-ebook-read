@@ -1,6 +1,6 @@
 [project]
 name = "mcp-ebook-read"
-version = "0.1.0rc2"
+version = "0.1.0rc3"
 description = "MCP server for reading and searching EPUB/PDF documents"
 readme = "README.md"
 requires-python = ">=3.13"
