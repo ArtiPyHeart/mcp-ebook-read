@@ -12,6 +12,7 @@ from mcp_ebook_read.schema.models import (
     DocumentStatus,
     DocumentType,
     ExtractedImage,
+    FormulaRecord,
     ImageRecord,
     Locator,
     OutlineNode,
@@ -137,12 +138,37 @@ def _chunk(
     )
 
 
+def _formula(
+    *,
+    doc_id: str,
+    formula_id: str,
+    chunk_id: str | None,
+    page: int | None,
+    bbox: list[float] | None,
+    latex: str,
+    status: str = "resolved",
+    source: str = "pix2text",
+) -> FormulaRecord:
+    return FormulaRecord(
+        formula_id=formula_id,
+        doc_id=doc_id,
+        chunk_id=chunk_id,
+        section_path=["S0"],
+        page=page,
+        bbox=bbox,
+        latex=latex,
+        source=source,
+        status=status,
+    )
+
+
 def _parsed(
     doc_id: str,
     *,
     title: str,
     method: str,
     images: list[ExtractedImage] | None = None,
+    formulas: list[FormulaRecord] | None = None,
     outline: list[OutlineNode] | None = None,
 ) -> ParsedDocument:
     chunks = [_chunk(doc_id, "c0", 0, method), _chunk(doc_id, "c1", 1, method)]
@@ -153,6 +179,7 @@ def _parsed(
         metadata={"source": method},
         outline=effective_outline,
         chunks=chunks,
+        formulas=formulas or [],
         images=images or [],
         reading_markdown="# Section\n\ntext",
         overall_confidence=0.9,
@@ -1070,6 +1097,158 @@ def test_pdf_image_tools_errors(tmp_path: Path) -> None:
     with pytest.raises(AppError) as missing_exc:
         service.pdf_read_image(doc_id=pdf_doc_id, image_id="missing")
     assert missing_exc.value.code == ErrorCode.READ_IMAGE_NOT_FOUND
+
+
+def test_pdf_book_formula_tools_list_and_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    doc_id = "doc-pdf-formulas-book"
+    pdf_path = tmp_path / "formula_book.pdf"
+    pdf_path.write_bytes(b"pdf")
+
+    parsed_pdf = _parsed(
+        doc_id,
+        title="Formula Book",
+        method="docling",
+        outline=[
+            OutlineNode(
+                id="toc-1", title="Chapter 1", level=1, page_start=1, page_end=5
+            )
+        ],
+        formulas=[
+            _formula(
+                doc_id=doc_id,
+                formula_id="f-book-1",
+                chunk_id="c0",
+                page=2,
+                bbox=[10.0, 20.0, 120.0, 80.0],
+                latex=r"\frac{a}{b}",
+                status="resolved",
+            )
+        ],
+    )
+    service = _build_service(
+        tmp_path,
+        pdf_parser=RecordingParser(result=parsed_pdf),
+        epub_parser=RecordingParser(result=_parsed("x", title="X", method="ebooklib")),
+        grobid=RecordingGrobid(),
+    )
+    _register_doc(service, doc_id, pdf_path, DocumentType.PDF)
+    service.document_ingest_pdf_book(doc_id=doc_id, path=None, force=True)
+
+    listed = service.pdf_book_list_formulas(
+        doc_id=doc_id, node_id=None, limit=20, status=None
+    )
+    assert listed["formulas_count"] == 1
+    assert listed["formulas"][0]["formula_id"] == "f-book-1"
+
+    monkeypatch.setattr(
+        "mcp_ebook_read.service.render_pdf_region",
+        lambda *_args, **_kwargs: (320, 120),
+    )
+    read = service.pdf_book_read_formula(doc_id=doc_id, formula_id="f-book-1")
+    assert read["formula"]["latex"] == r"\frac{a}{b}"
+    assert read["evidence"] is not None
+    assert read["evidence"]["type"] == "formula_region"
+    assert read["context"] is not None
+
+
+def test_pdf_paper_formula_tools_filter_by_node_and_status(tmp_path: Path) -> None:
+    doc_id = "doc-pdf-formulas-paper"
+    pdf_path = tmp_path / "formula_paper.pdf"
+    pdf_path.write_bytes(b"pdf")
+
+    parsed_pdf = _parsed(
+        doc_id,
+        title="Formula Paper",
+        method="docling",
+        outline=[
+            OutlineNode(
+                id="toc-intro", title="Intro", level=1, page_start=1, page_end=2
+            ),
+            OutlineNode(
+                id="toc-method", title="Method", level=1, page_start=3, page_end=6
+            ),
+        ],
+        formulas=[
+            _formula(
+                doc_id=doc_id,
+                formula_id="f-paper-1",
+                chunk_id="c0",
+                page=1,
+                bbox=[10.0, 20.0, 120.0, 80.0],
+                latex=r"a=b",
+                status="resolved",
+            ),
+            _formula(
+                doc_id=doc_id,
+                formula_id="f-paper-2",
+                chunk_id="c1",
+                page=4,
+                bbox=None,
+                latex="fallback formula",
+                status="fallback_text",
+                source="page_text_fallback",
+            ),
+        ],
+    )
+    service = _build_service(
+        tmp_path,
+        pdf_parser=RecordingParser(result=parsed_pdf),
+        epub_parser=RecordingParser(result=_parsed("x", title="X", method="ebooklib")),
+        grobid=RecordingGrobid(metadata={"paper_title": "Formula Paper"}),
+    )
+    _register_doc(service, doc_id, pdf_path, DocumentType.PDF)
+    service.document_ingest_pdf_paper(doc_id=doc_id, path=None, force=True)
+
+    method_only = service.pdf_paper_list_formulas(
+        doc_id=doc_id,
+        node_id="toc-method",
+        limit=20,
+        status="fallback_text",
+    )
+    assert method_only["formulas_count"] == 1
+    assert method_only["formulas"][0]["formula_id"] == "f-paper-2"
+
+
+def test_pdf_formula_tools_reject_profile_mismatch(tmp_path: Path) -> None:
+    doc_id = "doc-pdf-formulas-mismatch"
+    pdf_path = tmp_path / "formula_mismatch.pdf"
+    pdf_path.write_bytes(b"pdf")
+
+    service = _build_service(
+        tmp_path,
+        pdf_parser=RecordingParser(
+            result=_parsed(
+                doc_id,
+                title="Formula Mismatch",
+                method="docling",
+                formulas=[
+                    _formula(
+                        doc_id=doc_id,
+                        formula_id="f-mismatch-1",
+                        chunk_id="c0",
+                        page=1,
+                        bbox=[10.0, 20.0, 120.0, 80.0],
+                        latex="x",
+                    )
+                ],
+            )
+        ),
+        epub_parser=RecordingParser(result=_parsed("x", title="X", method="ebooklib")),
+        grobid=RecordingGrobid(),
+    )
+    _register_doc(service, doc_id, pdf_path, DocumentType.PDF)
+    service.document_ingest_pdf_book(doc_id=doc_id, path=None, force=True)
+
+    with pytest.raises(AppError) as exc:
+        service.pdf_paper_list_formulas(
+            doc_id=doc_id,
+            node_id=None,
+            limit=20,
+            status=None,
+        )
+    assert exc.value.code == ErrorCode.INGEST_UNSUPPORTED_TYPE
 
 
 def test_storage_delete_document_removes_catalog_vector_and_artifacts(

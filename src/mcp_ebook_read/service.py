@@ -19,13 +19,14 @@ from mcp_ebook_read.parsers.epub_ebooklib import EbooklibEpubParser
 from mcp_ebook_read.parsers.pdf_docling import DoclingPdfParser
 from mcp_ebook_read.parsers.pdf_grobid import GrobidClient
 from mcp_ebook_read.render.pdf_images import PdfImageExtractor
-from mcp_ebook_read.render.pdf_render import render_pdf_page
+from mcp_ebook_read.render.pdf_render import render_pdf_page, render_pdf_region
 from mcp_ebook_read.schema.models import (
     ChunkRecord,
     DocumentRecord,
     DocumentStatus,
     DocumentType,
     ExtractedImage,
+    FormulaRecord,
     ImageRecord,
     Locator,
     OutlineNode,
@@ -482,6 +483,7 @@ class AppService:
                 "chunks_count": len(
                     catalog.get_chunks_window(doc.doc_id, 0, 0, 1_000_000)
                 ),
+                "formulas_count": len(catalog.list_formulas(doc.doc_id)),
                 "images_count": len(catalog.list_images(doc.doc_id)),
                 "outline_depth": max((node.level for node in doc.outline), default=0),
                 "overall_confidence": doc.overall_confidence,
@@ -572,6 +574,7 @@ class AppService:
                 "profile": profile,
                 "parser_chain": parsed.parser_chain,
                 "chunks_count": len(parsed.chunks),
+                "formulas_count": len(parsed.formulas),
                 "images_count": len(image_records),
                 "outline_depth": max(
                     (node.level for node in parsed.outline), default=0
@@ -849,6 +852,36 @@ class AppService:
                 },
             )
         return doc, catalog
+
+    def _ensure_pdf_profile_doc(
+        self, doc_id: str, *, expected_profile: Profile
+    ) -> tuple[DocumentRecord, CatalogStore]:
+        doc, catalog = self._ensure_pdf_doc(doc_id)
+        if doc.profile != expected_profile:
+            raise AppError(
+                ErrorCode.INGEST_UNSUPPORTED_TYPE,
+                "The requested formula tool does not match the ingested PDF profile.",
+                details={
+                    "doc_id": doc_id,
+                    "doc_profile": doc.profile,
+                    "required_profile": expected_profile,
+                    "hint": "Use the matching document_ingest_pdf_book or document_ingest_pdf_paper before formula tools.",
+                },
+            )
+        return doc, catalog
+
+    def _formula_payload(self, formula: FormulaRecord) -> dict[str, Any]:
+        return {
+            "formula_id": formula.formula_id,
+            "chunk_id": formula.chunk_id,
+            "section_path": formula.section_path,
+            "page": formula.page,
+            "bbox": formula.bbox,
+            "latex": formula.latex,
+            "source": formula.source,
+            "confidence": formula.confidence,
+            "status": formula.status,
+        }
 
     def _image_payload(self, image: ImageRecord) -> dict[str, Any]:
         return {
@@ -1132,6 +1165,250 @@ class AppService:
             if matched_chunk
             else None,
         }
+
+    def _formula_matches_outline_node(
+        self,
+        *,
+        formula: FormulaRecord,
+        node: OutlineNode,
+    ) -> bool:
+        if formula.page is not None and self._page_ranges_overlap(
+            [formula.page, formula.page], node.page_start, node.page_end
+        ):
+            return True
+        node_title = node.title.strip().lower()
+        if not node_title:
+            return False
+        return any(node_title in part.strip().lower() for part in formula.section_path)
+
+    def _find_formula_context_chunk(
+        self,
+        *,
+        catalog: CatalogStore,
+        doc_id: str,
+        formula: FormulaRecord,
+    ) -> ChunkRecord | None:
+        if formula.chunk_id:
+            chunk = catalog.get_chunk(doc_id, formula.chunk_id)
+            if chunk is not None:
+                return chunk
+
+        chunks = catalog.list_chunks(doc_id)
+        if formula.page is not None:
+            for chunk in chunks:
+                if self._page_ranges_overlap(
+                    chunk.locator.page_range, formula.page, formula.page
+                ):
+                    return chunk
+
+        if formula.section_path:
+            target = formula.section_path[-1].strip().lower()
+            if target:
+                for chunk in chunks:
+                    if any(
+                        target in part.strip().lower() for part in chunk.section_path
+                    ):
+                        return chunk
+
+        return None
+
+    def _list_pdf_formulas(
+        self,
+        *,
+        doc_id: str,
+        node_id: str | None,
+        limit: int,
+        status: str | None,
+        expected_profile: Profile,
+    ) -> dict[str, Any]:
+        doc, catalog = self._ensure_pdf_profile_doc(
+            doc_id, expected_profile=expected_profile
+        )
+        formulas = catalog.list_formulas(doc_id)
+
+        normalized_status = (status or "").strip().lower()
+        if normalized_status:
+            allowed_statuses = {"resolved", "fallback_text", "unresolved"}
+            if normalized_status not in allowed_statuses:
+                raise AppError(
+                    ErrorCode.READ_FORMULA_NOT_FOUND,
+                    f"Unsupported formula status filter: {status}",
+                    details={
+                        "allowed_statuses": sorted(allowed_statuses),
+                        "received_status": status,
+                    },
+                )
+            formulas = [
+                item
+                for item in formulas
+                if item.status.strip().lower() == normalized_status
+            ]
+
+        node_payload: dict[str, Any] | None = None
+        if node_id:
+            _, node, _ = self._resolve_outline_node(doc_id, node_id)
+            node_payload = node.model_dump()
+            formulas = [
+                item
+                for item in formulas
+                if self._formula_matches_outline_node(formula=item, node=node)
+            ]
+
+        max_items = max(0, min(limit, 500))
+        truncated = len(formulas) > max_items
+        if truncated:
+            formulas = formulas[:max_items]
+
+        return {
+            "doc_title": doc.title,
+            "profile": expected_profile,
+            "node": node_payload,
+            "formulas": [self._formula_payload(item) for item in formulas],
+            "formulas_count": len(formulas),
+            "truncated": truncated,
+        }
+
+    def _read_pdf_formula(
+        self,
+        *,
+        doc_id: str,
+        formula_id: str,
+        expected_profile: Profile,
+    ) -> dict[str, Any]:
+        doc, catalog = self._ensure_pdf_profile_doc(
+            doc_id, expected_profile=expected_profile
+        )
+        formula = catalog.get_formula(formula_id)
+        if formula is None or formula.doc_id != doc_id:
+            raise AppError(
+                ErrorCode.READ_FORMULA_NOT_FOUND,
+                f"Unknown formula_id: {formula_id}",
+                details={
+                    "doc_id": doc_id,
+                    "formula_id": formula_id,
+                    "hint": "Call the corresponding pdf_*_list_formulas tool first.",
+                },
+            )
+
+        context_chunk = self._find_formula_context_chunk(
+            catalog=catalog, doc_id=doc_id, formula=formula
+        )
+
+        workspace_dir = self._doc_workspace_dir(doc, catalog)
+        evidence_path = (
+            workspace_dir / "evidence" / "formulas" / f"{formula.formula_id}.png"
+        )
+        evidence: dict[str, Any] | None = None
+
+        render_page = formula.page
+        if render_page is None and context_chunk and context_chunk.locator.page_range:
+            render_page = context_chunk.locator.page_range[0]
+
+        if render_page is not None:
+            if formula.bbox is not None:
+                try:
+                    width, height = render_pdf_region(
+                        doc.path,
+                        evidence_path,
+                        page=render_page,
+                        bbox=formula.bbox,
+                    )
+                    evidence = {
+                        "type": "formula_region",
+                        "image_path": str(evidence_path),
+                        "width": width,
+                        "height": height,
+                        "page": render_page,
+                        "bbox": formula.bbox,
+                    }
+                except AppError as exc:
+                    width, height = render_pdf_page(
+                        doc.path,
+                        evidence_path,
+                        page=render_page,
+                    )
+                    evidence = {
+                        "type": "page_fallback",
+                        "image_path": str(evidence_path),
+                        "width": width,
+                        "height": height,
+                        "page": render_page,
+                        "bbox": None,
+                        "fallback_reason": exc.message,
+                    }
+            else:
+                width, height = render_pdf_page(
+                    doc.path,
+                    evidence_path,
+                    page=render_page,
+                )
+                evidence = {
+                    "type": "page",
+                    "image_path": str(evidence_path),
+                    "width": width,
+                    "height": height,
+                    "page": render_page,
+                    "bbox": None,
+                }
+
+        return {
+            "doc_title": doc.title,
+            "profile": expected_profile,
+            "formula": self._formula_payload(formula),
+            "context": {
+                "text": context_chunk.text,
+                "locator": context_chunk.locator.model_dump(),
+            }
+            if context_chunk
+            else None,
+            "evidence": evidence,
+        }
+
+    def pdf_book_list_formulas(
+        self,
+        *,
+        doc_id: str,
+        node_id: str | None,
+        limit: int,
+        status: str | None,
+    ) -> dict[str, Any]:
+        return self._list_pdf_formulas(
+            doc_id=doc_id,
+            node_id=node_id,
+            limit=limit,
+            status=status,
+            expected_profile=Profile.BOOK,
+        )
+
+    def pdf_book_read_formula(self, *, doc_id: str, formula_id: str) -> dict[str, Any]:
+        return self._read_pdf_formula(
+            doc_id=doc_id,
+            formula_id=formula_id,
+            expected_profile=Profile.BOOK,
+        )
+
+    def pdf_paper_list_formulas(
+        self,
+        *,
+        doc_id: str,
+        node_id: str | None,
+        limit: int,
+        status: str | None,
+    ) -> dict[str, Any]:
+        return self._list_pdf_formulas(
+            doc_id=doc_id,
+            node_id=node_id,
+            limit=limit,
+            status=status,
+            expected_profile=Profile.PAPER,
+        )
+
+    def pdf_paper_read_formula(self, *, doc_id: str, formula_id: str) -> dict[str, Any]:
+        return self._read_pdf_formula(
+            doc_id=doc_id,
+            formula_id=formula_id,
+            expected_profile=Profile.PAPER,
+        )
 
     def get_outline(self, doc_id: str) -> dict[str, Any]:
         catalog = self._catalog_for_doc_id(doc_id)

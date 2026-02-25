@@ -16,6 +16,7 @@ from PIL import Image
 from mcp_ebook_read.errors import AppError, ErrorCode
 from mcp_ebook_read.schema.models import (
     ChunkRecord,
+    FormulaRecord,
     Locator,
     OutlineNode,
     ParsedDocument,
@@ -52,6 +53,16 @@ class _FormulaReplacementStats:
     replaced_by_engine: int = 0
     replaced_by_fallback: int = 0
     unresolved: int = 0
+
+
+@dataclass(slots=True)
+class _ResolvedFormula:
+    latex: str
+    page: int | None
+    bbox: list[float] | None
+    source: str
+    confidence: float | None
+    status: str
 
 
 def _sanitize_text(value: str) -> str:
@@ -521,12 +532,13 @@ class DoclingPdfParser:
         pdf_doc: fitz.Document,
         formula_cache: dict[int, list[_FormulaCandidate]],
         formula_offsets: dict[int, int],
-    ) -> tuple[str, _FormulaReplacementStats]:
+    ) -> tuple[str, _FormulaReplacementStats, list[_ResolvedFormula]]:
         stats = _FormulaReplacementStats(markers_total=text.count(_FORMULA_MARKER))
         if stats.markers_total == 0:
-            return text, stats
+            return text, stats, []
 
         replaced = text
+        formulas: list[_ResolvedFormula] = []
         for _ in range(stats.markers_total):
             candidate = self._pop_formula_candidate(
                 pdf_doc=pdf_doc,
@@ -537,9 +549,20 @@ class DoclingPdfParser:
             if candidate is not None:
                 replacement = self._format_formula_candidate(candidate)
                 stats.replaced_by_engine += 1
+                formulas.append(
+                    _ResolvedFormula(
+                        latex=candidate.latex,
+                        page=candidate.page,
+                        bbox=candidate.bbox,
+                        source=candidate.source,
+                        confidence=candidate.score,
+                        status="resolved",
+                    )
+                )
             else:
                 start, end = page_range
                 fallback_lines: list[str] = []
+                fallback_page: int | None = None
                 for page in range(start, end + 1):
                     page_text = get_page_text(page)
                     if not page_text:
@@ -548,6 +571,7 @@ class DoclingPdfParser:
                         _extract_formula_candidates_from_text(page_text, limit=2)
                     )
                     if fallback_lines:
+                        fallback_page = page
                         break
                 if fallback_lines:
                     replacement = "\n".join(
@@ -555,13 +579,33 @@ class DoclingPdfParser:
                         for line in fallback_lines[:2]
                     )
                     stats.replaced_by_fallback += 1
+                    formulas.append(
+                        _ResolvedFormula(
+                            latex="\n".join(fallback_lines[:2]),
+                            page=fallback_page,
+                            bbox=None,
+                            source="page_text_fallback",
+                            confidence=None,
+                            status="fallback_text",
+                        )
+                    )
                 else:
                     replacement = _UNRESOLVED_FORMULA
                     stats.unresolved += 1
+                    formulas.append(
+                        _ResolvedFormula(
+                            latex=_UNRESOLVED_FORMULA,
+                            page=start,
+                            bbox=None,
+                            source="unresolved",
+                            confidence=None,
+                            status="unresolved",
+                        )
+                    )
 
             replaced = replaced.replace(_FORMULA_MARKER, replacement, 1)
 
-        return replaced, stats
+        return replaced, stats, formulas
 
     def parse(self, pdf_path: str, doc_id: str) -> ParsedDocument:
         path = Path(pdf_path)
@@ -645,20 +689,24 @@ class DoclingPdfParser:
             formula_offsets: dict[int, int] = {}
             formula_stats = _FormulaReplacementStats()
             enhanced_sections: list[_SectionBlock] = []
+            section_formulas: list[list[_ResolvedFormula]] = []
 
             for section, page_range in zip(sections, page_ranges, strict=True):
-                enhanced_text, section_stats = self._replace_formula_markers(
-                    text=section.text,
-                    page_range=page_range,
-                    get_page_text=get_page_text,
-                    pdf_doc=pdf_doc,
-                    formula_cache=formula_cache,
-                    formula_offsets=formula_offsets,
+                enhanced_text, section_stats, recovered_formulas = (
+                    self._replace_formula_markers(
+                        text=section.text,
+                        page_range=page_range,
+                        get_page_text=get_page_text,
+                        pdf_doc=pdf_doc,
+                        formula_cache=formula_cache,
+                        formula_offsets=formula_offsets,
+                    )
                 )
                 formula_stats.markers_total += section_stats.markers_total
                 formula_stats.replaced_by_engine += section_stats.replaced_by_engine
                 formula_stats.replaced_by_fallback += section_stats.replaced_by_fallback
                 formula_stats.unresolved += section_stats.unresolved
+                section_formulas.append(recovered_formulas)
                 enhanced_sections.append(
                     _SectionBlock(
                         path=section.path,
@@ -669,6 +717,7 @@ class DoclingPdfParser:
                 )
 
         chunks: list[ChunkRecord] = []
+        chunk_ids_by_section_index: dict[int, str] = {}
         for idx, (section, page_range) in enumerate(
             zip(enhanced_sections, page_ranges, strict=True)
         ):
@@ -699,9 +748,39 @@ class DoclingPdfParser:
                     confidence=None,
                 )
             )
+            chunk_ids_by_section_index[idx] = chunk_id
 
         if not outline:
             outline = _build_outline_from_sections(enhanced_sections, page_ranges)
+
+        formulas: list[FormulaRecord] = []
+        for section_idx, (section, page_range, recovered_formulas) in enumerate(
+            zip(enhanced_sections, page_ranges, section_formulas, strict=True)
+        ):
+            chunk_id = chunk_ids_by_section_index.get(section_idx)
+            for formula_idx, recovered in enumerate(recovered_formulas):
+                page = recovered.page if recovered.page is not None else page_range[0]
+                formula_identity = (
+                    f"{doc_id}:{section_idx}:{formula_idx}:{page}:"
+                    f"{recovered.bbox}:{recovered.status}:{recovered.latex}"
+                )
+                formula_id = hashlib.sha1(
+                    formula_identity.encode(), usedforsecurity=False
+                ).hexdigest()[:16]
+                formulas.append(
+                    FormulaRecord(
+                        formula_id=formula_id,
+                        doc_id=doc_id,
+                        chunk_id=chunk_id,
+                        section_path=section.path,
+                        page=page,
+                        bbox=recovered.bbox,
+                        latex=recovered.latex,
+                        source=recovered.source,
+                        confidence=recovered.confidence,
+                        status=recovered.status,
+                    )
+                )
 
         parser_chain = [self.method]
         if formula_stats.markers_total > 0:
@@ -718,6 +797,7 @@ class DoclingPdfParser:
                 "formula_replaced_by_pix2text": formula_stats.replaced_by_engine,
                 "formula_replaced_by_fallback": formula_stats.replaced_by_fallback,
                 "formula_unresolved": formula_stats.unresolved,
+                "formula_records_total": len(formulas),
                 "formula_engine": _FORMULA_SOURCE
                 if formula_stats.markers_total
                 else None,
@@ -725,6 +805,7 @@ class DoclingPdfParser:
             },
             outline=outline,
             chunks=chunks,
+            formulas=formulas,
             reading_markdown=_sections_to_markdown(enhanced_sections),
             raw_artifacts={},
             overall_confidence=None,

@@ -56,6 +56,8 @@ If startup preflight fails, the server exits with a structured error payload on 
 - PDF image extraction is on-demand: ingest does not pre-extract PDF images.
 - Use `pdf_list_images` to trigger/list extracted PDF figure/table images (optionally scoped to one outline node).
 - Use `pdf_read_image` to get one extracted PDF image path plus nearby text context.
+- Use `pdf_book_list_formulas` / `pdf_book_read_formula` for formula-centric reading on PDF books.
+- Use `pdf_paper_list_formulas` / `pdf_paper_read_formula` for formula-centric reading on PDF papers.
 - Use `epub_list_images` to list extracted EPUB images (optionally scoped to one outline node).
 - Use `epub_read_image` to get one EPUB image path plus nearby text context.
 - Use `storage_list_sidecars` to inspect sidecar persistence under a root.

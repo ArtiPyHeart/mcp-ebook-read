@@ -244,6 +244,60 @@ def pdf_read_image(doc_id: str, image_id: str) -> dict[str, Any]:
 
 @mcp.tool()
 @tool_handler
+def pdf_book_list_formulas(
+    doc_id: str,
+    node_id: str | None = None,
+    limit: int = 200,
+    status: str | None = None,
+) -> dict[str, Any]:
+    """List formulas from a PDF book (optionally scoped to one outline node)."""
+    return _require_service().pdf_book_list_formulas(
+        doc_id=doc_id,
+        node_id=node_id,
+        limit=limit,
+        status=status,
+    )
+
+
+@mcp.tool()
+@tool_handler
+def pdf_book_read_formula(doc_id: str, formula_id: str) -> dict[str, Any]:
+    """Read one formula from a PDF book with context and evidence image."""
+    return _require_service().pdf_book_read_formula(
+        doc_id=doc_id,
+        formula_id=formula_id,
+    )
+
+
+@mcp.tool()
+@tool_handler
+def pdf_paper_list_formulas(
+    doc_id: str,
+    node_id: str | None = None,
+    limit: int = 200,
+    status: str | None = None,
+) -> dict[str, Any]:
+    """List formulas from a PDF paper (optionally scoped to one outline node)."""
+    return _require_service().pdf_paper_list_formulas(
+        doc_id=doc_id,
+        node_id=node_id,
+        limit=limit,
+        status=status,
+    )
+
+
+@mcp.tool()
+@tool_handler
+def pdf_paper_read_formula(doc_id: str, formula_id: str) -> dict[str, Any]:
+    """Read one formula from a PDF paper with context and evidence image."""
+    return _require_service().pdf_paper_read_formula(
+        doc_id=doc_id,
+        formula_id=formula_id,
+    )
+
+
+@mcp.tool()
+@tool_handler
 def get_outline(doc_id: str) -> dict[str, Any]:
     """Return document outline for EPUB/PDF."""
     return _require_service().get_outline(doc_id)

@@ -256,6 +256,7 @@ def test_docling_parse_success(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) 
     assert parsed.metadata["toc_nodes_raw"] == 2
     assert parsed.metadata["toc_nodes_clean"] == 2
     assert parsed.metadata["formula_markers_total"] == 0
+    assert parsed.formulas == []
 
 
 def test_docling_parse_skips_page_loading_without_formula_markers(
@@ -317,8 +318,14 @@ def test_docling_parse_replaces_formula_marker(
     assert parsed.parser_chain == ["docling", "pix2text"]
     assert parsed.metadata["formula_markers_total"] == 1
     assert parsed.metadata["formula_replaced_by_pix2text"] == 1
+    assert parsed.metadata["formula_records_total"] == 1
     assert "<!-- formula-not-decoded -->" not in parsed.chunks[0].text
     assert r"\frac{a}{b}" in parsed.chunks[0].text
+    assert len(parsed.formulas) == 1
+    assert parsed.formulas[0].status == "resolved"
+    assert parsed.formulas[0].source == "pix2text"
+    assert parsed.formulas[0].latex == r"\frac{a}{b}"
+    assert parsed.formulas[0].chunk_id == parsed.chunks[0].chunk_id
 
 
 def test_docling_parse_formula_fallback_uses_page_text(
@@ -346,6 +353,37 @@ def test_docling_parse_formula_fallback_uses_page_text(
     assert parsed.metadata["formula_replaced_by_pix2text"] == 0
     assert parsed.metadata["formula_replaced_by_fallback"] == 1
     assert "Formula fallback text" in parsed.chunks[0].text
+    assert len(parsed.formulas) == 1
+    assert parsed.formulas[0].status == "fallback_text"
+    assert "x(t) = sin(t)" in parsed.formulas[0].latex
+
+
+def test_docling_parse_formula_unresolved_when_no_fallback(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    parser = DoclingPdfParser()
+    pdf = tmp_path / "formula_unresolved.pdf"
+    pdf.write_bytes(b"pdf")
+
+    install_fake_docling(monkeypatch, FormulaConverter)
+    install_fake_pix2text(monkeypatch, outputs=[])
+    monkeypatch.setattr(
+        "mcp_ebook_read.parsers.pdf_docling.fitz.open",
+        lambda _path: FakePdfDoc(
+            title="Formula Unresolved PDF",
+            page_count=2,
+            toc=[[1, "Intro", 1]],
+            page_texts=["plain intro text", "plain method text"],
+        ),
+    )
+
+    parsed = parser.parse(str(pdf), "doc-formula-unresolved")
+
+    assert parsed.metadata["formula_markers_total"] == 1
+    assert parsed.metadata["formula_replaced_by_fallback"] == 0
+    assert parsed.metadata["formula_unresolved"] == 1
+    assert len(parsed.formulas) == 1
+    assert parsed.formulas[0].status == "unresolved"
 
 
 def test_docling_parse_formula_engine_missing_fails_fast(
