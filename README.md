@@ -10,7 +10,7 @@ A local MCP server for Codex to read and retrieve content from EPUB/PDF document
 docker rm -f qdrant 2>/dev/null || true && docker run -d --name qdrant -p 6333:6333 -p 6334:6334 qdrant/qdrant:v1.16.3
 ```
 
-### GROBID (required for `document_ingest_pdf_paper`)
+### GROBID (required by startup preflight and `document_ingest_pdf_paper`)
 
 ```bash
 docker rm -f grobid 2>/dev/null || true && docker run -d --name grobid -p 8070:8070 lfoppiano/grobid:0.8.0
@@ -27,13 +27,38 @@ Expected:
 - Qdrant returns JSON with `"status":"ok"`
 - GROBID returns `true`
 
-## Run MCP Server
+## Run MCP Server (PyPI via `uvx`)
 
 ```bash
-QDRANT_URL=http://localhost:6333 GROBID_URL=http://localhost:8070 GROBID_TIMEOUT_SECONDS=120 uv run mcp-ebook-read
+QDRANT_URL=http://localhost:6333 GROBID_URL=http://localhost:8070 GROBID_TIMEOUT_SECONDS=120 uvx mcp-ebook-read
 ```
 
 If startup preflight fails, the server exits with a structured error payload on stderr that includes missing env vars and setup hints.
+
+### First Run Recommendation
+
+Before configuring this MCP inside an MCP client, run it once manually from a terminal:
+
+```bash
+QDRANT_URL=http://localhost:6333 GROBID_URL=http://localhost:8070 GROBID_TIMEOUT_SECONDS=120 uvx --refresh mcp-ebook-read
+```
+
+This pre-resolves and aligns runtime dependencies, which helps avoid long first-time activation latency after MCP client configuration.
+
+## Environment Variables
+
+Required:
+- `QDRANT_URL` (for example `http://127.0.0.1:6333`)
+- `GROBID_URL` (for example `http://127.0.0.1:8070`)
+
+Optional:
+- `GROBID_TIMEOUT_SECONDS` (default `20`; recommended `120` for large papers)
+- `QDRANT_COLLECTION` (default `mcp_ebook_read_chunks`)
+- `QDRANT_TIMEOUT_SECONDS` (default `10`)
+- `FASTEMBED_MODEL` (FastEmbed model override)
+- `DOCLING_FORMULA_ENRICHMENT` (`true` by default)
+- `PDF_FORMULA_REQUIRE_ENGINE` (`true` by default)
+- `PDF_FORMULA_BATCH_SIZE` (`auto` by default; or an explicit integer)
 
 ## Persistence Model
 
@@ -46,6 +71,8 @@ If startup preflight fails, the server exits with a structured error payload on 
   - `docs/<doc_id>/evidence/...`
 
 ## Notes
+- Use `library_scan` to discover `.pdf`/`.epub` files under a root and register updates/removals.
+- Use `search` for global semantic retrieval and `read` for locator-based chunk windows.
 - Startup preflight is fail-fast and requires both Qdrant and GROBID to be configured and reachable.
 - Use `document_ingest_pdf_book` for PDF books.
 - Use `document_ingest_epub_book` for EPUB books.
@@ -78,11 +105,11 @@ If startup preflight fails, the server exits with a structured error payload on 
 
 ## No-Label Formula Benchmark
 
-Use sample non-scanned PDFs as a regression baseline without manual annotations.
+Use your own non-scanned PDF corpus as a no-label regression baseline (without manual annotations).
 
 ```bash
-uv run mcp-ebook-formula-benchmark \
-  --samples-dir tests/samples/pdf-papers \
+uvx mcp-ebook-formula-benchmark \
+  --samples-dir /ABSOLUTE/PATH/TO/pdf-formula-benchmark-corpus \
   --passes 2 \
   --max-unresolved-rate 0.15 \
   --min-latex-valid-rate 0.85 \
@@ -95,30 +122,7 @@ Output is JSON with per-document metrics and a threshold pass/fail flag. Exit co
 
 You can register this server in a Claude Code compatible `mcpServers` JSON config.
 
-### Option A: Run from local project path (recommended during development)
-
-```json
-{
-  "mcpServers": {
-    "mcp-ebook-read": {
-      "command": "uvx",
-      "args": [
-        "--from",
-        "/ABSOLUTE/PATH/TO/mcp-ebook-read",
-        "mcp-ebook-read"
-      ],
-      "env": {
-        "QDRANT_URL": "http://127.0.0.1:6333",
-        "QDRANT_COLLECTION": "mcp_ebook_read_chunks",
-        "GROBID_URL": "http://127.0.0.1:8070",
-        "GROBID_TIMEOUT_SECONDS": "120"
-      }
-    }
-  }
-}
-```
-
-### Option B: Run from a published package
+### Published package
 
 ```json
 {
@@ -152,11 +156,7 @@ You can also configure MCP servers in Codex using TOML style (for example in a C
 ```toml
 [mcp_servers.mcp-ebook-read]
 command = "uvx"
-args = [
-  "--from",
-  "/ABSOLUTE/PATH/TO/mcp-ebook-read",
-  "mcp-ebook-read"
-]
+args = [ "mcp-ebook-read" ]
 startup_timeout_sec = 60
 
 [mcp_servers.mcp-ebook-read.env]
@@ -164,32 +164,4 @@ QDRANT_URL = "http://127.0.0.1:6333"
 QDRANT_COLLECTION = "mcp_ebook_read_chunks"
 GROBID_URL = "http://127.0.0.1:8070"
 GROBID_TIMEOUT_SECONDS = "120"
-```
-
-### With additional MCP servers (same style as your example)
-
-```toml
-[mcp_servers.serena]
-command = "uvx"
-args = [
-  "--from",
-  "git+https://github.com/oraios/serena",
-  "serena",
-  "start-mcp-server",
-  "--context",
-  "codex"
-]
-startup_timeout_sec = 30
-
-[mcp_servers.mcp-ssh]
-command = "npx"
-args = [ "@aiondadotcom/mcp-ssh" ]
-
-[mcp_servers.chrome-devtools]
-command = "npx"
-args = [ "chrome-devtools-mcp@latest" ]
-
-[mcp_servers.mcp-shell-server]
-command = "npx"
-args = [ "-y", "@mkusaka/mcp-shell-server" ]
 ```
