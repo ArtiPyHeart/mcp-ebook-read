@@ -78,6 +78,7 @@ Optional:
 - Use `document_ingest_epub_book` for EPUB books.
 - Use `document_ingest_pdf_paper` for PDF papers (Docling + GROBID, fail-fast).
 - Use `search_in_outline_node` when you need chapter-scoped retrieval (recommended for reading workflows).
+- Use `get_outline` to fetch document outline nodes before chapter/formula/image scoped reading.
 - Use `read_outline_node` to read a chapter/outline node directly without locator stitching.
 - Use `render_pdf_page` for PDF evidence rendering.
 - PDF image extraction is on-demand: ingest does not pre-extract PDF images.
