@@ -19,7 +19,6 @@ from mcp_ebook_read.schema.models import (
     ParsedDocument,
 )
 from mcp_ebook_read.service import AppService
-from mcp_ebook_read.store.catalog import CatalogStore
 
 
 class RecordingVectorIndex:
@@ -195,10 +194,7 @@ def _build_service(
     vector: RecordingVectorIndex | None = None,
     pdf_image_extractor: RecordingPdfImageExtractor | None = None,
 ) -> AppService:
-    sidecar_dir = tmp_path / ".mcp-ebook-read"
     return AppService(
-        data_dir=sidecar_dir,
-        catalog=CatalogStore(sidecar_dir / "catalog.db"),
         sidecar_dir_name=".mcp-ebook-read",
         vector_index=vector or RecordingVectorIndex(),
         pdf_parser=pdf_parser,

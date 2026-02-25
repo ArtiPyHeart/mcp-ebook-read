@@ -42,6 +42,10 @@
 - Record validated best practices and lessons learned during implementation.
 - For service components requiring extra setup (for example Qdrant), document the full setup process in README.md.
 
+## Release Flow
+- PyPI publishing is automated via GitHub Actions.
+- When a new version tag is pushed from `main`, the release workflow automatically publishes that version to PyPI.
+
 ## Lessons Learned
 - Keep MCP protocol output isolated from logs: write logs to stderr only.
 - Keep retrieval single-path: Qdrant + FastEmbed only; avoid adding BM25 fallback.

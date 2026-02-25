@@ -30,17 +30,18 @@ Expected:
 ## Run MCP Server (PyPI via `uvx`)
 
 ```bash
-QDRANT_URL=http://localhost:6333 GROBID_URL=http://localhost:8070 GROBID_TIMEOUT_SECONDS=120 uvx mcp-ebook-read
+QDRANT_URL=http://localhost:6333 GROBID_URL=http://localhost:8070 GROBID_TIMEOUT_SECONDS=120 uvx --upgrade mcp-ebook-read
 ```
 
 If startup preflight fails, the server exits with a structured error payload on stderr that includes missing env vars and setup hints.
+Always prefer the latest published package version by keeping `--upgrade` in your launch command.
 
 ### First Run Recommendation
 
 Before configuring this MCP inside an MCP client, run it once manually from a terminal:
 
 ```bash
-QDRANT_URL=http://localhost:6333 GROBID_URL=http://localhost:8070 GROBID_TIMEOUT_SECONDS=120 uvx --refresh mcp-ebook-read
+QDRANT_URL=http://localhost:6333 GROBID_URL=http://localhost:8070 GROBID_TIMEOUT_SECONDS=120 uvx --upgrade mcp-ebook-read
 ```
 
 This pre-resolves and aligns runtime dependencies, which helps avoid long first-time activation latency after MCP client configuration.
@@ -131,6 +132,7 @@ You can register this server in a Claude Code compatible `mcpServers` JSON confi
     "mcp-ebook-read": {
       "command": "uvx",
       "args": [
+        "--upgrade",
         "mcp-ebook-read"
       ],
       "env": {
@@ -157,7 +159,7 @@ You can also configure MCP servers in Codex using TOML style (for example in a C
 ```toml
 [mcp_servers.mcp-ebook-read]
 command = "uvx"
-args = [ "mcp-ebook-read" ]
+args = [ "--upgrade", "mcp-ebook-read" ]
 startup_timeout_sec = 60
 
 [mcp_servers.mcp-ebook-read.env]

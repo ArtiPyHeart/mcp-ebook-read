@@ -70,8 +70,8 @@ def test_from_env_startup_preflight_success(
 
     assert service.vector_index is vector
     assert service.grobid_client is grobid
-    assert service.data_dir == (tmp_path / ".mcp-ebook-read").resolve()
     assert service.pdf_parser.formula_extractor.batch_size == 7
+    assert not (tmp_path / ".mcp-ebook-read").exists()
 
 
 def test_from_env_formula_batch_size_env_override(

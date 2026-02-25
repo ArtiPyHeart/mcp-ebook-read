@@ -44,8 +44,6 @@ class AppService:
     def __init__(
         self,
         *,
-        data_dir: Path,
-        catalog: CatalogStore,
         sidecar_dir_name: str,
         vector_index: QdrantVectorIndex,
         pdf_parser: DoclingPdfParser,
@@ -53,17 +51,13 @@ class AppService:
         grobid_client: GrobidClient,
         epub_parser: EbooklibEpubParser,
     ) -> None:
-        self.data_dir = data_dir.resolve()
-        self.catalog = catalog
         self.sidecar_dir_name = sidecar_dir_name
         self.vector_index = vector_index
         self.pdf_parser = pdf_parser
         self.pdf_image_extractor = pdf_image_extractor
         self.grobid_client = grobid_client
         self.epub_parser = epub_parser
-        self._catalogs: dict[str, CatalogStore] = {
-            str(catalog.db_path.resolve()): catalog,
-        }
+        self._catalogs: dict[str, CatalogStore] = {}
         self._doc_catalog_index: dict[str, str] = {}
 
     @staticmethod
@@ -132,7 +126,6 @@ class AppService:
 
     @classmethod
     def from_env(cls) -> "AppService":
-        bootstrap_data_dir = (Path.cwd() / ".mcp-ebook-read").resolve()
         preflight_errors: list[dict[str, Any]] = []
 
         def env_bool(name: str, default: bool) -> bool:
@@ -215,8 +208,6 @@ class AppService:
 
         assert vector_index is not None
         return cls(
-            data_dir=bootstrap_data_dir,
-            catalog=CatalogStore(bootstrap_data_dir / "catalog.db"),
             sidecar_dir_name=".mcp-ebook-read",
             vector_index=vector_index,
             pdf_parser=DoclingPdfParser(

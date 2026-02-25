@@ -84,7 +84,9 @@ def test_e2e_scan_ingest_search_read_render(
     )
     assert "grobid" in paper_result["parser_chain"]
 
-    seed_chunk = service.catalog.get_chunks_window(
+    catalog = service._catalog_for_doc_id(pdf_result["doc_id"])
+    assert catalog is not None
+    seed_chunk = catalog.get_chunks_window(
         pdf_result["doc_id"], center_order=0, before=0, after=0
     )
     assert seed_chunk

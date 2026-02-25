@@ -12,7 +12,6 @@ from mcp_ebook_read.schema.models import (
     Locator,
 )
 from mcp_ebook_read.service import AppService
-from mcp_ebook_read.store.catalog import CatalogStore
 
 
 class DummyVectorIndex:
@@ -36,10 +35,7 @@ class DummyGrobid:
 
 
 def build_service(tmp_path: Path) -> AppService:
-    sidecar_dir = tmp_path / ".mcp-ebook-read"
     return AppService(
-        data_dir=sidecar_dir,
-        catalog=CatalogStore(sidecar_dir / "catalog.db"),
         sidecar_dir_name=".mcp-ebook-read",
         vector_index=DummyVectorIndex(),
         pdf_parser=DummyParser(),
@@ -67,15 +63,18 @@ def test_read_locator_not_found(tmp_path: Path) -> None:
 def test_read_success(tmp_path: Path) -> None:
     service = build_service(tmp_path)
     doc_id = "abcd1234abcd1234"
-    service.catalog.upsert_scanned_document(
+    path = tmp_path / "x.pdf"
+    catalog = service._catalog_for_document_path(path)
+    catalog.upsert_scanned_document(
         DocumentRecord(
             doc_id=doc_id,
-            path=str((tmp_path / "x.pdf").resolve()),
+            path=str(path.resolve()),
             type=DocumentType.PDF,
             sha256="f" * 64,
             mtime=1.0,
         )
     )
+    service._bind_doc_catalog(doc_id, catalog)
 
     chunks = []
     for idx in range(2):
@@ -98,7 +97,7 @@ def test_read_success(tmp_path: Path) -> None:
                 method="docling",
             )
         )
-    service.catalog.replace_chunks(doc_id, chunks)
+    catalog.replace_chunks(doc_id, chunks)
 
     data = service.read(
         locator=chunks[0].locator.model_dump(), before=0, after=1, out_format="text"
