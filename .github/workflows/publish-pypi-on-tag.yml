@@ -38,15 +38,7 @@ jobs:
       - name: Ensure tag matches package version
         run: |
           TAG_VERSION="${GITHUB_REF_NAME#v}"
-          PACKAGE_VERSION="$(python - <<'PY'
-import pathlib
-import tomllib
-
-content = pathlib.Path('pyproject.toml').read_text(encoding='utf-8')
-data = tomllib.loads(content)
-print(data['project']['version'])
-PY
-          )"
+          PACKAGE_VERSION="$(python -c "import pathlib, tomllib; print(tomllib.loads(pathlib.Path('pyproject.toml').read_text(encoding='utf-8'))['project']['version'])")"
 
           if [ "$TAG_VERSION" != "$PACKAGE_VERSION" ]; then
             echo "Tag version ($TAG_VERSION) does not match pyproject version ($PACKAGE_VERSION)."
