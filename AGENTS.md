@@ -44,7 +44,11 @@
 
 ## Release Flow
 - PyPI publishing is automated via GitHub Actions.
-- When a new version tag is pushed from `main`, the release workflow automatically publishes that version to PyPI.
+- Release order is mandatory:
+  1. Merge all intended release changes into `main` (including version bump in `pyproject.toml`) and push `main`.
+  2. Create a version tag from that `main` commit (for example `v0.1.2`).
+  3. Push the tag to remote.
+- GitHub Actions publishes to PyPI from the pushed tag; bumping version without pushing the matching tag means the release is incomplete.
 
 ## Lessons Learned
 - Keep MCP protocol output isolated from logs: write logs to stderr only.
