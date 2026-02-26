@@ -30,9 +30,11 @@ class FakeEmbedder:
 
 
 class FakeQdrantClient:
-    def __init__(self, *, url: str, timeout: float) -> None:
+    def __init__(self, *, url: str, timeout: float, **kwargs: object) -> None:
         self.url = url
         self.timeout = timeout
+        self.trust_env = kwargs.get("trust_env")
+        self.check_compatibility = kwargs.get("check_compatibility")
         self.exists = False
         self.raise_get = False
         self.raise_query = False
@@ -105,6 +107,20 @@ def test_vector_index_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
     assert index.url == "http://qdrant:6333"
     assert index.collection == "my_collection"
     assert index.timeout == 12.0
+    assert index.client.trust_env is True
+    assert index.client.check_compatibility is True
+
+
+def test_vector_index_ignores_env_proxy_for_local_backend(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("mcp_ebook_read.index.vector.QdrantClient", FakeQdrantClient)
+    monkeypatch.setattr("mcp_ebook_read.index.vector.TextEmbedding", FakeEmbedder)
+
+    index = QdrantVectorIndex(url="http://127.0.0.1:6333", collection="my_collection")
+
+    assert index.client.trust_env is False
+    assert index.client.check_compatibility is False
 
 
 def test_vector_index_backend_not_ready(monkeypatch: pytest.MonkeyPatch) -> None:

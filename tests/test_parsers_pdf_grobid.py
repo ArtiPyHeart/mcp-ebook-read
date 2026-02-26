@@ -74,6 +74,33 @@ def test_assert_available_connect_failure(monkeypatch: pytest.MonkeyPatch) -> No
     assert exc.value.code == ErrorCode.INGEST_PAPER_GROBID_UNAVAILABLE
 
 
+def test_local_base_url_disables_env_proxy() -> None:
+    client = GrobidClient(base_url="http://localhost:8070")
+    assert client._trust_env_proxy is False
+
+
+def test_remote_base_url_keeps_env_proxy() -> None:
+    client = GrobidClient(base_url="https://grobid.example.com")
+    assert client._trust_env_proxy is True
+
+
+def test_assert_available_passes_trust_env_flag(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: list[dict[str, object]] = []
+
+    def _factory(**kwargs: object) -> FakeHttpxClient:
+        captured.append(kwargs)
+        return FakeHttpxClient(**kwargs)
+
+    monkeypatch.setattr("mcp_ebook_read.parsers.pdf_grobid.httpx.Client", _factory)
+    client = GrobidClient(base_url="http://127.0.0.1:8070")
+    client._assert_available()
+
+    assert captured
+    assert captured[0].get("trust_env") is False
+
+
 def test_parse_fulltext_missing_file(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

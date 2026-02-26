@@ -10,6 +10,7 @@ import httpx
 from lxml import etree
 
 from mcp_ebook_read.errors import AppError, ErrorCode
+from mcp_ebook_read.network import should_trust_env_proxy
 from mcp_ebook_read.schema.models import OutlineNode
 
 NS = {"tei": "http://www.tei-c.org/ns/1.0"}
@@ -27,6 +28,7 @@ class GrobidClient:
     def __init__(self, base_url: str | None, timeout_seconds: float = 20.0) -> None:
         self.base_url = (base_url or "").rstrip("/")
         self.timeout_seconds = timeout_seconds
+        self._trust_env_proxy = should_trust_env_proxy(self.base_url)
 
     @classmethod
     def from_env(cls) -> "GrobidClient":
@@ -47,7 +49,10 @@ class GrobidClient:
             )
 
         try:
-            with httpx.Client(timeout=self.timeout_seconds) as client:
+            with httpx.Client(
+                timeout=self.timeout_seconds,
+                trust_env=self._trust_env_proxy,
+            ) as client:
                 response = client.get(f"{self.base_url}/api/isalive")
                 response.raise_for_status()
                 if "true" not in response.text.lower():
@@ -75,7 +80,10 @@ class GrobidClient:
             )
 
         try:
-            with httpx.Client(timeout=self.timeout_seconds) as client:
+            with httpx.Client(
+                timeout=self.timeout_seconds,
+                trust_env=self._trust_env_proxy,
+            ) as client:
                 with path.open("rb") as fh:
                     response = client.post(
                         f"{self.base_url}/api/processFulltextDocument",

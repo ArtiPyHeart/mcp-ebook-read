@@ -13,6 +13,7 @@ from qdrant_client import QdrantClient
 from qdrant_client.http import models
 
 from mcp_ebook_read.errors import AppError, ErrorCode
+from mcp_ebook_read.network import should_trust_env_proxy
 from mcp_ebook_read.schema.models import ChunkRecord
 
 logger = logging.getLogger(__name__)
@@ -33,7 +34,13 @@ class QdrantVectorIndex:
         self.url = url
         self.collection = collection
         self.timeout = timeout
-        self.client = QdrantClient(url=url, timeout=timeout)
+        trust_env_proxy = should_trust_env_proxy(url)
+        self.client = QdrantClient(
+            url=url,
+            timeout=timeout,
+            trust_env=trust_env_proxy,
+            check_compatibility=trust_env_proxy,
+        )
         self.embedder = (
             TextEmbedding(model_name=model_name) if model_name else TextEmbedding()
         )
