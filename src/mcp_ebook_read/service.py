@@ -15,6 +15,15 @@ from typing import Any
 
 from mcp_ebook_read.errors import AppError, ErrorCode
 from mcp_ebook_read.index.vector import QdrantVectorIndex
+from mcp_ebook_read.outline import (
+    find_outline_node,
+    matches_outline_node,
+    normalize_section_key,
+    normalize_section_path,
+    page_ranges_overlap,
+    section_path_leaf_matches,
+    section_path_prefix_matches,
+)
 from mcp_ebook_read.parsers.epub_ebooklib import EbooklibEpubParser
 from mcp_ebook_read.parsers.pdf_docling import DoclingPdfParser
 from mcp_ebook_read.parsers.pdf_grobid import GrobidClient
@@ -59,6 +68,7 @@ class AppService:
         self.epub_parser = epub_parser
         self._catalogs: dict[str, CatalogStore] = {}
         self._doc_catalog_index: dict[str, str] = {}
+        self._known_roots: set[str] = set()
 
     @staticmethod
     def _detect_total_memory_bytes() -> int | None:
@@ -225,6 +235,14 @@ class AppService:
     def _catalog_key(self, catalog: CatalogStore) -> str:
         return str(catalog.db_path.resolve())
 
+    def _normalize_root(self, root: str | Path) -> str:
+        return str(Path(root).expanduser().resolve())
+
+    def _register_root(self, root: str | Path) -> str:
+        normalized = self._normalize_root(root)
+        self._known_roots.add(normalized)
+        return normalized
+
     def _get_or_create_catalog(self, sidecar_dir: Path) -> CatalogStore:
         key = str((sidecar_dir / "catalog.db").resolve())
         catalog = self._catalogs.get(key)
@@ -236,9 +254,10 @@ class AppService:
 
     def _catalog_for_document_path(self, path: str | Path) -> CatalogStore:
         resolved = Path(path).expanduser().resolve()
+        self._register_root(resolved.parent)
         return self._get_or_create_catalog(resolved.parent / self.sidecar_dir_name)
 
-    def _catalog_for_doc_id(self, doc_id: str) -> CatalogStore | None:
+    def _lookup_doc_in_loaded_catalogs(self, doc_id: str) -> CatalogStore | None:
         cached_key = self._doc_catalog_index.get(doc_id)
         if cached_key:
             cached_catalog = self._catalogs.get(cached_key)
@@ -251,12 +270,56 @@ class AppService:
                 return catalog
         return None
 
+    def _catalog_for_doc_id(self, doc_id: str) -> CatalogStore | None:
+        catalog = self._lookup_doc_in_loaded_catalogs(doc_id)
+        if catalog is not None:
+            return catalog
+
+        for root in sorted(self._known_roots):
+            root_path = Path(root)
+            if not root_path.exists() or not root_path.is_dir():
+                continue
+            self._discover_sidecar_catalogs(root)
+            catalog = self._lookup_doc_in_loaded_catalogs(doc_id)
+            if catalog is not None:
+                return catalog
+        return None
+
     def _bind_doc_catalog(self, doc_id: str, catalog: CatalogStore) -> None:
         self._doc_catalog_index[doc_id] = self._catalog_key(catalog)
 
     def _doc_workspace_dir(self, doc: DocumentRecord, catalog: CatalogStore) -> Path:
         self._bind_doc_catalog(doc.doc_id, catalog)
         return catalog.db_path.parent / "docs" / doc.doc_id
+
+    def _missing_doc_details(self, doc_id: str) -> dict[str, Any]:
+        details: dict[str, Any] = {
+            "doc_id": doc_id,
+            "known_roots": sorted(self._known_roots),
+            "hint": "After a fresh server restart, call library_scan(root=...) or storage_list_sidecars(root=...) before using doc_id-only tools.",
+        }
+        if self._known_roots:
+            details["reason"] = "Document id was not found under discovered roots."
+        else:
+            details["reason"] = "No roots have been discovered in this process."
+        return details
+
+    def _require_doc(
+        self,
+        doc_id: str,
+        *,
+        error_code: ErrorCode,
+        message: str,
+    ) -> tuple[DocumentRecord, CatalogStore]:
+        catalog = self._catalog_for_doc_id(doc_id)
+        doc = catalog.get_document_by_id(doc_id) if catalog is not None else None
+        if doc is None or catalog is None:
+            raise AppError(
+                error_code,
+                message,
+                details=self._missing_doc_details(doc_id),
+            )
+        return doc, catalog
 
     def _resolve_doc(
         self, doc_id: str | None, path: str | None
@@ -279,11 +342,11 @@ class AppService:
                 return doc, catalog
 
         if doc_id:
-            catalog = self._catalog_for_doc_id(doc_id)
-            if catalog is not None:
-                doc = catalog.get_document_by_id(doc_id)
-                if doc is not None:
-                    return doc, catalog
+            return self._require_doc(
+                doc_id,
+                error_code=ErrorCode.INGEST_DOC_NOT_FOUND,
+                message="Document not found by doc_id or path",
+            )
 
         raise AppError(
             ErrorCode.INGEST_DOC_NOT_FOUND, "Document not found by doc_id or path"
@@ -314,6 +377,7 @@ class AppService:
                 ErrorCode.SCAN_INVALID_ROOT,
                 f"Invalid scan root: {root}",
             )
+        self._register_root(root_path)
 
         found_paths: set[str] = set()
         found_paths_by_catalog: dict[str, set[str]] = defaultdict(set)
@@ -523,8 +587,11 @@ class AppService:
                 parsed = self.pdf_parser.parse(doc.path, doc.doc_id)
                 parsed.parser_chain.append("grobid")
                 parsed.metadata = {**parsed.metadata, **grobid_result.metadata}
-                if grobid_result.outline:
-                    parsed.outline = grobid_result.outline
+                paper_title = str(
+                    grobid_result.metadata.get("paper_title") or ""
+                ).strip()
+                if paper_title:
+                    parsed.title = paper_title
             else:
                 raise AppError(
                     ErrorCode.INGEST_UNSUPPORTED_TYPE,
@@ -623,22 +690,63 @@ class AppService:
         node_start: int | None,
         node_end: int | None,
     ) -> bool:
-        if not chunk_range or len(chunk_range) != 2:
-            return False
-        if node_start is None or node_end is None:
-            return False
-        c_start, c_end = chunk_range
-        return c_start <= node_end and c_end >= node_start
+        return page_ranges_overlap(chunk_range, node_start, node_end)
+
+    @staticmethod
+    def _normalize_section_key(value: str) -> str:
+        return normalize_section_key(value)
+
+    def _normalize_section_path(self, section_path: list[str]) -> list[str]:
+        return normalize_section_path(section_path)
+
+    def _section_path_prefix_matches(
+        self, section_path: list[str], node_path: list[str]
+    ) -> bool:
+        return section_path_prefix_matches(section_path, node_path)
+
+    def _section_path_leaf_matches(
+        self, section_path: list[str], node_path: list[str]
+    ) -> bool:
+        return section_path_leaf_matches(section_path, node_path)
+
+    def _find_outline_node(
+        self,
+        nodes: list[OutlineNode],
+        node_id: str,
+        ancestry: list[str] | None = None,
+    ) -> tuple[OutlineNode, list[str]] | None:
+        resolved = find_outline_node(nodes, node_id, ancestry)
+        if resolved is None:
+            return None
+        return resolved.node, resolved.path
+
+    def _matches_outline_node(
+        self,
+        *,
+        page_range: list[int] | None,
+        section_path: list[str],
+        spine_id: str | None,
+        node: OutlineNode,
+        node_path: list[str],
+    ) -> bool:
+        return matches_outline_node(
+            page_range=page_range,
+            section_path=section_path,
+            spine_id=spine_id,
+            node=node,
+            node_path=node_path,
+        )
 
     def _resolve_outline_node(
         self, doc_id: str, node_id: str
-    ) -> tuple[DocumentRecord, OutlineNode, CatalogStore]:
-        catalog = self._catalog_for_doc_id(doc_id)
-        doc = catalog.get_document_by_id(doc_id) if catalog is not None else None
-        if not doc:
-            raise AppError(ErrorCode.INGEST_DOC_NOT_FOUND, f"Unknown doc_id: {doc_id}")
-        node = next((item for item in doc.outline if item.id == node_id), None)
-        if node is None:
+    ) -> tuple[DocumentRecord, OutlineNode, list[str], CatalogStore]:
+        doc, catalog = self._require_doc(
+            doc_id,
+            error_code=ErrorCode.INGEST_DOC_NOT_FOUND,
+            message=f"Unknown doc_id: {doc_id}",
+        )
+        resolved = self._find_outline_node(doc.outline, node_id)
+        if resolved is None:
             raise AppError(
                 ErrorCode.READ_LOCATOR_NOT_FOUND,
                 f"Unknown outline node: {node_id}",
@@ -648,7 +756,8 @@ class AppService:
                     "hint": "Call get_outline first and use a valid node id.",
                 },
             )
-        return doc, node, catalog
+        node, node_path = resolved
+        return doc, node, node_path, catalog
 
     def _chunks_for_outline_node(
         self,
@@ -656,6 +765,7 @@ class AppService:
         catalog: CatalogStore,
         doc_id: str,
         node: OutlineNode,
+        node_path: list[str],
     ) -> list[ChunkRecord]:
         all_chunks = catalog.list_chunks(doc_id)
         if not all_chunks:
@@ -664,23 +774,15 @@ class AppService:
         matched = [
             chunk
             for chunk in all_chunks
-            if self._page_ranges_overlap(
-                chunk.locator.page_range,
-                node.page_start,
-                node.page_end,
+            if self._matches_outline_node(
+                page_range=chunk.locator.page_range,
+                section_path=chunk.section_path,
+                spine_id=(chunk.locator.epub_locator or {}).get("spine_id"),
+                node=node,
+                node_path=node_path,
             )
         ]
-        if matched:
-            return matched
-
-        node_title = node.title.strip().lower()
-        if not node_title:
-            return []
-        return [
-            chunk
-            for chunk in all_chunks
-            if any(node_title in part.strip().lower() for part in chunk.section_path)
-        ]
+        return matched
 
     def _format_chunk_window(self, chunks: list[ChunkRecord], out_format: str) -> str:
         if out_format not in {"markdown", "text"}:
@@ -709,7 +811,7 @@ class AppService:
         query: str,
         top_k: int,
     ) -> dict[str, Any]:
-        _, node, _ = self._resolve_outline_node(doc_id, node_id)
+        _, node, node_path, _ = self._resolve_outline_node(doc_id, node_id)
         expanded_top_k = max(top_k * 5, top_k)
         raw_hits = self.vector_index.search(
             query=query, top_k=expanded_top_k, doc_ids=[doc_id]
@@ -717,22 +819,16 @@ class AppService:
         filtered_hits: list[dict[str, Any]] = []
         for hit in raw_hits:
             locator = hit.get("locator") or {}
-            page_range = locator.get("page_range")
-            if self._page_ranges_overlap(page_range, node.page_start, node.page_end):
+            if self._matches_outline_node(
+                page_range=locator.get("page_range"),
+                section_path=locator.get("section_path") or [],
+                spine_id=(locator.get("epub_locator") or {}).get("spine_id"),
+                node=node,
+                node_path=node_path,
+            ):
                 filtered_hits.append(hit)
                 if len(filtered_hits) >= top_k:
                     break
-
-        if len(filtered_hits) < top_k:
-            node_title = node.title.strip().lower()
-            for hit in raw_hits:
-                locator = hit.get("locator") or {}
-                section_path = locator.get("section_path") or []
-                joined = " / ".join(section_path).lower()
-                if node_title and node_title in joined and hit not in filtered_hits:
-                    filtered_hits.append(hit)
-                    if len(filtered_hits) >= top_k:
-                        break
 
         return {
             "node": node.model_dump(),
@@ -743,12 +839,11 @@ class AppService:
         self, locator: dict[str, Any], before: int, after: int, out_format: str
     ) -> dict[str, Any]:
         parsed_locator = Locator(**locator)
-        catalog = self._catalog_for_doc_id(parsed_locator.doc_id)
-        if catalog is None:
-            raise AppError(
-                ErrorCode.READ_LOCATOR_NOT_FOUND,
-                "Chunk not found for locator.",
-            )
+        _, catalog = self._require_doc(
+            parsed_locator.doc_id,
+            error_code=ErrorCode.READ_LOCATOR_NOT_FOUND,
+            message="Chunk not found for locator.",
+        )
         chunk = catalog.get_chunk(parsed_locator.doc_id, parsed_locator.chunk_id)
         if not chunk:
             raise AppError(
@@ -779,11 +874,12 @@ class AppService:
         out_format: str,
         max_chunks: int = 120,
     ) -> dict[str, Any]:
-        doc, node, catalog = self._resolve_outline_node(doc_id, node_id)
+        doc, node, node_path, catalog = self._resolve_outline_node(doc_id, node_id)
         scoped_chunks = self._chunks_for_outline_node(
             catalog=catalog,
             doc_id=doc_id,
             node=node,
+            node_path=node_path,
         )
         if not scoped_chunks:
             raise AppError(
@@ -811,10 +907,11 @@ class AppService:
         }
 
     def _ensure_epub_doc(self, doc_id: str) -> tuple[DocumentRecord, CatalogStore]:
-        catalog = self._catalog_for_doc_id(doc_id)
-        doc = catalog.get_document_by_id(doc_id) if catalog is not None else None
-        if not doc:
-            raise AppError(ErrorCode.INGEST_DOC_NOT_FOUND, f"Unknown doc_id: {doc_id}")
+        doc, catalog = self._require_doc(
+            doc_id,
+            error_code=ErrorCode.INGEST_DOC_NOT_FOUND,
+            message=f"Unknown doc_id: {doc_id}",
+        )
         if doc.type != DocumentType.EPUB:
             raise AppError(
                 ErrorCode.INGEST_UNSUPPORTED_TYPE,
@@ -828,10 +925,11 @@ class AppService:
         return doc, catalog
 
     def _ensure_pdf_doc(self, doc_id: str) -> tuple[DocumentRecord, CatalogStore]:
-        catalog = self._catalog_for_doc_id(doc_id)
-        doc = catalog.get_document_by_id(doc_id) if catalog is not None else None
-        if not doc:
-            raise AppError(ErrorCode.INGEST_DOC_NOT_FOUND, f"Unknown doc_id: {doc_id}")
+        doc, catalog = self._require_doc(
+            doc_id,
+            error_code=ErrorCode.INGEST_DOC_NOT_FOUND,
+            message=f"Unknown doc_id: {doc_id}",
+        )
         if doc.type != DocumentType.PDF:
             raise AppError(
                 ErrorCode.INGEST_UNSUPPORTED_TYPE,
@@ -964,16 +1062,18 @@ class AppService:
 
         node_payload: dict[str, Any] | None = None
         if node_id:
-            _, node, _ = self._resolve_outline_node(doc_id, node_id)
+            _, node, node_path, _ = self._resolve_outline_node(doc_id, node_id)
             node_payload = node.model_dump()
-            node_title = node.title.strip().lower()
             filtered: list[ImageRecord] = []
             for image in images:
-                if node.spine_ref and image.spine_id == node.spine_ref:
-                    filtered.append(image)
-                    continue
-                if node_title and any(
-                    node_title in part.strip().lower() for part in image.section_path
+                if self._matches_outline_node(
+                    page_range=[image.page, image.page]
+                    if image.page is not None
+                    else None,
+                    section_path=image.section_path,
+                    spine_id=image.spine_id,
+                    node=node,
+                    node_path=node_path,
                 ):
                     filtered.append(image)
             images = filtered
@@ -1064,18 +1164,18 @@ class AppService:
 
         node_payload: dict[str, Any] | None = None
         if node_id:
-            _, node, _ = self._resolve_outline_node(doc_id, node_id)
+            _, node, node_path, _ = self._resolve_outline_node(doc_id, node_id)
             node_payload = node.model_dump()
-            node_title = node.title.strip().lower()
             filtered: list[ImageRecord] = []
             for image in images:
-                if image.page is not None and self._page_ranges_overlap(
-                    [image.page, image.page], node.page_start, node.page_end
-                ):
-                    filtered.append(image)
-                    continue
-                if node_title and any(
-                    node_title in part.strip().lower() for part in image.section_path
+                if self._matches_outline_node(
+                    page_range=[image.page, image.page]
+                    if image.page is not None
+                    else None,
+                    section_path=image.section_path,
+                    spine_id=image.spine_id,
+                    node=node,
+                    node_path=node_path,
                 ):
                     filtered.append(image)
             images = filtered
@@ -1162,15 +1262,17 @@ class AppService:
         *,
         formula: FormulaRecord,
         node: OutlineNode,
+        node_path: list[str],
     ) -> bool:
-        if formula.page is not None and self._page_ranges_overlap(
-            [formula.page, formula.page], node.page_start, node.page_end
-        ):
-            return True
-        node_title = node.title.strip().lower()
-        if not node_title:
-            return False
-        return any(node_title in part.strip().lower() for part in formula.section_path)
+        return self._matches_outline_node(
+            page_range=[formula.page, formula.page]
+            if formula.page is not None
+            else None,
+            section_path=formula.section_path,
+            spine_id=None,
+            node=node,
+            node_path=node_path,
+        )
 
     def _find_formula_context_chunk(
         self,
@@ -1237,12 +1339,14 @@ class AppService:
 
         node_payload: dict[str, Any] | None = None
         if node_id:
-            _, node, _ = self._resolve_outline_node(doc_id, node_id)
+            _, node, node_path, _ = self._resolve_outline_node(doc_id, node_id)
             node_payload = node.model_dump()
             formulas = [
                 item
                 for item in formulas
-                if self._formula_matches_outline_node(formula=item, node=node)
+                if self._formula_matches_outline_node(
+                    formula=item, node=node, node_path=node_path
+                )
             ]
 
         max_items = max(0, min(limit, 500))
@@ -1402,27 +1506,28 @@ class AppService:
         )
 
     def get_outline(self, doc_id: str) -> dict[str, Any]:
-        catalog = self._catalog_for_doc_id(doc_id)
-        doc = catalog.get_document_by_id(doc_id) if catalog is not None else None
-        if not doc:
-            raise AppError(ErrorCode.INGEST_DOC_NOT_FOUND, f"Unknown doc_id: {doc_id}")
+        doc, _ = self._require_doc(
+            doc_id,
+            error_code=ErrorCode.INGEST_DOC_NOT_FOUND,
+            message=f"Unknown doc_id: {doc_id}",
+        )
         return {
             "title": doc.title,
             "nodes": [node.model_dump() for node in doc.outline],
         }
 
     def render_pdf_page(self, doc_id: str, page: int, dpi: int) -> dict[str, Any]:
-        catalog = self._catalog_for_doc_id(doc_id)
-        doc = catalog.get_document_by_id(doc_id) if catalog is not None else None
-        if not doc:
-            raise AppError(ErrorCode.INGEST_DOC_NOT_FOUND, f"Unknown doc_id: {doc_id}")
+        doc, catalog = self._require_doc(
+            doc_id,
+            error_code=ErrorCode.INGEST_DOC_NOT_FOUND,
+            message=f"Unknown doc_id: {doc_id}",
+        )
         if doc.type != DocumentType.PDF:
             raise AppError(
                 ErrorCode.RENDER_PAGE_FAILED,
                 "render_pdf_page is only supported for PDF documents",
             )
 
-        assert catalog is not None
         out_path = (
             self._doc_workspace_dir(doc, catalog)
             / "evidence"
@@ -1444,6 +1549,7 @@ class AppService:
                 ErrorCode.SCAN_INVALID_ROOT,
                 f"Invalid scan root: {root}",
             )
+        self._register_root(root_path)
 
         catalogs: list[CatalogStore] = []
         seen: set[str] = set()

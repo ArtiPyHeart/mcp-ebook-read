@@ -78,11 +78,12 @@ Optional:
 
 ## Notes
 - Use `library_scan` to discover `.pdf`/`.epub` files under a root and register updates/removals.
+- After a fresh server restart, call `library_scan(root=...)` or `storage_list_sidecars(root=...)` before using tools that only take `doc_id`.
 - Use `search` for global semantic retrieval and `read` for locator-based chunk windows.
 - Startup preflight is fail-fast and requires both Qdrant and GROBID to be configured and reachable.
 - Use `document_ingest_pdf_book` for PDF books.
 - Use `document_ingest_epub_book` for EPUB books.
-- Use `document_ingest_pdf_paper` for PDF papers (Docling + GROBID, fail-fast).
+- Use `document_ingest_pdf_paper` for PDF papers. Docling remains the canonical page-aware outline; GROBID enriches paper metadata and title.
 - Use `search_in_outline_node` when you need chapter-scoped retrieval (recommended for reading workflows).
 - Use `get_outline` to fetch document outline nodes before chapter/formula/image scoped reading.
 - Use `read_outline_node` to read a chapter/outline node directly without locator stitching.

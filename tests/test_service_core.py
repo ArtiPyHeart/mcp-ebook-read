@@ -421,8 +421,9 @@ def test_document_ingest_pdf_paper_merges_grobid(tmp_path: Path) -> None:
     loaded_catalog = service._catalog_for_document_path(pdf_path)
     loaded = loaded_catalog.get_document_by_id(doc_id)
     assert loaded is not None
+    assert loaded.title == "Paper Title"
     assert loaded.metadata["paper_title"] == "Paper Title"
-    assert [node.title for node in loaded.outline] == ["Grobid Intro"]
+    assert [node.title for node in loaded.outline] == ["Section"]
 
 
 def test_document_ingest_failure_sets_failed_status(tmp_path: Path) -> None:
@@ -567,6 +568,8 @@ def test_get_outline_and_render_errors(tmp_path: Path) -> None:
     with pytest.raises(AppError) as outline_exc:
         service.get_outline("missing")
     assert outline_exc.value.code == ErrorCode.INGEST_DOC_NOT_FOUND
+    assert "library_scan" in str(outline_exc.value.details["hint"])
+    assert outline_exc.value.details["known_roots"] == []
 
     epub_path = tmp_path / "book.epub"
     epub_path.write_bytes(b"epub")
@@ -668,6 +671,127 @@ def test_read_outline_node_success(tmp_path: Path) -> None:
     assert "B-1" not in read["content"]
     assert read["chunks_count"] == 2
     assert read["truncated"] is False
+
+
+def test_nested_outline_child_node_read_and_search(tmp_path: Path) -> None:
+    doc_id = "doc-outline-nested"
+    pdf_path = tmp_path / "nested.pdf"
+    pdf_path.write_bytes(b"pdf")
+
+    vector = RecordingVectorIndex()
+    vector.search_result = [
+        {
+            "doc_id": doc_id,
+            "chunk_id": "inside",
+            "locator": {
+                "doc_id": doc_id,
+                "chunk_id": "inside",
+                "section_path": ["Chapter A", "Part 1"],
+                "page_range": [11, 11],
+                "method": "docling",
+            },
+        },
+        {
+            "doc_id": doc_id,
+            "chunk_id": "sibling",
+            "locator": {
+                "doc_id": doc_id,
+                "chunk_id": "sibling",
+                "section_path": ["Chapter A", "Part 2"],
+                "page_range": [13, 13],
+                "method": "docling",
+            },
+        },
+    ]
+    service = _build_service(
+        tmp_path,
+        pdf_parser=RecordingParser(result=_parsed("x", title="X", method="docling")),
+        epub_parser=RecordingParser(result=_parsed("x", title="X", method="ebooklib")),
+        grobid=RecordingGrobid(),
+        vector=vector,
+    )
+    _register_doc(service, doc_id, pdf_path, DocumentType.PDF)
+    catalog = service._catalog_for_document_path(pdf_path)
+    catalog.save_document_parse_output(
+        doc_id=doc_id,
+        title="Nested PDF",
+        parser_chain=["docling"],
+        metadata={},
+        outline=[
+            OutlineNode(
+                id="toc-parent",
+                title="Chapter A",
+                level=1,
+                page_start=10,
+                page_end=14,
+                children=[
+                    OutlineNode(
+                        id="toc-child",
+                        title="Part 1",
+                        level=2,
+                        page_start=11,
+                        page_end=12,
+                    )
+                ],
+            )
+        ],
+        overall_confidence=None,
+        status=DocumentStatus.READY,
+    )
+    catalog.replace_chunks(
+        doc_id,
+        [
+            ChunkRecord(
+                chunk_id="inside",
+                doc_id=doc_id,
+                order_index=0,
+                section_path=["Chapter A", "Part 1"],
+                text="Child section text",
+                search_text="Child section text",
+                locator=Locator(
+                    doc_id=doc_id,
+                    chunk_id="inside",
+                    section_path=["Chapter A", "Part 1"],
+                    page_range=[11, 11],
+                    method="docling",
+                ),
+                method="docling",
+            ),
+            ChunkRecord(
+                chunk_id="sibling",
+                doc_id=doc_id,
+                order_index=1,
+                section_path=["Chapter A", "Part 2"],
+                text="Sibling section text",
+                search_text="Sibling section text",
+                locator=Locator(
+                    doc_id=doc_id,
+                    chunk_id="sibling",
+                    section_path=["Chapter A", "Part 2"],
+                    page_range=[13, 13],
+                    method="docling",
+                ),
+                method="docling",
+            ),
+        ],
+    )
+
+    read = service.read_outline_node(
+        doc_id=doc_id,
+        node_id="toc-child",
+        out_format="text",
+        max_chunks=10,
+    )
+    assert "Child section text" in read["content"]
+    assert "Sibling section text" not in read["content"]
+
+    result = service.search_in_outline_node(
+        doc_id=doc_id,
+        node_id="toc-child",
+        query="part",
+        top_k=5,
+    )
+    assert [hit["chunk_id"] for hit in result["hits"]] == ["inside"]
 
 
 def test_search_in_outline_node_filters_by_page_range(tmp_path: Path) -> None:
@@ -843,6 +967,172 @@ def test_document_ingest_epub_persists_images_and_read(tmp_path: Path) -> None:
     assert read["image"]["alt"] == "Architecture diagram"
     assert read["context"] is not None
     assert "Nearby text" in read["context"]["text"]
+
+
+def test_epub_node_scoping_uses_spine_and_full_path(tmp_path: Path) -> None:
+    doc_id = "doc-epub-scoped"
+    epub_path = tmp_path / "scoped.epub"
+    epub_path.write_bytes(b"epub")
+
+    vector = RecordingVectorIndex()
+    vector.search_result = [
+        {
+            "doc_id": doc_id,
+            "chunk_id": "ch1-summary",
+            "locator": {
+                "doc_id": doc_id,
+                "chunk_id": "ch1-summary",
+                "section_path": ["Chapter One", "Summary"],
+                "epub_locator": {"spine_id": "chap1", "href": "chap1.xhtml"},
+                "method": "ebooklib",
+            },
+        },
+        {
+            "doc_id": doc_id,
+            "chunk_id": "ch2-summary",
+            "locator": {
+                "doc_id": doc_id,
+                "chunk_id": "ch2-summary",
+                "section_path": ["Chapter Two", "Summary"],
+                "epub_locator": {"spine_id": "chap2", "href": "chap2.xhtml"},
+                "method": "ebooklib",
+            },
+        },
+    ]
+    service = _build_service(
+        tmp_path,
+        pdf_parser=RecordingParser(result=_parsed("x", title="X", method="docling")),
+        epub_parser=RecordingParser(result=_parsed("x", title="X", method="ebooklib")),
+        grobid=RecordingGrobid(),
+        vector=vector,
+    )
+    _register_doc(service, doc_id, epub_path, DocumentType.EPUB)
+    catalog = service._catalog_for_document_path(epub_path)
+    catalog.save_document_parse_output(
+        doc_id=doc_id,
+        title="Scoped EPUB",
+        parser_chain=["ebooklib"],
+        metadata={},
+        outline=[
+            OutlineNode(
+                id="toc-ch1",
+                title="Chapter One",
+                level=1,
+                spine_ref="chap1",
+                children=[
+                    OutlineNode(
+                        id="toc-ch1-summary",
+                        title="Summary",
+                        level=2,
+                        spine_ref="chap1",
+                    )
+                ],
+            ),
+            OutlineNode(
+                id="toc-ch2",
+                title="Chapter Two",
+                level=1,
+                spine_ref="chap2",
+                children=[
+                    OutlineNode(
+                        id="toc-ch2-summary",
+                        title="Summary",
+                        level=2,
+                        spine_ref="chap2",
+                    )
+                ],
+            ),
+        ],
+        overall_confidence=None,
+        status=DocumentStatus.READY,
+    )
+    catalog.replace_chunks(
+        doc_id,
+        [
+            ChunkRecord(
+                chunk_id="ch1-summary",
+                doc_id=doc_id,
+                order_index=0,
+                section_path=["Chapter One", "Summary"],
+                text="Chapter one summary",
+                search_text="Chapter one summary",
+                locator=Locator(
+                    doc_id=doc_id,
+                    chunk_id="ch1-summary",
+                    section_path=["Chapter One", "Summary"],
+                    epub_locator={"spine_id": "chap1", "href": "chap1.xhtml"},
+                    method="ebooklib",
+                ),
+                method="ebooklib",
+            ),
+            ChunkRecord(
+                chunk_id="ch2-summary",
+                doc_id=doc_id,
+                order_index=1,
+                section_path=["Chapter Two", "Summary"],
+                text="Chapter two summary",
+                search_text="Chapter two summary",
+                locator=Locator(
+                    doc_id=doc_id,
+                    chunk_id="ch2-summary",
+                    section_path=["Chapter Two", "Summary"],
+                    epub_locator={"spine_id": "chap2", "href": "chap2.xhtml"},
+                    method="ebooklib",
+                ),
+                method="ebooklib",
+            ),
+        ],
+    )
+    img1 = tmp_path / "epub1.png"
+    img2 = tmp_path / "epub2.png"
+    img1.write_bytes(b"\x89PNG")
+    img2.write_bytes(b"\x89PNG")
+    catalog.replace_images(
+        doc_id,
+        [
+            ImageRecord(
+                image_id="img-ch1",
+                doc_id=doc_id,
+                order_index=0,
+                section_path=["Chapter One", "Summary"],
+                spine_id="chap1",
+                file_path=str(img1),
+            ),
+            ImageRecord(
+                image_id="img-ch2",
+                doc_id=doc_id,
+                order_index=1,
+                section_path=["Chapter Two", "Summary"],
+                spine_id="chap2",
+                file_path=str(img2),
+            ),
+        ],
+    )
+
+    read = service.read_outline_node(
+        doc_id=doc_id,
+        node_id="toc-ch1-summary",
+        out_format="text",
+        max_chunks=10,
+    )
+    assert "Chapter one summary" in read["content"]
+    assert "Chapter two summary" not in read["content"]
+
+    result = service.search_in_outline_node(
+        doc_id=doc_id,
+        node_id="toc-ch1-summary",
+        query="summary",
+        top_k=5,
+    )
+    assert [hit["chunk_id"] for hit in result["hits"]] == ["ch1-summary"]
+
+    listed = service.epub_list_images(
+        doc_id=doc_id,
+        node_id="toc-ch1-summary",
+        limit=20,
+    )
+    assert listed["images_count"] == 1
+    assert listed["images"][0]["image_id"] == "img-ch1"
 
 
 def test_epub_image_tools_reject_non_epub(tmp_path: Path) -> None:
@@ -1321,3 +1611,103 @@ def test_storage_cleanup_sidecars_removes_missing_docs_and_orphans(
     assert cleaned["orphan_artifacts_deleted"] >= 1
     assert doc_id in vector.delete_calls
     assert catalog.get_document_by_id(doc_id) is None
+
+
+def test_doc_id_tools_require_discovery_after_restart(tmp_path: Path) -> None:
+    root = tmp_path / "library"
+    books_dir = root / "books"
+    books_dir.mkdir(parents=True)
+    pdf_path = books_dir / "restart.pdf"
+    pdf_path.write_bytes(b"pdf")
+
+    parser = RecordingParser(result=_parsed("x", title="placeholder", method="docling"))
+    service = _build_service(
+        tmp_path,
+        pdf_parser=parser,
+        epub_parser=RecordingParser(result=_parsed("x", title="X", method="ebooklib")),
+        grobid=RecordingGrobid(),
+    )
+    scan = service.library_scan(str(root), ["**/*.pdf"])
+    doc_id = scan["added"][0]["doc_id"]
+    parser.result = _parsed(
+        doc_id,
+        title="Restart PDF",
+        method="docling",
+        outline=[
+            OutlineNode(
+                id="toc-restart", title="Chapter 1", level=1, page_start=1, page_end=1
+            )
+        ],
+        formulas=[
+            _formula(
+                doc_id=doc_id,
+                formula_id="f-restart",
+                chunk_id="c0",
+                page=1,
+                bbox=[1.0, 2.0, 3.0, 4.0],
+                latex="x=y",
+            )
+        ],
+    )
+    service.document_ingest_pdf_book(doc_id=doc_id, path=None, force=True)
+    catalog = service._catalog_for_document_path(pdf_path)
+    chunk = catalog.list_chunks(doc_id)[0]
+    image_path = tmp_path / "restart-image.png"
+    image_path.write_bytes(b"\x89PNG")
+    catalog.replace_images(
+        doc_id,
+        [
+            ImageRecord(
+                image_id="img-restart",
+                doc_id=doc_id,
+                order_index=0,
+                section_path=["S0"],
+                page=1,
+                file_path=str(image_path),
+            )
+        ],
+    )
+
+    restarted = _build_service(
+        tmp_path,
+        pdf_parser=RecordingParser(result=_parsed("x", title="X", method="docling")),
+        epub_parser=RecordingParser(result=_parsed("x", title="X", method="ebooklib")),
+        grobid=RecordingGrobid(),
+    )
+
+    with pytest.raises(AppError) as exc:
+        restarted.get_outline(doc_id)
+    assert exc.value.code == ErrorCode.INGEST_DOC_NOT_FOUND
+    assert exc.value.details["known_roots"] == []
+    assert "storage_list_sidecars" in str(exc.value.details["hint"])
+
+    rebound = restarted.storage_list_sidecars(root=str(root), limit=20)
+    assert rebound["documents_count"] == 1
+
+    outline = restarted.get_outline(doc_id)
+    assert outline["title"] == "Restart PDF"
+
+    read = restarted.read(
+        locator=chunk.locator.model_dump(),
+        before=0,
+        after=0,
+        out_format="text",
+    )
+    assert "text-0" in read["content"]
+
+    formulas = restarted.pdf_book_list_formulas(
+        doc_id=doc_id,
+        node_id=None,
+        limit=20,
+        status=None,
+    )
+    assert formulas["formulas_count"] == 1
+
+    images = restarted.pdf_list_images(doc_id=doc_id, node_id=None, limit=20)
+    assert images["images_count"] == 1
+
+    with pytest.raises(AppError) as missing_exc:
+        restarted.get_outline("missing-doc")
+    assert missing_exc.value.details["reason"] == (
+        "Document id was not found under discovered roots."
+    )

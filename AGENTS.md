@@ -44,6 +44,7 @@
 
 ## Release Flow
 - PyPI publishing is automated via GitHub Actions.
+- This project does not use `$codex-commit-ai-stats` or any AI-stat commit suffix workflow; use normal git commit messages.
 - Release order is mandatory:
   1. Merge all intended release changes into `main` (including version bump in `pyproject.toml`) and push `main`.
   2. Create a version tag from that `main` commit (for example `v0.1.2`).
