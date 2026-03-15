@@ -32,3 +32,25 @@ def test_cli_entry_startup_failure_outputs_structured_error(
     assert "STARTUP_DEPENDENCY_NOT_READY" in stderr
     assert "QDRANT_URL" in stderr
     assert "GROBID_URL" in stderr
+
+
+def test_cli_entry_registers_shutdown_cleanup(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[str] = []
+    registered: list[object] = []
+
+    class FakeService:
+        def close(self) -> None:
+            calls.append("close")
+
+    monkeypatch.setattr(server.AppService, "from_env", lambda: FakeService())
+    monkeypatch.setattr(server.mcp, "run", lambda *args, **kwargs: calls.append("run"))
+    monkeypatch.setattr(server.atexit, "register", lambda fn: registered.append(fn))
+    monkeypatch.setattr(server, "service", None)
+
+    server.cli_entry()
+
+    assert calls == ["run"]
+    assert len(registered) == 1
+    registered[0]()
+    assert calls == ["run", "close"]
+    assert server.service is None

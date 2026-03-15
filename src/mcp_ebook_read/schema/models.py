@@ -46,6 +46,35 @@ class IngestStage(StrEnum):
     CANCELED = "canceled"
 
 
+class PdfParserPerformanceConfig(BaseModel):
+    num_threads: int = 4
+    device: str = "auto"
+    ocr_batch_size: int = 4
+    layout_batch_size: int = 4
+    table_batch_size: int = 4
+
+
+class PdfParserBenchmarkRow(BaseModel):
+    label: str
+    config: PdfParserPerformanceConfig
+    convert_seconds: float | None = None
+    export_seconds: float | None = None
+    markdown_chars: int | None = None
+    formula_markers: int | None = None
+    error: str | None = None
+
+
+class PdfParserTuningProfile(BaseModel):
+    profile_version: int = 1
+    created_at: str
+    source_path: str
+    sample_pages: int
+    cpu_count: int
+    total_memory_bytes: int | None = None
+    selected_config: PdfParserPerformanceConfig
+    benchmarks: list[PdfParserBenchmarkRow] = Field(default_factory=list)
+
+
 class OutlineNode(BaseModel):
     id: str
     title: str

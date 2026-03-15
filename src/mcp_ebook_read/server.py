@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import atexit
 import json
 import logging
 import sys
@@ -21,6 +22,18 @@ logger = logging.getLogger(__name__)
 mcp = FastMCP("mcp-ebook-read")
 service: AppService | None = None
 T = TypeVar("T")
+
+
+def _shutdown_service() -> None:
+    global service
+    if service is None:
+        return
+    try:
+        service.close()
+    except Exception:  # noqa: BLE001
+        logger.exception("service_shutdown_failed")
+    finally:
+        service = None
 
 
 def _require_service() -> AppService:
@@ -165,6 +178,21 @@ def document_ingest_list_jobs(
 ) -> dict[str, Any]:
     """List recent background ingest jobs for one document."""
     return _require_service().document_ingest_list_jobs(doc_id=doc_id, limit=limit)
+
+
+@mcp.tool()
+@tool_handler
+def document_autotune_pdf_parser(
+    doc_id: str | None = None,
+    path: str | None = None,
+    sample_pages: int = 20,
+) -> dict[str, Any]:
+    """Benchmark a few Docling PDF parser profiles on sampled pages and persist the best one."""
+    return _require_service().document_autotune_pdf_parser(
+        doc_id=doc_id,
+        path=path,
+        sample_pages=sample_pages,
+    )
 
 
 @mcp.tool()
@@ -335,6 +363,7 @@ def cli_entry() -> None:
     global service
     try:
         service = AppService.from_env()
+        atexit.register(_shutdown_service)
     except Exception as exc:  # noqa: BLE001
         trace_id = make_trace_id()
         logger.exception("startup_failed", extra={"trace_id": trace_id})

@@ -4,7 +4,12 @@ from __future__ import annotations
 
 import hashlib
 import io
+import logging
+import os
 import re
+import tempfile
+import threading
+import time
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
@@ -20,6 +25,9 @@ from mcp_ebook_read.schema.models import (
     Locator,
     OutlineNode,
     ParsedDocument,
+    PdfParserBenchmarkRow,
+    PdfParserPerformanceConfig,
+    PdfParserTuningProfile,
 )
 
 
@@ -28,6 +36,9 @@ _MAX_HEADING_LENGTH = 160
 _CODE_LIKE_TOKENS = ("def ", "class ", "return ", "import ", "while ", "for ")
 _FORMULA_SOURCE = "pix2text"
 _UNRESOLVED_FORMULA = "[Formula unresolved. Use render_pdf_page for verification.]"
+_TABLEFORMER_LOGGER_NAME = "mcp_ebook_read.docling.tableformer"
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -347,6 +358,32 @@ def _coerce_bbox(position: Any) -> list[float] | None:
     return [min(xs), min(ys), max(xs), max(ys)]
 
 
+def _configure_docling_runtime_logging() -> None:
+    """Patch Docling table post-processing logging to avoid hot-path logger churn."""
+
+    try:
+        from docling_ibm_models.tableformer.data_management import (
+            matching_post_processor,
+        )
+    except Exception:  # noqa: BLE001
+        return
+
+    patched = getattr(
+        matching_post_processor.MatchingPostProcessor,
+        "_mcp_ebook_read_log_patch_applied",
+        False,
+    )
+    if patched:
+        return
+
+    quiet_logger = logging.getLogger(_TABLEFORMER_LOGGER_NAME)
+    quiet_logger.disabled = True
+    matching_post_processor.MatchingPostProcessor._log = lambda self: quiet_logger
+    matching_post_processor.MatchingPostProcessor._mcp_ebook_read_log_patch_applied = (
+        True
+    )
+
+
 class _Pix2TextFormulaExtractor:
     def __init__(self, *, batch_size: int = 1) -> None:
         self.batch_size = max(1, batch_size)
@@ -461,18 +498,76 @@ class DoclingPdfParser:
         enable_docling_formula_enrichment: bool = True,
         require_formula_engine: bool = True,
         formula_batch_size: int = 1,
+        performance_config: PdfParserPerformanceConfig | None = None,
     ) -> None:
         self.enable_docling_formula_enrichment = enable_docling_formula_enrichment
         self.require_formula_engine = require_formula_engine
+        self.performance_config = performance_config or PdfParserPerformanceConfig()
         self.formula_extractor = _Pix2TextFormulaExtractor(
             batch_size=formula_batch_size
         )
+        self._converter: Any | None = None
+        self._pending_converter: Any | None = None
+        self._pending_converter_config: PdfParserPerformanceConfig | None = None
+        self._converter_lock = threading.Lock()
 
-    def _build_docling_converter(self) -> Any:
+    def set_performance_config(self, config: PdfParserPerformanceConfig) -> None:
+        """Apply a new Docling performance profile and drop the cached converter."""
+
+        self.performance_config = config
+        with self._converter_lock:
+            active_converter = self._converter
+            pending_converter = self._pending_converter
+            pending_config = self._pending_converter_config
+            self._converter = None
+            self._pending_converter = None
+            self._pending_converter_config = None
+            if pending_converter is not None and pending_config == config:
+                self._converter = pending_converter
+                pending_converter = None
+
+        if active_converter is not None:
+            self._close_converter_instance(active_converter)
+        if pending_converter is not None:
+            self._close_converter_instance(pending_converter)
+
+    @staticmethod
+    def benchmark_candidates(
+        *,
+        cpu_count: int | None = None,
+        device: str = "auto",
+    ) -> list[PdfParserPerformanceConfig]:
+        """Return a small set of quality-preserving Docling benchmark candidates."""
+
+        detected_cpu = max(1, cpu_count or 1)
+        candidates = [
+            (4, 4),
+            (min(8, detected_cpu), min(8, detected_cpu)),
+            (detected_cpu, 4),
+            (detected_cpu, detected_cpu),
+        ]
+        seen: set[tuple[int, int]] = set()
+        resolved: list[PdfParserPerformanceConfig] = []
+        for num_threads, batch_size in candidates:
+            key = (num_threads, batch_size)
+            if key in seen:
+                continue
+            seen.add(key)
+            resolved.append(
+                PdfParserPerformanceConfig(
+                    num_threads=num_threads,
+                    device=device,
+                    ocr_batch_size=batch_size,
+                    layout_batch_size=batch_size,
+                    table_batch_size=batch_size,
+                )
+            )
+        return resolved
+
+    def _pipeline_options_for_config(self, config: PdfParserPerformanceConfig) -> Any:
         try:
-            from docling.datamodel.base_models import InputFormat
+            from docling.datamodel.accelerator_options import AcceleratorOptions
             from docling.datamodel.pipeline_options import PdfPipelineOptions
-            from docling.document_converter import DocumentConverter, PdfFormatOption
         except Exception as exc:  # noqa: BLE001
             raise AppError(
                 ErrorCode.INGEST_PDF_DOCLING_FAILED,
@@ -481,11 +576,293 @@ class DoclingPdfParser:
 
         options = PdfPipelineOptions()
         options.do_formula_enrichment = self.enable_docling_formula_enrichment
+        options.accelerator_options = AcceleratorOptions(
+            num_threads=config.num_threads,
+            device=config.device,
+        )
+        options.ocr_batch_size = config.ocr_batch_size
+        options.layout_batch_size = config.layout_batch_size
+        options.table_batch_size = config.table_batch_size
+        return options
+
+    def _build_docling_converter(self) -> Any:
+        try:
+            from docling.datamodel.base_models import InputFormat
+            from docling.document_converter import DocumentConverter, PdfFormatOption
+        except Exception as exc:  # noqa: BLE001
+            raise AppError(
+                ErrorCode.INGEST_PDF_DOCLING_FAILED,
+                "Docling formula pipeline dependencies are unavailable.",
+            ) from exc
+
+        _configure_docling_runtime_logging()
+        options = self._pipeline_options_for_config(self.performance_config)
         return DocumentConverter(
             format_options={
                 InputFormat.PDF: PdfFormatOption(pipeline_options=options),
             }
         )
+
+    def _get_docling_converter(self) -> Any:
+        cached = self._converter
+        if cached is not None:
+            return cached
+        with self._converter_lock:
+            if self._converter is None:
+                self._converter = self._build_docling_converter()
+            return self._converter
+
+    def _cleanup_docling_component(self, component: Any, seen: set[int]) -> None:
+        if component is None:
+            return
+        identity = id(component)
+        if identity in seen:
+            return
+        seen.add(identity)
+
+        for attr_name in ("engine", "actual_engine"):
+            nested = getattr(component, attr_name, None)
+            if nested is not None:
+                self._cleanup_docling_component(nested, seen)
+                try:
+                    setattr(component, attr_name, None)
+                except Exception:  # noqa: BLE001
+                    pass
+
+        cleanup = getattr(component, "cleanup", None)
+        if callable(cleanup):
+            try:
+                cleanup()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "docling_component_cleanup_failed "
+                    f"type={type(component).__name__} error={exc}"
+                )
+
+    def _pipeline_cleanup_components(self, pipeline: Any) -> list[Any]:
+        components: list[Any] = []
+        for attr_name in (
+            "preprocessing_model",
+            "ocr_model",
+            "layout_model",
+            "table_model",
+            "assemble_model",
+            "reading_order_model",
+        ):
+            component = getattr(pipeline, attr_name, None)
+            if component is not None:
+                components.append(component)
+        for attr_name in ("build_pipe", "enrichment_pipe"):
+            component_list = getattr(pipeline, attr_name, None)
+            if isinstance(component_list, list):
+                components.extend(component_list)
+        return components
+
+    def _close_converter_instance(self, converter: Any) -> None:
+        if converter is None:
+            return
+
+        initialized_pipelines = getattr(converter, "initialized_pipelines", None)
+        if not isinstance(initialized_pipelines, dict):
+            return
+
+        seen: set[int] = set()
+        for pipeline in initialized_pipelines.values():
+            for component in self._pipeline_cleanup_components(pipeline):
+                self._cleanup_docling_component(component, seen)
+        initialized_pipelines.clear()
+
+    def close(self) -> None:
+        """Release cached Docling pipelines and heavyweight runtime resources."""
+
+        with self._converter_lock:
+            converter = self._converter
+            pending_converter = self._pending_converter
+            self._converter = None
+            self._pending_converter = None
+            self._pending_converter_config = None
+
+        self._close_converter_instance(converter)
+        if pending_converter is not None and pending_converter is not converter:
+            self._close_converter_instance(pending_converter)
+
+    def _benchmark_docling_config(
+        self, *, pdf_path: Path, config: PdfParserPerformanceConfig
+    ) -> tuple[PdfParserBenchmarkRow, Any | None]:
+        try:
+            from docling.datamodel.base_models import InputFormat
+            from docling.document_converter import DocumentConverter, PdfFormatOption
+        except Exception as exc:  # noqa: BLE001
+            raise AppError(
+                ErrorCode.INGEST_PDF_DOCLING_FAILED,
+                "Docling formula pipeline dependencies are unavailable.",
+            ) from exc
+
+        _configure_docling_runtime_logging()
+        label = (
+            f"threads={config.num_threads},"
+            f"batches={config.ocr_batch_size}/{config.layout_batch_size}/{config.table_batch_size},"
+            f"device={config.device}"
+        )
+        converter: Any | None = None
+        try:
+            converter = DocumentConverter(
+                format_options={
+                    InputFormat.PDF: PdfFormatOption(
+                        pipeline_options=self._pipeline_options_for_config(config)
+                    ),
+                }
+            )
+            convert_started = time.perf_counter()
+            result = converter.convert(str(pdf_path))
+            convert_seconds = time.perf_counter() - convert_started
+            export_started = time.perf_counter()
+            markdown = result.document.export_to_markdown()
+            export_seconds = time.perf_counter() - export_started
+            return (
+                PdfParserBenchmarkRow(
+                    label=label,
+                    config=config,
+                    convert_seconds=convert_seconds,
+                    export_seconds=export_seconds,
+                    markdown_chars=len(markdown),
+                    formula_markers=markdown.count(_FORMULA_MARKER),
+                ),
+                converter,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._close_converter_instance(converter)
+            return (
+                PdfParserBenchmarkRow(
+                    label=label,
+                    config=config,
+                    error=str(exc),
+                ),
+                None,
+            )
+
+    def autotune(
+        self,
+        *,
+        pdf_path: str,
+        sample_pages: int = 20,
+        total_memory_bytes: int | None = None,
+        candidate_configs: list[PdfParserPerformanceConfig] | None = None,
+    ) -> PdfParserTuningProfile:
+        """Benchmark a few Docling performance profiles on a sampled PDF subset."""
+
+        path = Path(pdf_path).expanduser().resolve()
+        if not path.exists():
+            raise AppError(
+                ErrorCode.INGEST_DOC_NOT_FOUND,
+                f"Document not found: {pdf_path}",
+            )
+
+        if path.suffix.lower() != ".pdf":
+            raise AppError(
+                ErrorCode.INGEST_UNSUPPORTED_TYPE,
+                "document_autotune_pdf_parser only supports PDF documents",
+                details={"path": str(path)},
+            )
+
+        configs = candidate_configs or self.benchmark_candidates(
+            cpu_count=os.cpu_count(),
+            device=self.performance_config.device,
+        )
+        if not configs:
+            raise AppError(
+                ErrorCode.INGEST_PDF_DOCLING_FAILED,
+                "No benchmark candidates were generated for Docling autotune.",
+            )
+
+        with tempfile.TemporaryDirectory(prefix="mcp-ebook-read-bench-") as temp_dir:
+            subset_root = Path(temp_dir)
+            subset_path = subset_root / "subset.pdf"
+            warmup_path = subset_root / "warmup.pdf"
+            with fitz.open(str(path)) as source:
+                page_limit = min(max(1, sample_pages), source.page_count)
+                subset = fitz.open()
+                warmup = fitz.open()
+                try:
+                    subset.insert_pdf(source, from_page=0, to_page=page_limit - 1)
+                    subset.save(str(subset_path))
+                    warmup.insert_pdf(source, from_page=0, to_page=0)
+                    warmup.save(str(warmup_path))
+                finally:
+                    subset.close()
+                    warmup.close()
+
+            warmup_row, warmup_converter = self._benchmark_docling_config(
+                pdf_path=warmup_path,
+                config=configs[0],
+            )
+            self._close_converter_instance(warmup_converter)
+            logger.info(
+                "docling_autotune_warmup_complete "
+                f"path={path} sample_pages={page_limit} error={warmup_row.error}"
+            )
+
+            benchmarks: list[PdfParserBenchmarkRow] = []
+            benchmark_converters: list[tuple[PdfParserBenchmarkRow, Any]] = []
+            for config in configs:
+                row, converter = self._benchmark_docling_config(
+                    pdf_path=subset_path,
+                    config=config,
+                )
+                logger.info(
+                    "docling_autotune_candidate_complete "
+                    f"path={path} label={row.label} convert_seconds={row.convert_seconds} "
+                    f"export_seconds={row.export_seconds} error={row.error}"
+                )
+                benchmarks.append(row)
+                if converter is not None:
+                    benchmark_converters.append((row, converter))
+
+            successful = [
+                (row, converter)
+                for row, converter in benchmark_converters
+                if row.error is None and row.convert_seconds is not None
+            ]
+            if not successful:
+                for _, converter in benchmark_converters:
+                    self._close_converter_instance(converter)
+                raise AppError(
+                    ErrorCode.INGEST_PDF_DOCLING_FAILED,
+                    f"Docling autotune failed for {path}",
+                    details={
+                        "path": str(path),
+                        "sample_pages": page_limit,
+                        "benchmarks": [
+                            row.model_dump(mode="json") for row in benchmarks
+                        ],
+                    },
+                )
+
+            selected_row, selected_converter = min(
+                successful,
+                key=lambda item: item[0].convert_seconds or float("inf"),
+            )
+            with self._converter_lock:
+                previous_pending = self._pending_converter
+                self._pending_converter = selected_converter
+                self._pending_converter_config = selected_row.config
+            if (
+                previous_pending is not None
+                and previous_pending is not selected_converter
+            ):
+                self._close_converter_instance(previous_pending)
+            for _, converter in benchmark_converters:
+                if converter is not selected_converter:
+                    self._close_converter_instance(converter)
+            return PdfParserTuningProfile(
+                created_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                source_path=str(path),
+                sample_pages=page_limit,
+                cpu_count=max(1, os.cpu_count() or 1),
+                total_memory_bytes=total_memory_bytes,
+                selected_config=selected_row.config,
+                benchmarks=benchmarks,
+            )
 
     def _render_page_image(self, pdf_doc: fitz.Document, page: int) -> Image.Image:
         page_obj = pdf_doc.load_page(page - 1)
@@ -616,7 +993,7 @@ class DoclingPdfParser:
             )
 
         try:
-            converter = self._build_docling_converter()
+            converter = self._get_docling_converter()
             result = converter.convert(str(path))
             document = result.document
             markdown = document.export_to_markdown()

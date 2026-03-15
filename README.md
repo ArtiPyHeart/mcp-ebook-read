@@ -65,6 +65,10 @@ Optional:
 - `DOCLING_FORMULA_ENRICHMENT` (`true` by default)
 - `PDF_FORMULA_REQUIRE_ENGINE` (`true` by default)
 - `PDF_FORMULA_BATCH_SIZE` (`auto` by default; or an explicit integer)
+- `PDF_DOCLING_NUM_THREADS` (override Docling CPU threads)
+- `PDF_DOCLING_BATCH_SIZE` (override Docling OCR/layout/table batch sizes together)
+- `PDF_DOCLING_DEVICE` (override Docling accelerator device, for example `auto` or `cpu`)
+- `PDF_DOCLING_TUNING_PROFILE_PATH` (override the local autotune profile JSON path)
 
 ## Persistence Model
 
@@ -86,6 +90,7 @@ Optional:
 - Use `document_ingest_pdf_paper` to queue a background ingest job for a PDF paper. Docling remains the canonical page-aware outline; GROBID enriches paper metadata and title.
 - Use `document_ingest_status` to poll the current status of one ingest job (or the latest job for a document).
 - Use `document_ingest_list_jobs` to inspect recent ingest job history for one document.
+- Use `document_autotune_pdf_parser` before a long PDF ingest when you want to benchmark a few Docling thread/batch profiles on sampled pages and persist the best local profile for later runs.
 - Use `search_in_outline_node` when you need chapter-scoped retrieval (recommended for reading workflows).
 - Use `get_outline` to fetch document outline nodes before chapter/formula/image scoped reading.
 - Use `read_outline_node` to read a chapter/outline node directly without locator stitching.
@@ -109,6 +114,10 @@ Optional:
   - `DOCLING_FORMULA_ENRICHMENT` (`true` by default)
   - `PDF_FORMULA_REQUIRE_ENGINE` (`true` by default)
   - `PDF_FORMULA_BATCH_SIZE` (`auto` by default; auto-detected from CPU and memory, or set an explicit integer)
+- Optional Docling performance controls:
+  - `document_autotune_pdf_parser` benchmarks a sampled subset of one PDF and writes the selected profile to a local JSON cache.
+  - By default the tuning profile lives at `~/Library/Caches/mcp-ebook-read/docling_pdf_tuning.json` on macOS and `$XDG_CACHE_HOME/mcp-ebook-read/docling_pdf_tuning.json` (or `~/.cache/...`) elsewhere.
+  - `PDF_DOCLING_NUM_THREADS` and `PDF_DOCLING_BATCH_SIZE` override the cached profile when you need a fixed setting.
 - Sidecar cleanup is explicit:
   - `library_scan` no longer triggers threshold-based auto compaction.
   - Use `storage_cleanup_sidecars(..., compact_catalog=true)` when you want compaction.

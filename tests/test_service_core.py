@@ -20,6 +20,8 @@ from mcp_ebook_read.schema.models import (
     Locator,
     OutlineNode,
     ParsedDocument,
+    PdfParserPerformanceConfig,
+    PdfParserTuningProfile,
 )
 from mcp_ebook_read.service import AppService
 
@@ -51,6 +53,7 @@ class RecordingParser:
         self.result = result
         self.error = error
         self.calls: list[tuple[str, str]] = []
+        self.close_calls = 0
 
     def parse(self, path: str, doc_id: str) -> ParsedDocument:
         self.calls.append((path, doc_id))
@@ -59,6 +62,36 @@ class RecordingParser:
         if self.result is None:
             raise RuntimeError("parser result not configured")
         return self.result
+
+    def autotune(
+        self,
+        *,
+        pdf_path: str,
+        sample_pages: int,
+        total_memory_bytes: int | None,
+        candidate_configs=None,  # noqa: ANN001
+    ) -> PdfParserTuningProfile:
+        selected = PdfParserPerformanceConfig(
+            num_threads=8,
+            ocr_batch_size=6,
+            layout_batch_size=6,
+            table_batch_size=6,
+        )
+        return PdfParserTuningProfile(
+            created_at="2026-03-15T00:00:00Z",
+            source_path=pdf_path,
+            sample_pages=sample_pages,
+            cpu_count=8,
+            total_memory_bytes=total_memory_bytes,
+            selected_config=selected,
+            benchmarks=[],
+        )
+
+    def set_performance_config(self, config: PdfParserPerformanceConfig) -> None:
+        self.performance_config = config
+
+    def close(self) -> None:
+        self.close_calls += 1
 
 
 class BlockingParser(RecordingParser):
@@ -407,6 +440,79 @@ def test_document_ingest_pdf_book_success(tmp_path: Path) -> None:
     assert loaded is not None
     assert loaded.status == DocumentStatus.READY
     assert loaded.title == "PDF Book"
+
+
+def test_document_autotune_pdf_parser_persists_profile_and_updates_parser(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pdf_path = tmp_path / "autotune.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4")
+    parser = RecordingParser(result=_parsed("doc1", title="PDF", method="docling"))
+    service = _build_service(
+        tmp_path,
+        pdf_parser=parser,
+        epub_parser=RecordingParser(
+            result=_parsed("doc2", title="EPUB", method="epub")
+        ),
+        grobid=RecordingGrobid(),
+    )
+    profile_path = tmp_path / "runtime" / "docling_tuning.json"
+    monkeypatch.setenv("PDF_DOCLING_TUNING_PROFILE_PATH", str(profile_path))
+
+    result = service.document_autotune_pdf_parser(
+        doc_id=None,
+        path=str(pdf_path),
+        sample_pages=11,
+    )
+
+    assert result["doc_id"] is None
+    assert result["path"] == str(pdf_path.resolve())
+    assert result["profile_path"] == str(profile_path)
+    assert result["selected_config"]["num_threads"] == 8
+    assert parser.performance_config.num_threads == 8
+    assert profile_path.exists()
+
+
+def test_document_autotune_pdf_parser_accepts_scanned_doc_id(tmp_path: Path) -> None:
+    pdf_path = tmp_path / "library" / "scan.pdf"
+    pdf_path.parent.mkdir(parents=True, exist_ok=True)
+    pdf_path.write_bytes(b"%PDF-1.4")
+    parser = RecordingParser(result=_parsed("doc1", title="PDF", method="docling"))
+    service = _build_service(
+        tmp_path,
+        pdf_parser=parser,
+        epub_parser=RecordingParser(
+            result=_parsed("doc2", title="EPUB", method="epub")
+        ),
+        grobid=RecordingGrobid(),
+    )
+    _register_doc(service, "doc-scan", pdf_path, DocumentType.PDF)
+
+    result = service.document_autotune_pdf_parser(
+        doc_id="doc-scan",
+        path=None,
+        sample_pages=7,
+    )
+
+    assert result["doc_id"] == "doc-scan"
+    assert result["sample_pages"] == 7
+
+
+def test_service_close_closes_pdf_parser_once(tmp_path: Path) -> None:
+    parser = RecordingParser(result=_parsed("doc1", title="PDF", method="docling"))
+    service = _build_service(
+        tmp_path,
+        pdf_parser=parser,
+        epub_parser=RecordingParser(
+            result=_parsed("doc2", title="EPUB", method="epub")
+        ),
+        grobid=RecordingGrobid(),
+    )
+
+    service.close()
+    service.close()
+
+    assert parser.close_calls == 1
 
 
 def test_document_ingest_cached_ready_without_force(tmp_path: Path) -> None:

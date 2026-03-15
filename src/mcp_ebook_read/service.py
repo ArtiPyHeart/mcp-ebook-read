@@ -50,6 +50,8 @@ from mcp_ebook_read.schema.models import (
     OutlineNode,
     ParsedDocument,
     Profile,
+    PdfParserPerformanceConfig,
+    PdfParserTuningProfile,
 )
 from mcp_ebook_read.store.catalog import CatalogStore
 
@@ -80,12 +82,21 @@ class AppService:
         self._known_roots: set[str] = set()
         self._ingest_queue: Queue[tuple[str, str]] = Queue()
         self._ingest_lock = threading.Lock()
+        self._closed = False
         self._ingest_worker = threading.Thread(
             target=self._ingest_worker_loop,
             name="mcp-ebook-read-ingest-worker",
             daemon=True,
         )
         self._ingest_worker.start()
+
+    def close(self) -> None:
+        """Release process-scoped resources owned by the service."""
+
+        if self._closed:
+            return
+        self._closed = True
+        self.pdf_parser.close()
 
     @staticmethod
     def _detect_total_memory_bytes() -> int | None:
@@ -151,6 +162,103 @@ class AppService:
             )
         return batch_size
 
+    @staticmethod
+    def _pdf_tuning_profile_path() -> Path:
+        override = os.environ.get("PDF_DOCLING_TUNING_PROFILE_PATH")
+        if override and override.strip():
+            return Path(override).expanduser()
+        if sys.platform == "darwin":
+            return (
+                Path.home()
+                / "Library"
+                / "Caches"
+                / "mcp-ebook-read"
+                / "docling_pdf_tuning.json"
+            )
+        xdg_cache_home = os.environ.get("XDG_CACHE_HOME")
+        if xdg_cache_home and xdg_cache_home.strip():
+            cache_root = Path(xdg_cache_home).expanduser()
+        else:
+            cache_root = Path.home() / ".cache"
+        return cache_root / "mcp-ebook-read" / "docling_pdf_tuning.json"
+
+    @classmethod
+    def _load_pdf_tuning_profile(cls) -> PdfParserTuningProfile | None:
+        profile_path = cls._pdf_tuning_profile_path()
+        if not profile_path.exists():
+            return None
+        try:
+            return PdfParserTuningProfile.model_validate_json(
+                profile_path.read_text(encoding="utf-8")
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                f"pdf_docling_tuning_profile_invalid path={profile_path} error={exc}"
+            )
+            return None
+
+    @classmethod
+    def _write_pdf_tuning_profile(cls, profile: PdfParserTuningProfile) -> Path:
+        profile_path = cls._pdf_tuning_profile_path()
+        profile_path.parent.mkdir(parents=True, exist_ok=True)
+        profile_path.write_text(
+            profile.model_dump_json(indent=2),
+            encoding="utf-8",
+        )
+        return profile_path
+
+    @classmethod
+    def _resolve_positive_int_env(
+        cls,
+        *,
+        env_name: str,
+        default: int,
+    ) -> int:
+        raw_value = os.environ.get(env_name)
+        if raw_value is None or not raw_value.strip():
+            return default
+        try:
+            value = int(raw_value)
+        except ValueError as exc:
+            raise AppError(
+                ErrorCode.STARTUP_DEPENDENCY_NOT_READY,
+                f"{env_name} must be a positive integer.",
+                details={"env": env_name, "value": raw_value},
+            ) from exc
+        if value < 1:
+            raise AppError(
+                ErrorCode.STARTUP_DEPENDENCY_NOT_READY,
+                f"{env_name} must be >= 1.",
+                details={"env": env_name, "value": raw_value},
+            )
+        return value
+
+    @classmethod
+    def _resolve_docling_performance_config(cls) -> PdfParserPerformanceConfig:
+        tuned_profile = cls._load_pdf_tuning_profile()
+        base = (
+            tuned_profile.selected_config
+            if tuned_profile is not None
+            else PdfParserPerformanceConfig()
+        )
+        batch_size = cls._resolve_positive_int_env(
+            env_name="PDF_DOCLING_BATCH_SIZE",
+            default=base.ocr_batch_size,
+        )
+        device = (
+            os.environ.get("PDF_DOCLING_DEVICE", base.device).strip() or base.device
+        )
+        return PdfParserPerformanceConfig(
+            num_threads=cls._resolve_positive_int_env(
+                env_name="PDF_DOCLING_NUM_THREADS",
+                default=base.num_threads,
+            ),
+            device=device,
+            ocr_batch_size=batch_size,
+            layout_batch_size=batch_size,
+            table_batch_size=batch_size,
+        )
+
     @classmethod
     def from_env(cls) -> "AppService":
         preflight_errors: list[dict[str, Any]] = []
@@ -214,6 +322,19 @@ class AppService:
             )
             formula_batch_size = 1
 
+        try:
+            docling_performance_config = cls._resolve_docling_performance_config()
+        except AppError as exc:
+            preflight_errors.append(
+                {
+                    "component": "config",
+                    "code": exc.code,
+                    "message": exc.message,
+                    "details": exc.details or None,
+                }
+            )
+            docling_performance_config = PdfParserPerformanceConfig()
+
         if preflight_errors:
             raise AppError(
                 ErrorCode.STARTUP_DEPENDENCY_NOT_READY,
@@ -243,6 +364,7 @@ class AppService:
                 ),
                 require_formula_engine=env_bool("PDF_FORMULA_REQUIRE_ENGINE", True),
                 formula_batch_size=formula_batch_size,
+                performance_config=docling_performance_config,
             ),
             pdf_image_extractor=PdfImageExtractor(min_area_ratio=0.01),
             grobid_client=grobid_client,
@@ -368,6 +490,55 @@ class AppService:
         raise AppError(
             ErrorCode.INGEST_DOC_NOT_FOUND, "Document not found by doc_id or path"
         )
+
+    def _resolve_pdf_path_for_autotune(
+        self, doc_id: str | None, path: str | None
+    ) -> tuple[Path, str | None]:
+        if path:
+            resolved = Path(path).expanduser().resolve()
+            if not resolved.exists() or not resolved.is_file():
+                raise AppError(
+                    ErrorCode.INGEST_DOC_NOT_FOUND,
+                    f"Document not found: {path}",
+                )
+            if resolved.suffix.lower() != ".pdf":
+                raise AppError(
+                    ErrorCode.INGEST_UNSUPPORTED_TYPE,
+                    "document_autotune_pdf_parser only supports PDF documents",
+                    details={"path": str(resolved)},
+                )
+            if doc_id is not None:
+                resolved_doc, _catalog = self._resolve_doc(doc_id, str(resolved))
+                if resolved_doc.type != DocumentType.PDF:
+                    raise AppError(
+                        ErrorCode.INGEST_UNSUPPORTED_TYPE,
+                        "document_autotune_pdf_parser only supports PDF documents",
+                        details={
+                            "doc_id": resolved_doc.doc_id,
+                            "type": resolved_doc.type,
+                        },
+                    )
+                return resolved, resolved_doc.doc_id
+            return resolved, None
+
+        if doc_id is None:
+            raise AppError(
+                ErrorCode.INGEST_DOC_NOT_FOUND,
+                "Document not found by doc_id or path",
+            )
+
+        doc, _catalog = self._require_doc(
+            doc_id,
+            error_code=ErrorCode.INGEST_DOC_NOT_FOUND,
+            message="Document not found by doc_id or path",
+        )
+        if doc.type != DocumentType.PDF:
+            raise AppError(
+                ErrorCode.INGEST_UNSUPPORTED_TYPE,
+                "document_autotune_pdf_parser only supports PDF documents",
+                details={"doc_id": doc.doc_id, "type": doc.type},
+            )
+        return Path(doc.path).expanduser().resolve(), doc.doc_id
 
     def _doc_type_from_path(self, path: Path) -> DocumentType:
         suffix = path.suffix.lower()
@@ -954,6 +1125,40 @@ class AppService:
                 doc.doc_id, DocumentStatus.FAILED, profile=profile
             )
             raise
+
+    def document_autotune_pdf_parser(
+        self,
+        *,
+        doc_id: str | None,
+        path: str | None,
+        sample_pages: int = 20,
+    ) -> dict[str, Any]:
+        resolved_path, resolved_doc_id = self._resolve_pdf_path_for_autotune(
+            doc_id, path
+        )
+        profile = self.pdf_parser.autotune(
+            pdf_path=str(resolved_path),
+            sample_pages=sample_pages,
+            total_memory_bytes=self._detect_total_memory_bytes(),
+        )
+        profile_path = self._write_pdf_tuning_profile(profile)
+        self.pdf_parser.set_performance_config(profile.selected_config)
+        logger.info(
+            "pdf_docling_autotune_applied "
+            f"path={resolved_path} profile_path={profile_path} "
+            f"threads={profile.selected_config.num_threads} "
+            f"batch={profile.selected_config.ocr_batch_size}"
+        )
+        return {
+            "doc_id": resolved_doc_id,
+            "path": str(resolved_path),
+            "profile_path": str(profile_path),
+            "selected_config": profile.selected_config.model_dump(mode="json"),
+            "benchmarks": [row.model_dump(mode="json") for row in profile.benchmarks],
+            "sample_pages": profile.sample_pages,
+            "cpu_count": profile.cpu_count,
+            "total_memory_bytes": profile.total_memory_bytes,
+        }
 
     def document_ingest_pdf_book(
         self, *, doc_id: str | None, path: str | None, force: bool
