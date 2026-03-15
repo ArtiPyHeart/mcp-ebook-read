@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 import threading
 import time
@@ -440,6 +441,46 @@ def test_document_ingest_pdf_book_success(tmp_path: Path) -> None:
     assert loaded is not None
     assert loaded.status == DocumentStatus.READY
     assert loaded.title == "PDF Book"
+
+
+def test_document_ingest_stage_log_uses_safe_extra_key(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    doc_id = "docpdf-stage-log"
+    pdf_path = tmp_path / "book.pdf"
+    pdf_path.write_bytes(b"pdf")
+
+    service = _build_service(
+        tmp_path,
+        pdf_parser=RecordingParser(
+            result=_parsed(doc_id, title="PDF Book", method="docling")
+        ),
+        epub_parser=RecordingParser(result=_parsed("x", title="X", method="ebooklib")),
+        grobid=RecordingGrobid(),
+    )
+    _register_doc(service, doc_id, pdf_path, DocumentType.PDF)
+
+    with caplog.at_level(logging.INFO, logger="mcp_ebook_read.service"):
+        queued = service.document_ingest_pdf_book(
+            doc_id=doc_id,
+            path=None,
+            force=True,
+        )
+        status = _wait_for_ingest_job(
+            service,
+            doc_id=doc_id,
+            job_id=queued["job_id"],
+        )
+
+    assert status["status"] == IngestJobStatus.SUCCEEDED
+    stage_records = [
+        record for record in caplog.records if record.msg == "ingest_job_stage"
+    ]
+    assert stage_records
+    assert any(
+        getattr(record, "stage_message", None) == "Parsing PDF book with Docling."
+        for record in stage_records
+    )
 
 
 def test_document_autotune_pdf_parser_persists_profile_and_updates_parser(

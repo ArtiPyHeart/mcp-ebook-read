@@ -53,6 +53,7 @@
 
 ## Lessons Learned
 - Keep MCP protocol output isolated from logs: write logs to stderr only.
+- Stdlib logging `extra` payloads must avoid reserved `LogRecord` keys like `message`; Python 3.13 raises `KeyError` when they are overwritten.
 - Keep retrieval single-path: Qdrant + FastEmbed only; avoid adding BM25 fallback.
 - Qdrant container must publish host port 6333 (or set QDRANT_URL explicitly) before starting the MCP server.
 - Runtime must pass README-documented env vars explicitly; `document_ingest_pdf_paper` always requires `GROBID_URL` (and usually `GROBID_TIMEOUT_SECONDS`).

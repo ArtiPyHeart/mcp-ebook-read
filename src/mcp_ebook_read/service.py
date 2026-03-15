@@ -763,7 +763,7 @@ class AppService:
                     "doc_id": doc_id,
                     "job_id": job_id,
                     "stage": stage,
-                    "message": message,
+                    "stage_message": message,
                 },
             )
 
