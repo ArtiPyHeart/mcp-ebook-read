@@ -14,6 +14,9 @@ from mcp_ebook_read.schema.models import (
     DocumentRecord,
     DocumentStatus,
     FormulaRecord,
+    IngestJobRecord,
+    IngestJobStatus,
+    IngestStage,
     ImageRecord,
     OutlineNode,
     Profile,
@@ -116,6 +119,27 @@ class CatalogStore:
 
                 CREATE INDEX IF NOT EXISTS idx_images_doc
                 ON images(doc_id, order_index);
+
+                CREATE TABLE IF NOT EXISTS ingest_jobs (
+                    job_id TEXT PRIMARY KEY,
+                    doc_id TEXT NOT NULL,
+                    path TEXT NOT NULL,
+                    profile TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    stage TEXT NOT NULL,
+                    force INTEGER NOT NULL,
+                    message TEXT,
+                    result_json TEXT,
+                    error_json TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    started_at TEXT,
+                    finished_at TEXT,
+                    FOREIGN KEY (doc_id) REFERENCES documents(doc_id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_ingest_jobs_doc_created
+                ON ingest_jobs(doc_id, created_at DESC);
                 """
             )
             image_columns = {
@@ -126,6 +150,22 @@ class CatalogStore:
                 conn.execute("ALTER TABLE images ADD COLUMN page INTEGER")
             if "bbox_json" not in image_columns:
                 conn.execute("ALTER TABLE images ADD COLUMN bbox_json TEXT")
+            conn.execute(
+                """
+                UPDATE ingest_jobs
+                SET status = ?, stage = ?, message = ?, updated_at = ?, finished_at = ?
+                WHERE status IN (?, ?)
+                """,
+                (
+                    IngestJobStatus.FAILED,
+                    IngestStage.FAILED,
+                    "Job was interrupted by a previous server shutdown or restart.",
+                    datetime.now(UTC).isoformat(),
+                    datetime.now(UTC).isoformat(),
+                    IngestJobStatus.QUEUED,
+                    IngestJobStatus.RUNNING,
+                ),
+            )
 
     def upsert_scanned_document(self, doc: DocumentRecord) -> str:
         """Upsert discovered document and return added|updated|unchanged."""
@@ -278,6 +318,130 @@ class CatalogStore:
                 """
             ).fetchall()
             return [self._row_to_document(row) for row in rows]
+
+    def create_ingest_job(self, job: IngestJobRecord) -> None:
+        with self._conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO ingest_jobs (
+                    job_id, doc_id, path, profile, status, stage, force, message,
+                    result_json, error_json, created_at, updated_at, started_at, finished_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    job.job_id,
+                    job.doc_id,
+                    job.path,
+                    job.profile,
+                    job.status,
+                    job.stage,
+                    1 if job.force else 0,
+                    job.message,
+                    json.dumps(job.result) if job.result is not None else None,
+                    json.dumps(job.error) if job.error is not None else None,
+                    job.created_at,
+                    job.updated_at,
+                    job.started_at,
+                    job.finished_at,
+                ),
+            )
+
+    def get_ingest_job(
+        self, doc_id: str, job_id: str | None = None
+    ) -> IngestJobRecord | None:
+        with self._conn() as conn:
+            if job_id:
+                row = conn.execute(
+                    """
+                    SELECT * FROM ingest_jobs
+                    WHERE doc_id = ? AND job_id = ?
+                    """,
+                    (doc_id, job_id),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    """
+                    SELECT * FROM ingest_jobs
+                    WHERE doc_id = ?
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                    """,
+                    (doc_id,),
+                ).fetchone()
+            return self._row_to_ingest_job(row) if row else None
+
+    def list_ingest_jobs(self, doc_id: str, limit: int = 20) -> list[IngestJobRecord]:
+        capped_limit = max(1, min(limit, 200))
+        with self._conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM ingest_jobs
+                WHERE doc_id = ?
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (doc_id, capped_limit),
+            ).fetchall()
+            return [self._row_to_ingest_job(row) for row in rows]
+
+    def get_active_ingest_job(self, doc_id: str) -> IngestJobRecord | None:
+        with self._conn() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM ingest_jobs
+                WHERE doc_id = ? AND status IN (?, ?)
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (
+                    doc_id,
+                    IngestJobStatus.QUEUED,
+                    IngestJobStatus.RUNNING,
+                ),
+            ).fetchone()
+            return self._row_to_ingest_job(row) if row else None
+
+    def update_ingest_job(
+        self,
+        job_id: str,
+        *,
+        status: IngestJobStatus | None = None,
+        stage: IngestStage | None = None,
+        message: str | None = None,
+        result: dict[str, Any] | None = None,
+        error: dict[str, Any] | None = None,
+        started_at: str | None = None,
+        finished_at: str | None = None,
+    ) -> None:
+        assignments: list[str] = ["updated_at = ?"]
+        values: list[Any] = [datetime.now(UTC).isoformat()]
+        if status is not None:
+            assignments.append("status = ?")
+            values.append(status)
+        if stage is not None:
+            assignments.append("stage = ?")
+            values.append(stage)
+        if message is not None:
+            assignments.append("message = ?")
+            values.append(message)
+        if result is not None:
+            assignments.append("result_json = ?")
+            values.append(json.dumps(result))
+        if error is not None:
+            assignments.append("error_json = ?")
+            values.append(json.dumps(error))
+        if started_at is not None:
+            assignments.append("started_at = ?")
+            values.append(started_at)
+        if finished_at is not None:
+            assignments.append("finished_at = ?")
+            values.append(finished_at)
+        values.append(job_id)
+        with self._conn() as conn:
+            conn.execute(
+                f"UPDATE ingest_jobs SET {', '.join(assignments)} WHERE job_id = ?",
+                values,
+            )
 
     def set_document_status(
         self, doc_id: str, status: DocumentStatus, profile: Profile | None = None
@@ -558,4 +722,22 @@ class CatalogStore:
             height=row["height"],
             source=row["source"],
             status=row["status"],
+        )
+
+    def _row_to_ingest_job(self, row: sqlite3.Row) -> IngestJobRecord:
+        return IngestJobRecord(
+            job_id=row["job_id"],
+            doc_id=row["doc_id"],
+            path=row["path"],
+            profile=row["profile"],
+            status=row["status"],
+            stage=row["stage"],
+            force=bool(row["force"]),
+            message=row["message"],
+            result=json.loads(row["result_json"]) if row["result_json"] else None,
+            error=json.loads(row["error_json"]) if row["error_json"] else None,
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+            started_at=row["started_at"],
+            finished_at=row["finished_at"],
         )

@@ -25,6 +25,27 @@ class Profile(StrEnum):
     PAPER = "paper"
 
 
+class IngestJobStatus(StrEnum):
+    QUEUED = "queued"
+    RUNNING = "running"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    CANCELED = "canceled"
+
+
+class IngestStage(StrEnum):
+    QUEUED = "queued"
+    CACHED = "cached"
+    GROBID = "grobid"
+    PARSE = "parse"
+    PERSIST = "persist"
+    INDEX = "index"
+    FINALIZE = "finalize"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELED = "canceled"
+
+
 class OutlineNode(BaseModel):
     id: str
     title: str
@@ -138,6 +159,23 @@ class ParsedDocument(BaseModel):
     reading_markdown: str
     raw_artifacts: dict[str, str] = Field(default_factory=dict)
     overall_confidence: float | None = None
+
+
+class IngestJobRecord(BaseModel):
+    job_id: str
+    doc_id: str
+    path: str
+    profile: Profile
+    status: IngestJobStatus
+    stage: IngestStage
+    force: bool = False
+    message: str | None = None
+    result: dict[str, Any] | None = None
+    error: dict[str, Any] | None = None
+    created_at: str
+    updated_at: str
+    started_at: str | None = None
+    finished_at: str | None = None
 
 
 class ToolEnvelope(BaseModel):

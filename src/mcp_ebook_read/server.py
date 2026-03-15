@@ -115,7 +115,7 @@ def document_ingest_pdf_book(
     path: str | None = None,
     force: bool = False,
 ) -> dict[str, Any]:
-    """Ingest one PDF book document."""
+    """Queue one PDF book ingest job for background execution."""
     return _require_service().document_ingest_pdf_book(
         doc_id=doc_id, path=path, force=force
     )
@@ -128,7 +128,7 @@ def document_ingest_epub_book(
     path: str | None = None,
     force: bool = False,
 ) -> dict[str, Any]:
-    """Ingest one EPUB book document."""
+    """Queue one EPUB book ingest job for background execution."""
     return _require_service().document_ingest_epub_book(
         doc_id=doc_id, path=path, force=force
     )
@@ -141,10 +141,30 @@ def document_ingest_pdf_paper(
     path: str | None = None,
     force: bool = False,
 ) -> dict[str, Any]:
-    """Ingest one PDF paper document (Docling + GROBID)."""
+    """Queue one PDF paper ingest job for background execution."""
     return _require_service().document_ingest_pdf_paper(
         doc_id=doc_id, path=path, force=force
     )
+
+
+@mcp.tool()
+@tool_handler
+def document_ingest_status(
+    doc_id: str,
+    job_id: str | None = None,
+) -> dict[str, Any]:
+    """Read current status for one background ingest job, or the latest job for a document."""
+    return _require_service().document_ingest_status(doc_id=doc_id, job_id=job_id)
+
+
+@mcp.tool()
+@tool_handler
+def document_ingest_list_jobs(
+    doc_id: str,
+    limit: int = 20,
+) -> dict[str, Any]:
+    """List recent background ingest jobs for one document."""
+    return _require_service().document_ingest_list_jobs(doc_id=doc_id, limit=limit)
 
 
 @mcp.tool()

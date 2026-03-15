@@ -2,18 +2,24 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from collections import defaultdict
+from datetime import UTC, datetime
 import json
 import hashlib
 import logging
 import os
+from queue import Empty, Queue
 import shutil
 import subprocess
 import sys
+import threading
+import traceback
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
-from mcp_ebook_read.errors import AppError, ErrorCode
+from mcp_ebook_read.errors import AppError, ErrorCode, to_error_payload
 from mcp_ebook_read.index.vector import QdrantVectorIndex
 from mcp_ebook_read.outline import (
     find_outline_node,
@@ -37,6 +43,9 @@ from mcp_ebook_read.schema.models import (
     ExtractedImage,
     FormulaRecord,
     ImageRecord,
+    IngestJobRecord,
+    IngestJobStatus,
+    IngestStage,
     Locator,
     OutlineNode,
     ParsedDocument,
@@ -69,6 +78,14 @@ class AppService:
         self._catalogs: dict[str, CatalogStore] = {}
         self._doc_catalog_index: dict[str, str] = {}
         self._known_roots: set[str] = set()
+        self._ingest_queue: Queue[tuple[str, str]] = Queue()
+        self._ingest_lock = threading.Lock()
+        self._ingest_worker = threading.Thread(
+            target=self._ingest_worker_loop,
+            name="mcp-ebook-read-ingest-worker",
+            daemon=True,
+        )
+        self._ingest_worker.start()
 
     @staticmethod
     def _detect_total_memory_bytes() -> int | None:
@@ -370,6 +387,263 @@ class AppService:
                 h.update(chunk)
         return h.hexdigest()
 
+    def _now_iso(self) -> str:
+        return datetime.now(UTC).isoformat()
+
+    def _ingest_result_from_doc(
+        self, doc: DocumentRecord, catalog: CatalogStore
+    ) -> dict[str, Any]:
+        chunks = catalog.list_chunks(doc.doc_id)
+        return {
+            "doc_id": doc.doc_id,
+            "profile": doc.profile,
+            "parser_chain": doc.parser_chain,
+            "chunks_count": len(chunks),
+            "formulas_count": len(catalog.list_formulas(doc.doc_id)),
+            "images_count": len(catalog.list_images(doc.doc_id)),
+            "outline_depth": max((node.level for node in doc.outline), default=0),
+            "overall_confidence": doc.overall_confidence,
+        }
+
+    def _serialize_ingest_job(self, job: IngestJobRecord) -> dict[str, Any]:
+        return {
+            "job_id": job.job_id,
+            "doc_id": job.doc_id,
+            "path": job.path,
+            "profile": job.profile,
+            "status": job.status,
+            "stage": job.stage,
+            "force": job.force,
+            "message": job.message,
+            "result": job.result,
+            "error": job.error,
+            "created_at": job.created_at,
+            "updated_at": job.updated_at,
+            "started_at": job.started_at,
+            "finished_at": job.finished_at,
+        }
+
+    def _ingest_job_payload(
+        self,
+        job: IngestJobRecord,
+        *,
+        deduplicated: bool = False,
+        cached: bool = False,
+    ) -> dict[str, Any]:
+        payload = self._serialize_ingest_job(job)
+        payload["deduplicated"] = deduplicated
+        payload["cached"] = cached
+        payload["hint"] = (
+            "Call document_ingest_status(doc_id=..., job_id=...) to poll status."
+        )
+        return payload
+
+    def _set_job_stage(
+        self,
+        *,
+        catalog: CatalogStore,
+        job_id: str,
+        status: IngestJobStatus | None = None,
+        stage: IngestStage | None = None,
+        message: str | None = None,
+        result: dict[str, Any] | None = None,
+        error: dict[str, Any] | None = None,
+        started_at: str | None = None,
+        finished_at: str | None = None,
+    ) -> None:
+        catalog.update_ingest_job(
+            job_id,
+            status=status,
+            stage=stage,
+            message=message,
+            result=result,
+            error=error,
+            started_at=started_at,
+            finished_at=finished_at,
+        )
+
+    def _submit_ingest_job(
+        self,
+        *,
+        doc: DocumentRecord,
+        catalog: CatalogStore,
+        profile: Profile,
+        expected_doc_type: DocumentType,
+        force: bool,
+        ingest_mode: str,
+    ) -> dict[str, Any]:
+        if doc.type != expected_doc_type:
+            raise AppError(
+                ErrorCode.INGEST_UNSUPPORTED_TYPE,
+                f"{ingest_mode} only supports {expected_doc_type.value} documents",
+                details={
+                    "ingest_mode": ingest_mode,
+                    "doc_type": doc.type,
+                    "supported_doc_types": [expected_doc_type],
+                },
+            )
+        active = catalog.get_active_ingest_job(doc.doc_id)
+        if active is not None and active.profile == profile:
+            return self._ingest_job_payload(active, deduplicated=True)
+
+        if doc.status == DocumentStatus.READY and not force and doc.profile == profile:
+            now = self._now_iso()
+            job = IngestJobRecord(
+                job_id=uuid4().hex,
+                doc_id=doc.doc_id,
+                path=doc.path,
+                profile=profile,
+                status=IngestJobStatus.SUCCEEDED,
+                stage=IngestStage.CACHED,
+                force=force,
+                message="Cached READY document reused; no ingest work was scheduled.",
+                result=self._ingest_result_from_doc(doc, catalog),
+                created_at=now,
+                updated_at=now,
+                started_at=now,
+                finished_at=now,
+            )
+            catalog.create_ingest_job(job)
+            return self._ingest_job_payload(job, cached=True)
+
+        now = self._now_iso()
+        job = IngestJobRecord(
+            job_id=uuid4().hex,
+            doc_id=doc.doc_id,
+            path=doc.path,
+            profile=profile,
+            status=IngestJobStatus.QUEUED,
+            stage=IngestStage.QUEUED,
+            force=force,
+            message=f"{ingest_mode} queued for background execution.",
+            created_at=now,
+            updated_at=now,
+        )
+        catalog.create_ingest_job(job)
+        self._ingest_queue.put((doc.doc_id, job.job_id))
+        logger.info(
+            "ingest_job_queued",
+            extra={
+                "doc_id": doc.doc_id,
+                "job_id": job.job_id,
+                "profile": profile,
+                "path": doc.path,
+            },
+        )
+        return self._ingest_job_payload(job)
+
+    def _ingest_worker_loop(self) -> None:
+        while True:
+            try:
+                doc_id, job_id = self._ingest_queue.get(timeout=0.5)
+            except Empty:
+                continue
+            try:
+                self._run_ingest_job(doc_id=doc_id, job_id=job_id)
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "ingest_worker_unhandled_error",
+                    extra={"doc_id": doc_id, "job_id": job_id},
+                )
+            finally:
+                self._ingest_queue.task_done()
+
+    def _run_ingest_job(self, *, doc_id: str, job_id: str) -> None:
+        doc, catalog = self._require_doc(
+            doc_id,
+            error_code=ErrorCode.INGEST_DOC_NOT_FOUND,
+            message="Document not found while executing ingest job",
+        )
+        job = catalog.get_ingest_job(doc_id, job_id)
+        if job is None:
+            raise AppError(
+                ErrorCode.INGEST_DOC_NOT_FOUND,
+                "Ingest job not found",
+                details={"doc_id": doc_id, "job_id": job_id},
+            )
+        if job.status != IngestJobStatus.QUEUED:
+            return
+
+        started_at = self._now_iso()
+        self._set_job_stage(
+            catalog=catalog,
+            job_id=job_id,
+            status=IngestJobStatus.RUNNING,
+            stage=IngestStage.PARSE,
+            message="Worker started background ingest job.",
+            started_at=started_at,
+        )
+        logger.info(
+            "ingest_job_started",
+            extra={"doc_id": doc_id, "job_id": job_id, "profile": job.profile},
+        )
+
+        def stage_callback(stage: IngestStage, message: str) -> None:
+            self._set_job_stage(
+                catalog=catalog,
+                job_id=job_id,
+                status=IngestJobStatus.RUNNING,
+                stage=stage,
+                message=message,
+            )
+            logger.info(
+                "ingest_job_stage",
+                extra={
+                    "doc_id": doc_id,
+                    "job_id": job_id,
+                    "stage": stage,
+                    "message": message,
+                },
+            )
+
+        try:
+            result = self._document_ingest(
+                doc=doc,
+                catalog=catalog,
+                profile=job.profile,
+                expected_doc_type=DocumentType.PDF
+                if doc.type == DocumentType.PDF
+                else DocumentType.EPUB,
+                ingest_mode=f"background_{job.profile}_{doc.type}",
+                force=job.force,
+                stage_callback=stage_callback,
+            )
+        except Exception as exc:  # noqa: BLE001
+            error = to_error_payload(exc)
+            error["traceback"] = traceback.format_exc()
+            self._set_job_stage(
+                catalog=catalog,
+                job_id=job_id,
+                status=IngestJobStatus.FAILED,
+                stage=IngestStage.FAILED,
+                message=str(exc),
+                error=error,
+                finished_at=self._now_iso(),
+            )
+            logger.exception(
+                "ingest_job_failed",
+                extra={"doc_id": doc_id, "job_id": job_id},
+            )
+            return
+
+        self._set_job_stage(
+            catalog=catalog,
+            job_id=job_id,
+            status=IngestJobStatus.SUCCEEDED,
+            stage=IngestStage.COMPLETED,
+            message="Background ingest job completed successfully.",
+            result=result,
+            finished_at=self._now_iso(),
+        )
+        logger.info(
+            "ingest_job_succeeded",
+            extra={
+                "doc_id": doc_id,
+                "job_id": job_id,
+                "chunks": result["chunks_count"],
+            },
+        )
+
     def library_scan(self, root: str, patterns: list[str]) -> dict[str, Any]:
         root_path = Path(root).expanduser().resolve()
         if not root_path.exists() or not root_path.is_dir():
@@ -529,6 +803,7 @@ class AppService:
         expected_doc_type: DocumentType | None,
         ingest_mode: str,
         force: bool,
+        stage_callback: Callable[[IngestStage, str], None] | None = None,
     ) -> dict[str, Any]:
         if doc.status == DocumentStatus.READY and not force and doc.profile == profile:
             return {
@@ -564,8 +839,18 @@ class AppService:
 
             if profile == Profile.BOOK:
                 if doc.type == DocumentType.PDF:
+                    if stage_callback is not None:
+                        stage_callback(
+                            IngestStage.PARSE,
+                            "Parsing PDF book with Docling.",
+                        )
                     parsed = self.pdf_parser.parse(doc.path, doc.doc_id)
                 elif doc.type == DocumentType.EPUB:
+                    if stage_callback is not None:
+                        stage_callback(
+                            IngestStage.PARSE,
+                            "Parsing EPUB book with EbookLib.",
+                        )
                     parsed = self.epub_parser.parse(doc.path, doc.doc_id)
                 else:
                     raise AppError(
@@ -583,7 +868,17 @@ class AppService:
                             "supported_doc_types": [DocumentType.PDF],
                         },
                     )
+                if stage_callback is not None:
+                    stage_callback(
+                        IngestStage.GROBID,
+                        "Parsing PDF paper metadata with GROBID.",
+                    )
                 grobid_result = self.grobid_client.parse_fulltext(doc.path)
+                if stage_callback is not None:
+                    stage_callback(
+                        IngestStage.PARSE,
+                        "Parsing PDF paper structure with Docling.",
+                    )
                 parsed = self.pdf_parser.parse(doc.path, doc.doc_id)
                 parsed.parser_chain.append("grobid")
                 parsed.metadata = {**parsed.metadata, **grobid_result.metadata}
@@ -598,6 +893,11 @@ class AppService:
                     f"Unsupported ingest profile: {profile}",
                 )
 
+            if stage_callback is not None:
+                stage_callback(
+                    IngestStage.PERSIST,
+                    "Persisting reading artifacts and relational records.",
+                )
             self._write_reading_artifact(workspace_dir, parsed)
             catalog.replace_chunks(doc.doc_id, parsed.chunks)
             catalog.replace_formulas(doc.doc_id, parsed.formulas)
@@ -617,7 +917,17 @@ class AppService:
                     "pdf_images_extraction_mode": "on_demand",
                 }
             catalog.replace_images(doc.doc_id, image_records)
+            if stage_callback is not None:
+                stage_callback(
+                    IngestStage.INDEX,
+                    "Rebuilding vector index for document chunks.",
+                )
             self.vector_index.rebuild_document(doc.doc_id, parsed.title, parsed.chunks)
+            if stage_callback is not None:
+                stage_callback(
+                    IngestStage.FINALIZE,
+                    "Saving final document metadata and marking document ready.",
+                )
             catalog.save_document_parse_output(
                 doc_id=doc.doc_id,
                 title=parsed.title,
@@ -649,39 +959,75 @@ class AppService:
         self, *, doc_id: str | None, path: str | None, force: bool
     ) -> dict[str, Any]:
         doc, catalog = self._resolve_doc(doc_id, path)
-        return self._document_ingest(
+        return self._submit_ingest_job(
             doc=doc,
             catalog=catalog,
             profile=Profile.BOOK,
             expected_doc_type=DocumentType.PDF,
-            ingest_mode="document_ingest_pdf_book",
             force=force,
+            ingest_mode="document_ingest_pdf_book",
         )
+
+    def document_ingest_status(
+        self, *, doc_id: str, job_id: str | None = None
+    ) -> dict[str, Any]:
+        doc, catalog = self._require_doc(
+            doc_id,
+            error_code=ErrorCode.INGEST_DOC_NOT_FOUND,
+            message="Document not found for ingest status lookup",
+        )
+        job = catalog.get_ingest_job(doc.doc_id, job_id)
+        if job is None:
+            raise AppError(
+                ErrorCode.INGEST_DOC_NOT_FOUND,
+                "Ingest job not found for document",
+                details={"doc_id": doc.doc_id, "job_id": job_id},
+            )
+        payload = self._serialize_ingest_job(job)
+        payload["document_status"] = doc.status
+        payload["document_profile"] = doc.profile
+        if job.status == IngestJobStatus.SUCCEEDED and job.result is None:
+            payload["result"] = self._ingest_result_from_doc(doc, catalog)
+        return payload
+
+    def document_ingest_list_jobs(
+        self, *, doc_id: str, limit: int = 20
+    ) -> dict[str, Any]:
+        doc, catalog = self._require_doc(
+            doc_id,
+            error_code=ErrorCode.INGEST_DOC_NOT_FOUND,
+            message="Document not found for ingest job listing",
+        )
+        jobs = catalog.list_ingest_jobs(doc.doc_id, limit=limit)
+        return {
+            "doc_id": doc.doc_id,
+            "jobs": [self._serialize_ingest_job(job) for job in jobs],
+        }
 
     def document_ingest_epub_book(
         self, *, doc_id: str | None, path: str | None, force: bool
     ) -> dict[str, Any]:
         doc, catalog = self._resolve_doc(doc_id, path)
-        return self._document_ingest(
+        return self._submit_ingest_job(
             doc=doc,
             catalog=catalog,
             profile=Profile.BOOK,
             expected_doc_type=DocumentType.EPUB,
-            ingest_mode="document_ingest_epub_book",
             force=force,
+            ingest_mode="document_ingest_epub_book",
         )
 
     def document_ingest_pdf_paper(
         self, *, doc_id: str | None, path: str | None, force: bool
     ) -> dict[str, Any]:
         doc, catalog = self._resolve_doc(doc_id, path)
-        return self._document_ingest(
+        return self._submit_ingest_job(
             doc=doc,
             catalog=catalog,
             profile=Profile.PAPER,
             expected_doc_type=DocumentType.PDF,
-            ingest_mode="document_ingest_pdf_paper",
             force=force,
+            ingest_mode="document_ingest_pdf_paper",
         )
 
     def _page_ranges_overlap(
@@ -1590,6 +1936,12 @@ class AppService:
                             "type": doc.type,
                             "status": doc.status,
                             "profile": doc.profile,
+                            "latest_ingest_job": (
+                                self._serialize_ingest_job(latest_job)
+                                if (latest_job := catalog.get_ingest_job(doc.doc_id))
+                                is not None
+                                else None
+                            ),
                         }
                         for doc in sample_docs
                     ],

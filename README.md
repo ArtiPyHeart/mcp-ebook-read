@@ -81,9 +81,11 @@ Optional:
 - After a fresh server restart, call `library_scan(root=...)` or `storage_list_sidecars(root=...)` before using tools that only take `doc_id`.
 - Use `search` for global semantic retrieval and `read` for locator-based chunk windows.
 - Startup preflight is fail-fast and requires both Qdrant and GROBID to be configured and reachable.
-- Use `document_ingest_pdf_book` for PDF books.
-- Use `document_ingest_epub_book` for EPUB books.
-- Use `document_ingest_pdf_paper` for PDF papers. Docling remains the canonical page-aware outline; GROBID enriches paper metadata and title.
+- Use `document_ingest_pdf_book` to queue a background ingest job for a PDF book.
+- Use `document_ingest_epub_book` to queue a background ingest job for an EPUB book.
+- Use `document_ingest_pdf_paper` to queue a background ingest job for a PDF paper. Docling remains the canonical page-aware outline; GROBID enriches paper metadata and title.
+- Use `document_ingest_status` to poll the current status of one ingest job (or the latest job for a document).
+- Use `document_ingest_list_jobs` to inspect recent ingest job history for one document.
 - Use `search_in_outline_node` when you need chapter-scoped retrieval (recommended for reading workflows).
 - Use `get_outline` to fetch document outline nodes before chapter/formula/image scoped reading.
 - Use `read_outline_node` to read a chapter/outline node directly without locator stitching.
@@ -110,6 +112,10 @@ Optional:
 - Sidecar cleanup is explicit:
   - `library_scan` no longer triggers threshold-based auto compaction.
   - Use `storage_cleanup_sidecars(..., compact_catalog=true)` when you want compaction.
+- Ingest is now asynchronous by design:
+  - the `document_ingest_*` tools submit work and return immediately with `job_id`/`doc_id`;
+  - poll `document_ingest_status(doc_id=..., job_id=...)` until `status` becomes `succeeded` or `failed`;
+  - use `document_ingest_list_jobs(doc_id=...)` when you need recent history or lost the latest `job_id`.
 
 ## No-Label Formula Benchmark
 
