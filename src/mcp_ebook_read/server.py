@@ -292,6 +292,50 @@ def pdf_read_image(doc_id: str, image_id: str) -> dict[str, Any]:
 
 @mcp.tool()
 @tool_handler
+def pdf_list_tables(
+    doc_id: str,
+    node_id: str | None = None,
+    limit: int = 200,
+) -> dict[str, Any]:
+    """List extracted tables from a PDF document (optionally scoped to one outline node)."""
+    return _require_service().pdf_list_tables(
+        doc_id=doc_id,
+        node_id=node_id,
+        limit=limit,
+    )
+
+
+@mcp.tool()
+@tool_handler
+def pdf_read_table(doc_id: str, table_id: str) -> dict[str, Any]:
+    """Read one extracted PDF table with structured rows, evidence image, and nearby text context."""
+    return _require_service().pdf_read_table(doc_id=doc_id, table_id=table_id)
+
+
+@mcp.tool()
+@tool_handler
+def pdf_list_figures(
+    doc_id: str,
+    node_id: str | None = None,
+    limit: int = 200,
+) -> dict[str, Any]:
+    """List Docling-detected figures from a PDF document (optionally scoped to one outline node)."""
+    return _require_service().pdf_list_figures(
+        doc_id=doc_id,
+        node_id=node_id,
+        limit=limit,
+    )
+
+
+@mcp.tool()
+@tool_handler
+def pdf_read_figure(doc_id: str, figure_id: str) -> dict[str, Any]:
+    """Read one extracted PDF figure with local path and nearby text context."""
+    return _require_service().pdf_read_figure(doc_id=doc_id, figure_id=figure_id)
+
+
+@mcp.tool()
+@tool_handler
 def pdf_book_list_formulas(
     doc_id: str,
     node_id: str | None = None,

@@ -19,6 +19,8 @@ from mcp_ebook_read.schema.models import (
     IngestStage,
     ImageRecord,
     OutlineNode,
+    PdfFigureRecord,
+    PdfTableRecord,
     Profile,
 )
 
@@ -119,6 +121,52 @@ class CatalogStore:
 
                 CREATE INDEX IF NOT EXISTS idx_images_doc
                 ON images(doc_id, order_index);
+
+                CREATE TABLE IF NOT EXISTS pdf_tables (
+                    table_id TEXT PRIMARY KEY,
+                    doc_id TEXT NOT NULL,
+                    order_index INTEGER NOT NULL,
+                    section_path_json TEXT NOT NULL,
+                    page_range_json TEXT,
+                    bbox_json TEXT,
+                    caption TEXT,
+                    headers_json TEXT NOT NULL,
+                    rows_json TEXT NOT NULL,
+                    markdown TEXT NOT NULL,
+                    html TEXT NOT NULL,
+                    file_path TEXT NOT NULL,
+                    width INTEGER,
+                    height INTEGER,
+                    merged INTEGER NOT NULL,
+                    merge_confidence REAL,
+                    segments_json TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    FOREIGN KEY (doc_id) REFERENCES documents(doc_id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_pdf_tables_doc
+                ON pdf_tables(doc_id, order_index);
+
+                CREATE TABLE IF NOT EXISTS pdf_figures (
+                    figure_id TEXT PRIMARY KEY,
+                    doc_id TEXT NOT NULL,
+                    order_index INTEGER NOT NULL,
+                    section_path_json TEXT NOT NULL,
+                    page INTEGER,
+                    bbox_json TEXT,
+                    caption TEXT,
+                    kind TEXT NOT NULL,
+                    file_path TEXT NOT NULL,
+                    width INTEGER,
+                    height INTEGER,
+                    source TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    FOREIGN KEY (doc_id) REFERENCES documents(doc_id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_pdf_figures_doc
+                ON pdf_figures(doc_id, order_index);
 
                 CREATE TABLE IF NOT EXISTS ingest_jobs (
                     job_id TEXT PRIMARY KEY,
@@ -583,6 +631,86 @@ class CatalogStore:
                 ],
             )
 
+    def replace_pdf_tables(self, doc_id: str, tables: list[PdfTableRecord]) -> None:
+        with self._conn() as conn:
+            conn.execute("DELETE FROM pdf_tables WHERE doc_id = ?", (doc_id,))
+            if not tables:
+                return
+            conn.executemany(
+                """
+                INSERT INTO pdf_tables (
+                    table_id, doc_id, order_index, section_path_json,
+                    page_range_json, bbox_json, caption, headers_json, rows_json,
+                    markdown, html, file_path, width, height, merged,
+                    merge_confidence, segments_json, source, status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        table.table_id,
+                        table.doc_id,
+                        table.order_index,
+                        json.dumps(table.section_path),
+                        json.dumps(table.page_range)
+                        if table.page_range is not None
+                        else None,
+                        json.dumps(table.bbox) if table.bbox is not None else None,
+                        table.caption,
+                        json.dumps(table.headers),
+                        json.dumps(table.rows),
+                        table.markdown,
+                        table.html,
+                        table.file_path,
+                        table.width,
+                        table.height,
+                        1 if table.merged else 0,
+                        table.merge_confidence,
+                        json.dumps(
+                            [
+                                segment.model_dump(mode="json")
+                                for segment in table.segments
+                            ]
+                        ),
+                        table.source,
+                        table.status,
+                    )
+                    for table in tables
+                ],
+            )
+
+    def replace_pdf_figures(self, doc_id: str, figures: list[PdfFigureRecord]) -> None:
+        with self._conn() as conn:
+            conn.execute("DELETE FROM pdf_figures WHERE doc_id = ?", (doc_id,))
+            if not figures:
+                return
+            conn.executemany(
+                """
+                INSERT INTO pdf_figures (
+                    figure_id, doc_id, order_index, section_path_json,
+                    page, bbox_json, caption, kind, file_path, width, height,
+                    source, status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        figure.figure_id,
+                        figure.doc_id,
+                        figure.order_index,
+                        json.dumps(figure.section_path),
+                        figure.page,
+                        json.dumps(figure.bbox) if figure.bbox is not None else None,
+                        figure.caption,
+                        figure.kind,
+                        figure.file_path,
+                        figure.width,
+                        figure.height,
+                        figure.source,
+                        figure.status,
+                    )
+                    for figure in figures
+                ],
+            )
+
     def get_chunk(self, doc_id: str, chunk_id: str) -> ChunkRecord | None:
         with self._conn() as conn:
             row = conn.execute(
@@ -659,6 +787,46 @@ class CatalogStore:
             ).fetchall()
             return [self._row_to_image(row) for row in rows]
 
+    def get_pdf_table(self, table_id: str) -> PdfTableRecord | None:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM pdf_tables WHERE table_id = ?",
+                (table_id,),
+            ).fetchone()
+            return self._row_to_pdf_table(row) if row else None
+
+    def list_pdf_tables(self, doc_id: str) -> list[PdfTableRecord]:
+        with self._conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM pdf_tables
+                WHERE doc_id = ?
+                ORDER BY order_index ASC
+                """,
+                (doc_id,),
+            ).fetchall()
+            return [self._row_to_pdf_table(row) for row in rows]
+
+    def get_pdf_figure(self, figure_id: str) -> PdfFigureRecord | None:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM pdf_figures WHERE figure_id = ?",
+                (figure_id,),
+            ).fetchone()
+            return self._row_to_pdf_figure(row) if row else None
+
+    def list_pdf_figures(self, doc_id: str) -> list[PdfFigureRecord]:
+        with self._conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM pdf_figures
+                WHERE doc_id = ?
+                ORDER BY order_index ASC
+                """,
+                (doc_id,),
+            ).fetchall()
+            return [self._row_to_pdf_figure(row) for row in rows]
+
     def _row_to_document(self, row: sqlite3.Row) -> DocumentRecord:
         return DocumentRecord(
             doc_id=row["doc_id"],
@@ -717,6 +885,48 @@ class CatalogStore:
             alt=row["alt"],
             caption=row["caption"],
             media_type=row["media_type"],
+            file_path=row["file_path"],
+            width=row["width"],
+            height=row["height"],
+            source=row["source"],
+            status=row["status"],
+        )
+
+    def _row_to_pdf_table(self, row: sqlite3.Row) -> PdfTableRecord:
+        return PdfTableRecord(
+            table_id=row["table_id"],
+            doc_id=row["doc_id"],
+            order_index=row["order_index"],
+            section_path=json.loads(row["section_path_json"]),
+            page_range=json.loads(row["page_range_json"])
+            if row["page_range_json"] is not None
+            else None,
+            bbox=json.loads(row["bbox_json"]) if row["bbox_json"] is not None else None,
+            caption=row["caption"],
+            headers=json.loads(row["headers_json"]),
+            rows=json.loads(row["rows_json"]),
+            markdown=row["markdown"],
+            html=row["html"],
+            file_path=row["file_path"],
+            width=row["width"],
+            height=row["height"],
+            merged=bool(row["merged"]),
+            merge_confidence=row["merge_confidence"],
+            segments=json.loads(row["segments_json"]),
+            source=row["source"],
+            status=row["status"],
+        )
+
+    def _row_to_pdf_figure(self, row: sqlite3.Row) -> PdfFigureRecord:
+        return PdfFigureRecord(
+            figure_id=row["figure_id"],
+            doc_id=row["doc_id"],
+            order_index=row["order_index"],
+            section_path=json.loads(row["section_path_json"]),
+            page=row["page"],
+            bbox=json.loads(row["bbox_json"]) if row["bbox_json"] is not None else None,
+            caption=row["caption"],
+            kind=row["kind"],
             file_path=row["file_path"],
             width=row["width"],
             height=row["height"],

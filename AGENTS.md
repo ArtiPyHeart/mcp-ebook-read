@@ -32,6 +32,7 @@
 - When shipping breaking changes, remove parameters/fields that are no longer used; do not keep deprecated placeholders.
 - Continuously simplify the codebase: remove redundant branches, stale outputs, and dead compatibility layers.
 - MCP tool names must encode file format and use-case explicitly to minimize LLM confusion; avoid generic multi-mode tool names.
+- Prefer explicit observability over silent degradation: when parsing/extraction falls back, loses fidelity, or cannot explain an output confidently, surface structured diagnostics to the MCP caller so the agent can notice, complain, and route feedback to the human user.
 
 ## Quality Gate
 - Format with `ruff`: `uv run ruff format .`
@@ -65,3 +66,4 @@
 - PDF ingest must extract figure/table images with page+bbox metadata and expose explicit tools (`pdf_list_images`, `pdf_read_image`) for multimodal LLM workflows.
 - Persistence is per-document-folder sidecar (`<doc_dir>/.mcp-ebook-read`); avoid global hidden data roots that are detached from source files.
 - Expose explicit storage maintenance tools so LLMs can inspect and clean persistence safely (`storage_list_sidecars`, `storage_delete_document`, `storage_cleanup_sidecars`).
+- Runtime diagnostics should be agent-visible and actionable: include enough structured warning/error detail, hints, and degradation metadata in MCP outputs so real reading sessions can reveal parser weaknesses and drive predictable iteration on sample PDFs/EPUBs.

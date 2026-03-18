@@ -45,11 +45,13 @@ QDRANT_URL=http://localhost:6333 GROBID_URL=http://localhost:8070 GROBID_TIMEOUT
 
 This pre-resolves and aligns runtime dependencies, which helps avoid long first-time activation latency after MCP client configuration.
 
-When you want to upgrade to the latest published version, run:
+When you want to refresh `uvx` to the latest published version, run:
 
 ```bash
-QDRANT_URL=http://localhost:6333 GROBID_URL=http://localhost:8070 GROBID_TIMEOUT_SECONDS=120 uvx --upgrade mcp-ebook-read
+QDRANT_URL=http://localhost:6333 GROBID_URL=http://localhost:8070 GROBID_TIMEOUT_SECONDS=120 uvx mcp-ebook-read@latest
 ```
+
+If you installed the tool persistently via `uv tool install`, use `uv tool upgrade mcp-ebook-read` instead.
 
 ## Environment Variables
 

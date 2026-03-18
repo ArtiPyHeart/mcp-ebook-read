@@ -21,8 +21,11 @@ from mcp_ebook_read.schema.models import (
     Locator,
     OutlineNode,
     ParsedDocument,
+    PdfFigureRecord,
     PdfParserPerformanceConfig,
     PdfParserTuningProfile,
+    PdfTableRecord,
+    TableSegmentRecord,
 )
 from mcp_ebook_read.service import AppService
 
@@ -165,6 +168,78 @@ class RecordingPdfImageExtractor:
         return generated
 
 
+class RecordingPdfVisualExtractor:
+    def __init__(
+        self,
+        *,
+        tables: list[PdfTableRecord] | None = None,
+        figures: list[PdfFigureRecord] | None = None,
+    ) -> None:
+        self.tables = tables or []
+        self.figures = figures or []
+        self.calls: list[dict[str, Any]] = []
+
+    def extract(
+        self,
+        *,
+        pdf_path: str,
+        doc_id: str,
+        chunks: list[ChunkRecord],
+        tables_dir: Path,
+        figures_dir: Path,
+    ):
+        self.calls.append(
+            {
+                "pdf_path": pdf_path,
+                "doc_id": doc_id,
+                "chunks_count": len(chunks),
+                "tables_dir": str(tables_dir),
+                "figures_dir": str(figures_dir),
+            }
+        )
+        tables_dir.mkdir(parents=True, exist_ok=True)
+        figures_dir.mkdir(parents=True, exist_ok=True)
+        generated_tables: list[PdfTableRecord] = []
+        generated_figures: list[PdfFigureRecord] = []
+
+        for table in self.tables:
+            image_path = tables_dir / f"{table.table_id}.png"
+            image_path.write_bytes(b"\x89PNG")
+            segments = []
+            for idx, segment in enumerate(table.segments):
+                segment_path = tables_dir / f"{table.table_id}_segment_{idx}.png"
+                segment_path.write_bytes(b"\x89PNG")
+                segments.append(
+                    segment.model_copy(update={"file_path": str(segment_path)})
+                )
+            generated_tables.append(
+                table.model_copy(
+                    update={
+                        "file_path": str(image_path),
+                        "segments": segments,
+                    }
+                )
+            )
+
+        for figure in self.figures:
+            image_path = figures_dir / f"{figure.figure_id}.png"
+            image_path.write_bytes(b"\x89PNG")
+            generated_figures.append(
+                figure.model_copy(update={"file_path": str(image_path)})
+            )
+
+        class Result:
+            def __init__(
+                self,
+                tables: list[PdfTableRecord],
+                figures: list[PdfFigureRecord],
+            ) -> None:
+                self.tables = tables
+                self.figures = figures
+
+        return Result(generated_tables, generated_figures)
+
+
 def _chunk(
     doc_id: str, chunk_id: str, idx: int, method: str = "docling"
 ) -> ChunkRecord:
@@ -211,6 +286,70 @@ def _formula(
     )
 
 
+def _pdf_table(
+    *,
+    doc_id: str,
+    table_id: str,
+    page_range: list[int],
+    section_path: list[str],
+    caption: str | None = None,
+    merged: bool = False,
+    merge_confidence: float | None = None,
+) -> PdfTableRecord:
+    return PdfTableRecord(
+        table_id=table_id,
+        doc_id=doc_id,
+        order_index=0,
+        section_path=section_path,
+        page_range=page_range,
+        bbox=[10.0, 10.0, 100.0, 100.0] if not merged else None,
+        caption=caption,
+        headers=["Name", "Value"],
+        rows=[["alpha", "1"], ["beta", "2"]],
+        markdown="| Name | Value |\n| --- | --- |\n| alpha | 1 |\n| beta | 2 |",
+        html="<table><thead><tr><th>Name</th><th>Value</th></tr></thead><tbody><tr><td>alpha</td><td>1</td></tr><tr><td>beta</td><td>2</td></tr></tbody></table>",
+        file_path="placeholder.png",
+        width=400,
+        height=300,
+        merged=merged,
+        merge_confidence=merge_confidence,
+        segments=[
+            TableSegmentRecord(
+                page=page_range[0],
+                bbox=[10.0, 10.0, 100.0, 100.0],
+                caption=caption,
+                file_path="placeholder-segment.png",
+                width=400,
+                height=300,
+            )
+        ],
+    )
+
+
+def _pdf_figure(
+    *,
+    doc_id: str,
+    figure_id: str,
+    page: int,
+    section_path: list[str],
+    caption: str | None = None,
+    kind: str = "picture",
+) -> PdfFigureRecord:
+    return PdfFigureRecord(
+        figure_id=figure_id,
+        doc_id=doc_id,
+        order_index=0,
+        section_path=section_path,
+        page=page,
+        bbox=[5.0, 5.0, 90.0, 90.0],
+        caption=caption,
+        kind=kind,
+        file_path="placeholder.png",
+        width=240,
+        height=160,
+    )
+
+
 def _parsed(
     doc_id: str,
     *,
@@ -243,12 +382,14 @@ def _build_service(
     grobid: RecordingGrobid,
     vector: RecordingVectorIndex | None = None,
     pdf_image_extractor: RecordingPdfImageExtractor | None = None,
+    pdf_visual_extractor: RecordingPdfVisualExtractor | None = None,
 ) -> AppService:
     return AppService(
         sidecar_dir_name=".mcp-ebook-read",
         vector_index=vector or RecordingVectorIndex(),
         pdf_parser=pdf_parser,
         pdf_image_extractor=pdf_image_extractor,
+        pdf_visual_extractor=pdf_visual_extractor,
         grobid_client=grobid,
         epub_parser=epub_parser,
     )
@@ -1630,6 +1771,254 @@ def test_pdf_image_tools_errors(tmp_path: Path) -> None:
     with pytest.raises(AppError) as missing_exc:
         service.pdf_read_image(doc_id=pdf_doc_id, image_id="missing")
     assert missing_exc.value.code == ErrorCode.READ_IMAGE_NOT_FOUND
+
+
+def test_pdf_list_tables_and_read_table(tmp_path: Path) -> None:
+    doc_id = "doc-pdf-tables-1"
+    pdf_path = tmp_path / "tables.pdf"
+    pdf_path.write_bytes(b"pdf")
+
+    service = _build_service(
+        tmp_path,
+        pdf_parser=RecordingParser(result=_parsed("x", title="X", method="docling")),
+        epub_parser=RecordingParser(result=_parsed("x", title="X", method="ebooklib")),
+        grobid=RecordingGrobid(),
+    )
+    _register_doc(service, doc_id, pdf_path, DocumentType.PDF)
+    catalog = service._catalog_for_document_path(pdf_path)
+    catalog.save_document_parse_output(
+        doc_id=doc_id,
+        title="PDF Tables",
+        parser_chain=["docling"],
+        metadata={},
+        outline=[
+            OutlineNode(
+                id="toc-a", title="Chapter A", level=1, page_start=10, page_end=12
+            ),
+            OutlineNode(
+                id="toc-b", title="Chapter B", level=1, page_start=20, page_end=22
+            ),
+        ],
+        overall_confidence=None,
+        status=DocumentStatus.READY,
+    )
+    catalog.replace_chunks(
+        doc_id,
+        [
+            ChunkRecord(
+                chunk_id="ca",
+                doc_id=doc_id,
+                order_index=0,
+                section_path=["Chapter A"],
+                text="Table context A",
+                search_text="Table context A",
+                locator=Locator(
+                    doc_id=doc_id,
+                    chunk_id="ca",
+                    section_path=["Chapter A"],
+                    page_range=[10, 10],
+                    method="docling",
+                ),
+                method="docling",
+            ),
+            ChunkRecord(
+                chunk_id="cb",
+                doc_id=doc_id,
+                order_index=1,
+                section_path=["Chapter B"],
+                text="Table context B",
+                search_text="Table context B",
+                locator=Locator(
+                    doc_id=doc_id,
+                    chunk_id="cb",
+                    section_path=["Chapter B"],
+                    page_range=[20, 20],
+                    method="docling",
+                ),
+                method="docling",
+            ),
+        ],
+    )
+
+    table_a_path = tmp_path / "table-a.png"
+    table_b_path = tmp_path / "table-b.png"
+    segment_a_path = tmp_path / "table-a-segment.png"
+    segment_b_path = tmp_path / "table-b-segment.png"
+    for path in (table_a_path, table_b_path, segment_a_path, segment_b_path):
+        path.write_bytes(b"\x89PNG")
+
+    table_a = _pdf_table(
+        doc_id=doc_id,
+        table_id="table-a",
+        page_range=[10, 10],
+        section_path=["Chapter A"],
+        caption="Table 1: A",
+    ).model_copy(
+        update={
+            "file_path": str(table_a_path),
+            "segments": [
+                TableSegmentRecord(
+                    page=10,
+                    bbox=[10.0, 10.0, 100.0, 100.0],
+                    caption="Table 1: A",
+                    file_path=str(segment_a_path),
+                    width=400,
+                    height=300,
+                )
+            ],
+        }
+    )
+    table_b = _pdf_table(
+        doc_id=doc_id,
+        table_id="table-b",
+        page_range=[20, 20],
+        section_path=["Chapter B"],
+        caption="Table 2: B",
+    ).model_copy(
+        update={
+            "order_index": 1,
+            "file_path": str(table_b_path),
+            "segments": [
+                TableSegmentRecord(
+                    page=20,
+                    bbox=[10.0, 10.0, 100.0, 100.0],
+                    caption="Table 2: B",
+                    file_path=str(segment_b_path),
+                    width=400,
+                    height=300,
+                )
+            ],
+        }
+    )
+    catalog.replace_pdf_tables(doc_id, [table_a, table_b])
+
+    listed_all = service.pdf_list_tables(doc_id=doc_id, node_id=None, limit=50)
+    assert listed_all["tables_count"] == 2
+
+    listed_a = service.pdf_list_tables(doc_id=doc_id, node_id="toc-a", limit=50)
+    assert listed_a["tables_count"] == 1
+    assert listed_a["tables"][0]["table_id"] == "table-a"
+
+    read = service.pdf_read_table(doc_id=doc_id, table_id="table-a")
+    assert read["table"]["caption"] == "Table 1: A"
+    assert read["table"]["rows"][0] == ["alpha", "1"]
+    assert read["context"] is not None
+    assert "context A" in read["context"]["text"]
+
+
+def test_pdf_visuals_are_extracted_on_demand(tmp_path: Path) -> None:
+    doc_id = "doc-pdf-visuals-lazy"
+    pdf_path = tmp_path / "visuals.pdf"
+    pdf_path.write_bytes(b"pdf")
+
+    visual_extractor = RecordingPdfVisualExtractor(
+        tables=[
+            _pdf_table(
+                doc_id=doc_id,
+                table_id="lazy-table-1",
+                page_range=[1, 2],
+                section_path=["S0"],
+                caption="Table Lazy",
+                merged=True,
+                merge_confidence=0.92,
+            )
+        ],
+        figures=[
+            _pdf_figure(
+                doc_id=doc_id,
+                figure_id="lazy-figure-1",
+                page=1,
+                section_path=["S0"],
+                caption="Figure Lazy",
+                kind="chart",
+            )
+        ],
+    )
+    service = _build_service(
+        tmp_path,
+        pdf_parser=RecordingParser(
+            result=_parsed(doc_id, title="PDF Lazy", method="docling")
+        ),
+        epub_parser=RecordingParser(result=_parsed("x", title="X", method="ebooklib")),
+        grobid=RecordingGrobid(),
+        pdf_visual_extractor=visual_extractor,
+    )
+    _register_doc(service, doc_id, pdf_path, DocumentType.PDF)
+
+    queued = service.document_ingest_pdf_book(doc_id=doc_id, path=None, force=True)
+    ingest = _wait_for_ingest_job(
+        service,
+        doc_id=doc_id,
+        job_id=queued["job_id"],
+    )["result"]
+    assert ingest["images_count"] == 0
+    assert visual_extractor.calls == []
+
+    tables = service.pdf_list_tables(doc_id=doc_id, node_id=None, limit=20)
+    assert tables["tables_count"] == 1
+    assert tables["tables"][0]["table_id"] == "lazy-table-1"
+    assert tables["tables"][0]["merged"] is True
+    assert len(visual_extractor.calls) == 1
+
+    figures = service.pdf_list_figures(doc_id=doc_id, node_id=None, limit=20)
+    assert figures["figures_count"] == 1
+    assert figures["figures"][0]["figure_id"] == "lazy-figure-1"
+    assert len(visual_extractor.calls) == 1
+
+    table_read = service.pdf_read_table(doc_id=doc_id, table_id="lazy-table-1")
+    assert table_read["table"]["segments"]
+    assert table_read["context"] is not None
+
+    figure_read = service.pdf_read_figure(doc_id=doc_id, figure_id="lazy-figure-1")
+    assert figure_read["figure"]["caption"] == "Figure Lazy"
+    assert figure_read["context"] is not None
+
+    catalog = service._catalog_for_document_path(pdf_path)
+    workspace_dir = catalog.db_path.parent / "docs" / doc_id
+    marker = workspace_dir / "assets" / "pdf-visuals" / ".extracted.json"
+    assert marker.exists()
+
+
+def test_pdf_table_and_figure_tools_errors(tmp_path: Path) -> None:
+    service = _build_service(
+        tmp_path,
+        pdf_parser=RecordingParser(result=_parsed("x", title="X", method="docling")),
+        epub_parser=RecordingParser(result=_parsed("x", title="X", method="ebooklib")),
+        grobid=RecordingGrobid(),
+    )
+    epub_doc_id = "doc-epub-for-visual-tools"
+    epub_path = tmp_path / "book.epub"
+    epub_path.write_bytes(b"epub")
+    _register_doc(service, epub_doc_id, epub_path, DocumentType.EPUB)
+
+    with pytest.raises(AppError) as list_table_exc:
+        service.pdf_list_tables(doc_id=epub_doc_id, node_id=None, limit=20)
+    assert list_table_exc.value.code == ErrorCode.INGEST_UNSUPPORTED_TYPE
+
+    with pytest.raises(AppError) as read_table_exc:
+        service.pdf_read_table(doc_id=epub_doc_id, table_id="x")
+    assert read_table_exc.value.code == ErrorCode.INGEST_UNSUPPORTED_TYPE
+
+    with pytest.raises(AppError) as list_figure_exc:
+        service.pdf_list_figures(doc_id=epub_doc_id, node_id=None, limit=20)
+    assert list_figure_exc.value.code == ErrorCode.INGEST_UNSUPPORTED_TYPE
+
+    with pytest.raises(AppError) as read_figure_exc:
+        service.pdf_read_figure(doc_id=epub_doc_id, figure_id="x")
+    assert read_figure_exc.value.code == ErrorCode.INGEST_UNSUPPORTED_TYPE
+
+    pdf_doc_id = "doc-pdf-visual-tools"
+    pdf_path = tmp_path / "visuals_missing.pdf"
+    pdf_path.write_bytes(b"pdf")
+    _register_doc(service, pdf_doc_id, pdf_path, DocumentType.PDF)
+
+    with pytest.raises(AppError) as missing_table_exc:
+        service.pdf_read_table(doc_id=pdf_doc_id, table_id="missing")
+    assert missing_table_exc.value.code == ErrorCode.READ_TABLE_NOT_FOUND
+
+    with pytest.raises(AppError) as missing_figure_exc:
+        service.pdf_read_figure(doc_id=pdf_doc_id, figure_id="missing")
+    assert missing_figure_exc.value.code == ErrorCode.READ_FIGURE_NOT_FOUND
 
 
 def test_pdf_book_formula_tools_list_and_read(

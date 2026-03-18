@@ -34,6 +34,7 @@ from mcp_ebook_read.parsers.epub_ebooklib import EbooklibEpubParser
 from mcp_ebook_read.parsers.pdf_docling import DoclingPdfParser
 from mcp_ebook_read.parsers.pdf_grobid import GrobidClient
 from mcp_ebook_read.render.pdf_images import PdfImageExtractor
+from mcp_ebook_read.render.pdf_visuals import DoclingPdfVisualExtractor
 from mcp_ebook_read.render.pdf_render import render_pdf_page, render_pdf_region
 from mcp_ebook_read.schema.models import (
     ChunkRecord,
@@ -49,7 +50,9 @@ from mcp_ebook_read.schema.models import (
     Locator,
     OutlineNode,
     ParsedDocument,
+    PdfFigureRecord,
     Profile,
+    PdfTableRecord,
     PdfParserPerformanceConfig,
     PdfParserTuningProfile,
 )
@@ -68,6 +71,7 @@ class AppService:
         vector_index: QdrantVectorIndex,
         pdf_parser: DoclingPdfParser,
         pdf_image_extractor: PdfImageExtractor | None = None,
+        pdf_visual_extractor: DoclingPdfVisualExtractor | None = None,
         grobid_client: GrobidClient,
         epub_parser: EbooklibEpubParser,
     ) -> None:
@@ -75,6 +79,7 @@ class AppService:
         self.vector_index = vector_index
         self.pdf_parser = pdf_parser
         self.pdf_image_extractor = pdf_image_extractor
+        self.pdf_visual_extractor = pdf_visual_extractor
         self.grobid_client = grobid_client
         self.epub_parser = epub_parser
         self._catalogs: dict[str, CatalogStore] = {}
@@ -97,6 +102,9 @@ class AppService:
             return
         self._closed = True
         self.pdf_parser.close()
+        close_visual_extractor = getattr(self.pdf_visual_extractor, "close", None)
+        if callable(close_visual_extractor):
+            close_visual_extractor()
 
     @staticmethod
     def _detect_total_memory_bytes() -> int | None:
@@ -367,6 +375,9 @@ class AppService:
                 performance_config=docling_performance_config,
             ),
             pdf_image_extractor=PdfImageExtractor(min_area_ratio=0.01),
+            pdf_visual_extractor=DoclingPdfVisualExtractor(
+                performance_config=docling_performance_config,
+            ),
             grobid_client=grobid_client,
             epub_parser=EbooklibEpubParser(),
         )
@@ -1080,13 +1091,15 @@ class AppService:
                     target_dir=workspace_dir / "assets" / "epub-images",
                 )
             elif doc.type == DocumentType.PDF:
-                pdf_image_dir = workspace_dir / "assets" / "pdf-images"
-                if pdf_image_dir.exists():
-                    shutil.rmtree(pdf_image_dir)
+                self._clear_pdf_visual_artifacts(doc=doc, catalog=catalog)
                 parsed.metadata = {
                     **parsed.metadata,
                     "pdf_images_extraction_mode": "on_demand",
+                    "pdf_tables_extraction_mode": "on_demand",
+                    "pdf_figures_extraction_mode": "on_demand",
                 }
+                catalog.replace_pdf_tables(doc.doc_id, [])
+                catalog.replace_pdf_figures(doc.doc_id, [])
             catalog.replace_images(doc.doc_id, image_records)
             if stage_callback is not None:
                 stage_callback(
@@ -1540,8 +1553,192 @@ class AppService:
             "height": image.height,
         }
 
+    def _table_payload(
+        self,
+        table: PdfTableRecord,
+        *,
+        include_rows: bool = False,
+        include_segments: bool = False,
+        observation: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        payload = {
+            "table_id": table.table_id,
+            "section_path": table.section_path,
+            "page_range": table.page_range,
+            "bbox": table.bbox,
+            "caption": table.caption,
+            "headers": table.headers,
+            "row_count": len(table.rows),
+            "column_count": len(table.headers),
+            "image_path": table.file_path,
+            "width": table.width,
+            "height": table.height,
+            "merged": table.merged,
+            "merge_confidence": table.merge_confidence,
+            "source": table.source,
+            "status": table.status,
+        }
+        if include_rows:
+            payload["rows"] = table.rows
+            payload["markdown"] = table.markdown
+            payload["html"] = table.html
+        if include_segments:
+            payload["segments"] = [
+                segment.model_dump(mode="json") for segment in table.segments
+            ]
+        if observation is not None:
+            payload["issues"] = observation.get("issues") or []
+            if observation.get("merge") is not None:
+                payload["merge_diagnostics"] = observation["merge"]
+        return payload
+
+    def _figure_payload(
+        self,
+        figure: PdfFigureRecord,
+        *,
+        observation: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        payload = {
+            "figure_id": figure.figure_id,
+            "section_path": figure.section_path,
+            "page": figure.page,
+            "bbox": figure.bbox,
+            "caption": figure.caption,
+            "kind": figure.kind,
+            "image_path": figure.file_path,
+            "width": figure.width,
+            "height": figure.height,
+            "source": figure.source,
+            "status": figure.status,
+        }
+        if observation is not None:
+            payload["issues"] = observation.get("issues") or []
+        return payload
+
+    def _pdf_images_dir(self, workspace_dir: Path) -> Path:
+        return workspace_dir / "assets" / "pdf-images"
+
+    def _pdf_tables_dir(self, workspace_dir: Path) -> Path:
+        return workspace_dir / "assets" / "pdf-tables"
+
+    def _pdf_figures_dir(self, workspace_dir: Path) -> Path:
+        return workspace_dir / "assets" / "pdf-figures"
+
     def _pdf_images_manifest_path(self, workspace_dir: Path) -> Path:
-        return workspace_dir / "assets" / "pdf-images" / ".extracted.json"
+        return self._pdf_images_dir(workspace_dir) / ".extracted.json"
+
+    def _pdf_visuals_manifest_path(self, workspace_dir: Path) -> Path:
+        return workspace_dir / "assets" / "pdf-visuals" / ".extracted.json"
+
+    def _default_pdf_visuals_diagnostics(
+        self,
+        *,
+        tables: list[PdfTableRecord],
+        figures: list[PdfFigureRecord],
+    ) -> dict[str, Any]:
+        return {
+            "extractor": "docling-visuals",
+            "summary": {
+                "tables_detected_raw": len(tables),
+                "tables_returned": len(tables),
+                "figures_returned": len(figures),
+                "merged_tables_count": sum(1 for table in tables if table.merged),
+                "issues_count": 0,
+                "warning_count": 0,
+                "error_count": 0,
+                "info_count": 0,
+            },
+            "issues": [],
+            "merge_decisions": [],
+            "tables": {},
+            "figures": {},
+        }
+
+    def _load_pdf_visuals_manifest(
+        self,
+        manifest_path: Path,
+        *,
+        tables: list[PdfTableRecord],
+        figures: list[PdfFigureRecord],
+    ) -> dict[str, Any]:
+        if not manifest_path.exists():
+            return self._default_pdf_visuals_diagnostics(tables=tables, figures=figures)
+        try:
+            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            return self._default_pdf_visuals_diagnostics(tables=tables, figures=figures)
+        diagnostics = payload.get("diagnostics")
+        if not isinstance(diagnostics, dict):
+            return self._default_pdf_visuals_diagnostics(tables=tables, figures=figures)
+        return diagnostics
+
+    def _persist_pdf_visuals_diagnostics_summary(
+        self,
+        *,
+        doc: DocumentRecord,
+        catalog: CatalogStore,
+        diagnostics: dict[str, Any],
+    ) -> None:
+        metadata = {
+            **doc.metadata,
+            "pdf_visuals_diagnostics": {
+                "summary": diagnostics.get("summary") or {},
+                "issues_count": len(diagnostics.get("issues") or []),
+                "last_extracted_at": self._now_iso(),
+            },
+        }
+        catalog.save_document_parse_output(
+            doc_id=doc.doc_id,
+            title=doc.title or Path(doc.path).stem,
+            parser_chain=doc.parser_chain,
+            metadata=metadata,
+            outline=doc.outline,
+            overall_confidence=doc.overall_confidence,
+            status=doc.status,
+        )
+
+    def _pdf_visuals_payload(self, diagnostics: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "summary": diagnostics.get("summary") or {},
+            "issues": diagnostics.get("issues") or [],
+            "merge_decisions": diagnostics.get("merge_decisions") or [],
+        }
+
+    def _table_observation(
+        self,
+        diagnostics: dict[str, Any],
+        table_id: str,
+    ) -> dict[str, Any]:
+        tables = diagnostics.get("tables") or {}
+        observation = tables.get(table_id)
+        return observation if isinstance(observation, dict) else {"issues": []}
+
+    def _figure_observation(
+        self,
+        diagnostics: dict[str, Any],
+        figure_id: str,
+    ) -> dict[str, Any]:
+        figures = diagnostics.get("figures") or {}
+        observation = figures.get(figure_id)
+        return observation if isinstance(observation, dict) else {"issues": []}
+
+    def _clear_pdf_visual_artifacts(
+        self,
+        *,
+        doc: DocumentRecord,
+        catalog: CatalogStore,
+    ) -> None:
+        workspace_dir = self._doc_workspace_dir(doc, catalog)
+        for target_dir in (
+            self._pdf_images_dir(workspace_dir),
+            self._pdf_tables_dir(workspace_dir),
+            self._pdf_figures_dir(workspace_dir),
+        ):
+            if target_dir.exists():
+                shutil.rmtree(target_dir)
+        manifest_path = self._pdf_visuals_manifest_path(workspace_dir)
+        if manifest_path.exists():
+            manifest_path.unlink()
 
     def _ensure_pdf_images_extracted(
         self,
@@ -1600,6 +1797,97 @@ class AppService:
             encoding="utf-8",
         )
         return extracted_images
+
+    def _ensure_pdf_visuals_extracted(
+        self,
+        *,
+        doc: DocumentRecord,
+        catalog: CatalogStore,
+        missing_chunks_error_code: ErrorCode,
+        force: bool = False,
+    ) -> tuple[list[PdfTableRecord], list[PdfFigureRecord], dict[str, Any]]:
+        workspace_dir = self._doc_workspace_dir(doc, catalog)
+        tables_dir = self._pdf_tables_dir(workspace_dir)
+        figures_dir = self._pdf_figures_dir(workspace_dir)
+        manifest_path = self._pdf_visuals_manifest_path(workspace_dir)
+
+        if force:
+            for target_dir in (tables_dir, figures_dir):
+                if target_dir.exists():
+                    shutil.rmtree(target_dir)
+            if manifest_path.exists():
+                manifest_path.unlink()
+            catalog.replace_pdf_tables(doc.doc_id, [])
+            catalog.replace_pdf_figures(doc.doc_id, [])
+
+        existing_tables = catalog.list_pdf_tables(doc.doc_id)
+        existing_figures = catalog.list_pdf_figures(doc.doc_id)
+        if (existing_tables or existing_figures) and not force:
+            diagnostics = self._load_pdf_visuals_manifest(
+                manifest_path,
+                tables=existing_tables,
+                figures=existing_figures,
+            )
+            return existing_tables, existing_figures, diagnostics
+        if manifest_path.exists() and not force:
+            diagnostics = self._load_pdf_visuals_manifest(
+                manifest_path,
+                tables=existing_tables,
+                figures=existing_figures,
+            )
+            return existing_tables, existing_figures, diagnostics
+        if self.pdf_visual_extractor is None:
+            diagnostics = self._default_pdf_visuals_diagnostics(
+                tables=existing_tables,
+                figures=existing_figures,
+            )
+            return existing_tables, existing_figures, diagnostics
+
+        chunks = catalog.list_chunks(doc.doc_id)
+        if not chunks:
+            raise AppError(
+                missing_chunks_error_code,
+                "PDF visuals are unavailable because the document has no parsed chunks.",
+                details={
+                    "doc_id": doc.doc_id,
+                    "hint": "Run document_ingest_pdf_book or document_ingest_pdf_paper first.",
+                },
+            )
+
+        extracted = self.pdf_visual_extractor.extract(
+            pdf_path=doc.path,
+            doc_id=doc.doc_id,
+            chunks=chunks,
+            tables_dir=tables_dir,
+            figures_dir=figures_dir,
+        )
+        diagnostics = getattr(extracted, "diagnostics", None)
+        if not isinstance(diagnostics, dict):
+            diagnostics = self._default_pdf_visuals_diagnostics(
+                tables=extracted.tables,
+                figures=extracted.figures,
+            )
+        catalog.replace_pdf_tables(doc.doc_id, extracted.tables)
+        catalog.replace_pdf_figures(doc.doc_id, extracted.figures)
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        manifest_path.write_text(
+            json.dumps(
+                {
+                    "doc_id": doc.doc_id,
+                    "tables_count": len(extracted.tables),
+                    "figures_count": len(extracted.figures),
+                    "diagnostics": diagnostics,
+                },
+                ensure_ascii=True,
+            ),
+            encoding="utf-8",
+        )
+        self._persist_pdf_visuals_diagnostics_summary(
+            doc=doc,
+            catalog=catalog,
+            diagnostics=diagnostics,
+        )
+        return extracted.tables, extracted.figures, diagnostics
 
     def epub_list_images(
         self,
@@ -1806,6 +2094,309 @@ class AppService:
             }
             if matched_chunk
             else None,
+        }
+
+    def _table_matches_outline_node(
+        self,
+        *,
+        table: PdfTableRecord,
+        node: OutlineNode,
+        node_path: list[str],
+    ) -> bool:
+        return self._matches_outline_node(
+            page_range=table.page_range,
+            section_path=table.section_path,
+            spine_id=None,
+            node=node,
+            node_path=node_path,
+        )
+
+    def _find_table_context_chunk(
+        self,
+        *,
+        catalog: CatalogStore,
+        doc_id: str,
+        table: PdfTableRecord,
+    ) -> ChunkRecord | None:
+        chunks = catalog.list_chunks(doc_id)
+        if table.page_range is not None:
+            for chunk in chunks:
+                if self._page_ranges_overlap(
+                    chunk.locator.page_range,
+                    table.page_range[0],
+                    table.page_range[1],
+                ):
+                    return chunk
+
+        if table.section_path:
+            target = table.section_path[-1].strip().lower()
+            if target:
+                for chunk in chunks:
+                    if any(
+                        target in part.strip().lower() for part in chunk.section_path
+                    ):
+                        return chunk
+
+        return None
+
+    def pdf_list_tables(
+        self,
+        *,
+        doc_id: str,
+        node_id: str | None,
+        limit: int,
+    ) -> dict[str, Any]:
+        doc, catalog = self._ensure_pdf_doc(doc_id)
+        tables, _, diagnostics = self._ensure_pdf_visuals_extracted(
+            doc=doc,
+            catalog=catalog,
+            missing_chunks_error_code=ErrorCode.READ_TABLE_NOT_FOUND,
+        )
+
+        node_payload: dict[str, Any] | None = None
+        if node_id:
+            _, node, node_path, _ = self._resolve_outline_node(doc_id, node_id)
+            node_payload = node.model_dump()
+            tables = [
+                table
+                for table in tables
+                if self._table_matches_outline_node(
+                    table=table,
+                    node=node,
+                    node_path=node_path,
+                )
+            ]
+
+        max_items = max(0, min(limit, 500))
+        truncated = len(tables) > max_items
+        if truncated:
+            tables = tables[:max_items]
+
+        return {
+            "doc_title": doc.title,
+            "node": node_payload,
+            "tables": [
+                self._table_payload(
+                    table,
+                    observation=self._table_observation(diagnostics, table.table_id),
+                )
+                for table in tables
+            ],
+            "tables_count": len(tables),
+            "truncated": truncated,
+            "diagnostics": self._pdf_visuals_payload(diagnostics),
+        }
+
+    def pdf_read_table(self, *, doc_id: str, table_id: str) -> dict[str, Any]:
+        doc, catalog = self._ensure_pdf_doc(doc_id)
+        _, _, diagnostics = self._ensure_pdf_visuals_extracted(
+            doc=doc,
+            catalog=catalog,
+            missing_chunks_error_code=ErrorCode.READ_TABLE_NOT_FOUND,
+        )
+        table = catalog.get_pdf_table(table_id)
+        if table is None or table.doc_id != doc_id:
+            raise AppError(
+                ErrorCode.READ_TABLE_NOT_FOUND,
+                f"Unknown table_id: {table_id}",
+                details={
+                    "doc_id": doc_id,
+                    "table_id": table_id,
+                    "hint": "Call pdf_list_tables to get valid table ids.",
+                },
+            )
+
+        image_path = Path(table.file_path)
+        if not image_path.exists():
+            _, _, diagnostics = self._ensure_pdf_visuals_extracted(
+                doc=doc,
+                catalog=catalog,
+                missing_chunks_error_code=ErrorCode.READ_TABLE_NOT_FOUND,
+                force=True,
+            )
+            table = catalog.get_pdf_table(table_id)
+            if table is None or table.doc_id != doc_id:
+                raise AppError(
+                    ErrorCode.READ_TABLE_NOT_FOUND,
+                    f"Unknown table_id: {table_id}",
+                    details={"doc_id": doc_id, "table_id": table_id},
+                )
+            image_path = Path(table.file_path)
+            if not image_path.exists():
+                raise AppError(
+                    ErrorCode.READ_TABLE_NOT_FOUND,
+                    f"Table image file does not exist: {table.file_path}",
+                    details={"doc_id": doc_id, "table_id": table_id},
+                )
+
+        matched_chunk = self._find_table_context_chunk(
+            catalog=catalog,
+            doc_id=doc_id,
+            table=table,
+        )
+        return {
+            "doc_title": doc.title,
+            "table": self._table_payload(
+                table,
+                include_rows=True,
+                include_segments=True,
+                observation=self._table_observation(diagnostics, table.table_id),
+            ),
+            "context": {
+                "text": matched_chunk.text,
+                "locator": matched_chunk.locator.model_dump(),
+            }
+            if matched_chunk
+            else None,
+            "diagnostics": {
+                "document": self._pdf_visuals_payload(diagnostics),
+                "table": self._table_observation(diagnostics, table.table_id),
+            },
+        }
+
+    def _find_figure_context_chunk(
+        self,
+        *,
+        catalog: CatalogStore,
+        doc_id: str,
+        figure: PdfFigureRecord,
+    ) -> ChunkRecord | None:
+        chunks = catalog.list_chunks(doc_id)
+        if figure.page is not None:
+            for chunk in chunks:
+                if self._page_ranges_overlap(
+                    chunk.locator.page_range,
+                    figure.page,
+                    figure.page,
+                ):
+                    return chunk
+
+        if figure.section_path:
+            target = figure.section_path[-1].strip().lower()
+            if target:
+                for chunk in chunks:
+                    if any(
+                        target in part.strip().lower() for part in chunk.section_path
+                    ):
+                        return chunk
+
+        return None
+
+    def pdf_list_figures(
+        self,
+        *,
+        doc_id: str,
+        node_id: str | None,
+        limit: int,
+    ) -> dict[str, Any]:
+        doc, catalog = self._ensure_pdf_doc(doc_id)
+        _, figures, diagnostics = self._ensure_pdf_visuals_extracted(
+            doc=doc,
+            catalog=catalog,
+            missing_chunks_error_code=ErrorCode.READ_FIGURE_NOT_FOUND,
+        )
+
+        node_payload: dict[str, Any] | None = None
+        if node_id:
+            _, node, node_path, _ = self._resolve_outline_node(doc_id, node_id)
+            node_payload = node.model_dump()
+            figures = [
+                figure
+                for figure in figures
+                if self._matches_outline_node(
+                    page_range=[figure.page, figure.page]
+                    if figure.page is not None
+                    else None,
+                    section_path=figure.section_path,
+                    spine_id=None,
+                    node=node,
+                    node_path=node_path,
+                )
+            ]
+
+        max_items = max(0, min(limit, 500))
+        truncated = len(figures) > max_items
+        if truncated:
+            figures = figures[:max_items]
+
+        return {
+            "doc_title": doc.title,
+            "node": node_payload,
+            "figures": [
+                self._figure_payload(
+                    figure,
+                    observation=self._figure_observation(diagnostics, figure.figure_id),
+                )
+                for figure in figures
+            ],
+            "figures_count": len(figures),
+            "truncated": truncated,
+            "diagnostics": self._pdf_visuals_payload(diagnostics),
+        }
+
+    def pdf_read_figure(self, *, doc_id: str, figure_id: str) -> dict[str, Any]:
+        doc, catalog = self._ensure_pdf_doc(doc_id)
+        _, _, diagnostics = self._ensure_pdf_visuals_extracted(
+            doc=doc,
+            catalog=catalog,
+            missing_chunks_error_code=ErrorCode.READ_FIGURE_NOT_FOUND,
+        )
+        figure = catalog.get_pdf_figure(figure_id)
+        if figure is None or figure.doc_id != doc_id:
+            raise AppError(
+                ErrorCode.READ_FIGURE_NOT_FOUND,
+                f"Unknown figure_id: {figure_id}",
+                details={
+                    "doc_id": doc_id,
+                    "figure_id": figure_id,
+                    "hint": "Call pdf_list_figures to get valid figure ids.",
+                },
+            )
+
+        image_path = Path(figure.file_path)
+        if not image_path.exists():
+            _, _, diagnostics = self._ensure_pdf_visuals_extracted(
+                doc=doc,
+                catalog=catalog,
+                missing_chunks_error_code=ErrorCode.READ_FIGURE_NOT_FOUND,
+                force=True,
+            )
+            figure = catalog.get_pdf_figure(figure_id)
+            if figure is None or figure.doc_id != doc_id:
+                raise AppError(
+                    ErrorCode.READ_FIGURE_NOT_FOUND,
+                    f"Unknown figure_id: {figure_id}",
+                    details={"doc_id": doc_id, "figure_id": figure_id},
+                )
+            image_path = Path(figure.file_path)
+            if not image_path.exists():
+                raise AppError(
+                    ErrorCode.READ_FIGURE_NOT_FOUND,
+                    f"Figure image file does not exist: {figure.file_path}",
+                    details={"doc_id": doc_id, "figure_id": figure_id},
+                )
+
+        matched_chunk = self._find_figure_context_chunk(
+            catalog=catalog,
+            doc_id=doc_id,
+            figure=figure,
+        )
+        return {
+            "doc_title": doc.title,
+            "figure": self._figure_payload(
+                figure,
+                observation=self._figure_observation(diagnostics, figure.figure_id),
+            ),
+            "context": {
+                "text": matched_chunk.text,
+                "locator": matched_chunk.locator.model_dump(),
+            }
+            if matched_chunk
+            else None,
+            "diagnostics": {
+                "document": self._pdf_visuals_payload(diagnostics),
+                "figure": self._figure_observation(diagnostics, figure.figure_id),
+            },
         }
 
     def _formula_matches_outline_node(

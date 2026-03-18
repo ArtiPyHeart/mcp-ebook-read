@@ -162,6 +162,53 @@ class ImageRecord(BaseModel):
     status: str = "ready"
 
 
+class TableSegmentRecord(BaseModel):
+    page: int | None = None
+    bbox: list[float] | None = None
+    caption: str | None = None
+    file_path: str
+    width: int | None = None
+    height: int | None = None
+
+
+class PdfTableRecord(BaseModel):
+    table_id: str
+    doc_id: str
+    order_index: int
+    section_path: list[str] = Field(default_factory=list)
+    page_range: list[int] | None = None
+    bbox: list[float] | None = None
+    caption: str | None = None
+    headers: list[str] = Field(default_factory=list)
+    rows: list[list[str]] = Field(default_factory=list)
+    markdown: str
+    html: str
+    file_path: str
+    width: int | None = None
+    height: int | None = None
+    merged: bool = False
+    merge_confidence: float | None = None
+    segments: list[TableSegmentRecord] = Field(default_factory=list)
+    source: str = "docling-table"
+    status: str = "ready"
+
+
+class PdfFigureRecord(BaseModel):
+    figure_id: str
+    doc_id: str
+    order_index: int
+    section_path: list[str] = Field(default_factory=list)
+    page: int | None = None
+    bbox: list[float] | None = None
+    caption: str | None = None
+    kind: str = "picture"
+    file_path: str
+    width: int | None = None
+    height: int | None = None
+    source: str = "docling-figure"
+    status: str = "ready"
+
+
 class DocumentRecord(BaseModel):
     doc_id: str
     path: str
