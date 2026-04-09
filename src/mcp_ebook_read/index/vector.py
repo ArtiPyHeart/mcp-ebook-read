@@ -5,6 +5,11 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
+import shutil
+import sys
+import time
+from pathlib import Path
 from typing import Any
 from uuid import NAMESPACE_URL, uuid5
 
@@ -17,6 +22,106 @@ from mcp_ebook_read.network import should_trust_env_proxy
 from mcp_ebook_read.schema.models import ChunkRecord
 
 logger = logging.getLogger(__name__)
+
+_FASTEMBED_INIT_RETRIES = 3
+_FASTEMBED_RETRY_BASE_DELAY_SECONDS = 1.0
+
+
+def _default_fastembed_cache_path() -> Path:
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Caches" / "mcp-ebook-read" / "fastembed"
+    xdg_cache_home = os.environ.get("XDG_CACHE_HOME")
+    if xdg_cache_home and xdg_cache_home.strip():
+        cache_root = Path(xdg_cache_home).expanduser()
+    else:
+        cache_root = Path.home() / ".cache"
+    return cache_root / "mcp-ebook-read" / "fastembed"
+
+
+def _resolve_fastembed_cache_path() -> Path:
+    override = os.environ.get("FASTEMBED_CACHE_PATH")
+    cache_path = (
+        Path(override).expanduser()
+        if override and override.strip()
+        else _default_fastembed_cache_path()
+    )
+    cache_path.mkdir(parents=True, exist_ok=True)
+    return cache_path
+
+
+def _extract_broken_model_cache_dir(exc: Exception, cache_dir: Path) -> Path | None:
+    pattern = re.compile(rf"({re.escape(str(cache_dir))}[^\s\"']+)")
+    match = pattern.search(str(exc))
+    if match is None:
+        return None
+
+    failed_path = Path(match.group(1))
+    for parent in failed_path.parents:
+        if parent.parent == cache_dir and parent.name.startswith("models--"):
+            return parent
+    return None
+
+
+def _should_retry_fastembed_init(exc: Exception) -> bool:
+    message = str(exc).lower()
+    retry_tokens = (
+        "no_suchfile",
+        "no such file",
+        "doesn't exist",
+        "ssl",
+        "maxretryerror",
+        "unexpected eof",
+        "connection reset",
+        "temporarily unavailable",
+        "timed out",
+    )
+    return any(token in message for token in retry_tokens)
+
+
+def _build_text_embedder(model_name: str | None, cache_dir: Path) -> TextEmbedding:
+    last_exc: Exception | None = None
+    for attempt in range(1, _FASTEMBED_INIT_RETRIES + 1):
+        try:
+            if model_name:
+                return TextEmbedding(model_name=model_name, cache_dir=str(cache_dir))
+            return TextEmbedding(cache_dir=str(cache_dir))
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            should_retry = (
+                attempt < _FASTEMBED_INIT_RETRIES and _should_retry_fastembed_init(exc)
+            )
+            cleared_cache_dir = None
+            if should_retry:
+                broken_model_cache_dir = _extract_broken_model_cache_dir(exc, cache_dir)
+                if broken_model_cache_dir and broken_model_cache_dir.exists():
+                    shutil.rmtree(broken_model_cache_dir, ignore_errors=True)
+                    cleared_cache_dir = str(broken_model_cache_dir)
+            logger.warning(
+                "fastembed_init_failed",
+                extra={
+                    "attempt": attempt,
+                    "retries": _FASTEMBED_INIT_RETRIES,
+                    "cache_dir": str(cache_dir),
+                    "model_name": model_name or "BAAI/bge-small-en-v1.5",
+                    "retrying": should_retry,
+                    "cleared_cache_dir": cleared_cache_dir,
+                    "error_type": type(exc).__name__,
+                },
+            )
+            if not should_retry:
+                break
+            time.sleep(_FASTEMBED_RETRY_BASE_DELAY_SECONDS * attempt)
+
+    assert last_exc is not None
+    raise AppError(
+        ErrorCode.SEARCH_INDEX_NOT_READY,
+        "FastEmbed model initialization failed.",
+        details={
+            "cache_dir": str(cache_dir),
+            "model_name": model_name or "BAAI/bge-small-en-v1.5",
+            "attempts": _FASTEMBED_INIT_RETRIES,
+        },
+    ) from last_exc
 
 
 class QdrantVectorIndex:
@@ -41,9 +146,8 @@ class QdrantVectorIndex:
             trust_env=trust_env_proxy,
             check_compatibility=trust_env_proxy,
         )
-        self.embedder = (
-            TextEmbedding(model_name=model_name) if model_name else TextEmbedding()
-        )
+        self.fastembed_cache_dir = _resolve_fastembed_cache_path()
+        self.embedder = _build_text_embedder(model_name, self.fastembed_cache_dir)
         self._vector_size: int | None = None
         if check_backend_ready:
             self._assert_backend_ready()

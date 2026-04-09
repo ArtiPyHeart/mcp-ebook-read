@@ -259,3 +259,35 @@ def test_from_env_invalid_formula_batch_size_fails_preflight(
     failed_components = details.get("failed_components")
     assert isinstance(failed_components, list)
     assert any(item["component"] == "config" for item in failed_components)
+
+
+def test_from_env_vector_init_failure_is_aggregated(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    grobid = ReadyGrobid()
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("QDRANT_URL", "http://127.0.0.1:6333")
+    monkeypatch.setenv("GROBID_URL", "http://127.0.0.1:8070")
+    monkeypatch.setattr(
+        "mcp_ebook_read.service.QdrantVectorIndex.from_env",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AppError(
+                ErrorCode.SEARCH_INDEX_NOT_READY,
+                "FastEmbed model initialization failed.",
+                details={"cache_dir": "/tmp/fastembed"},
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        "mcp_ebook_read.service.GrobidClient.from_env",
+        lambda: grobid,
+    )
+
+    with pytest.raises(AppError) as exc:
+        AppService.from_env()
+
+    failed_components = exc.value.details.get("failed_components")
+    assert isinstance(failed_components, list)
+    assert failed_components[0]["component"] == "qdrant"
+    assert failed_components[0]["message"] == "FastEmbed model initialization failed."

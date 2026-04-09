@@ -289,7 +289,17 @@ class AppService:
                 }
             )
         else:
-            vector_index = QdrantVectorIndex.from_env(check_backend_ready=False)
+            try:
+                vector_index = QdrantVectorIndex.from_env(check_backend_ready=False)
+            except AppError as exc:
+                preflight_errors.append(
+                    {
+                        "component": "qdrant",
+                        "code": exc.code,
+                        "message": exc.message,
+                        "details": exc.details or None,
+                    }
+                )
 
         grobid_client = GrobidClient.from_env()
         if vector_index is not None:

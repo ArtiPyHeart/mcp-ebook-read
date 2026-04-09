@@ -64,6 +64,7 @@ Optional:
 - `QDRANT_COLLECTION` (default `mcp_ebook_read_chunks`)
 - `QDRANT_TIMEOUT_SECONDS` (default `10`)
 - `FASTEMBED_MODEL` (FastEmbed model override)
+- `FASTEMBED_CACHE_PATH` (FastEmbed cache root override; defaults to `~/Library/Caches/mcp-ebook-read/fastembed` on macOS and `$XDG_CACHE_HOME/mcp-ebook-read/fastembed` or `~/.cache/mcp-ebook-read/fastembed` elsewhere)
 - `DOCLING_FORMULA_ENRICHMENT` (`true` by default)
 - `PDF_FORMULA_REQUIRE_ENGINE` (`true` by default)
 - `PDF_FORMULA_BATCH_SIZE` (`auto` by default; or an explicit integer)
@@ -87,6 +88,8 @@ Optional:
 - After a fresh server restart, call `library_scan(root=...)` or `storage_list_sidecars(root=...)` before using tools that only take `doc_id`.
 - Use `search` for global semantic retrieval and `read` for locator-based chunk windows.
 - Startup preflight is fail-fast and requires both Qdrant and GROBID to be configured and reachable.
+- FastEmbed model cache defaults to a stable per-user cache directory under `mcp-ebook-read/fastembed` instead of the system temp directory.
+- FastEmbed startup now performs bounded retries and clears broken per-model cache state before retrying when the local cache is corrupted or a transient download failure leaves incomplete model files behind.
 - Use `document_ingest_pdf_book` to queue a background ingest job for a PDF book.
 - Use `document_ingest_epub_book` to queue a background ingest job for an EPUB book.
 - Use `document_ingest_pdf_paper` to queue a background ingest job for a PDF paper. Docling remains the canonical page-aware outline; GROBID enriches paper metadata and title.

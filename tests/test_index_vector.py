@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -19,8 +20,13 @@ class FakeEmbeddingVector:
 
 
 class FakeEmbedder:
-    def __init__(self, model_name: str | None = None) -> None:
+    def __init__(
+        self,
+        model_name: str | None = None,
+        cache_dir: str | None = None,
+    ) -> None:
         self.model_name = model_name
+        self.cache_dir = cache_dir
 
     def embed(self, texts: list[str]):
         return [
@@ -135,6 +141,95 @@ def test_vector_index_backend_not_ready(monkeypatch: pytest.MonkeyPatch) -> None
         QdrantVectorIndex(url="http://localhost:6333", collection="x")
 
     assert exc.value.code == ErrorCode.SEARCH_INDEX_NOT_READY
+
+
+def test_vector_index_uses_stable_fastembed_cache_by_default(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr("mcp_ebook_read.index.vector.QdrantClient", FakeQdrantClient)
+    monkeypatch.setattr("mcp_ebook_read.index.vector.TextEmbedding", FakeEmbedder)
+    monkeypatch.setattr(
+        "mcp_ebook_read.index.vector._resolve_fastembed_cache_path",
+        lambda: tmp_path / "fastembed",
+    )
+
+    index = QdrantVectorIndex(
+        url="http://localhost:6333", collection="cache_collection"
+    )
+
+    assert index.fastembed_cache_dir == tmp_path / "fastembed"
+    assert index.embedder.cache_dir == str(tmp_path / "fastembed")
+
+
+def test_vector_index_retries_after_broken_fastembed_cache(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    attempts: list[int] = []
+    cache_root = tmp_path / "fastembed"
+    broken_model_dir = cache_root / "models--broken-model"
+
+    class FlakyEmbedder(FakeEmbedder):
+        def __init__(
+            self,
+            model_name: str | None = None,
+            cache_dir: str | None = None,
+        ) -> None:
+            attempts.append(1)
+            if len(attempts) == 1:
+                broken_snapshot = (
+                    Path(cache_dir or "")
+                    / "models--broken-model"
+                    / "snapshots"
+                    / "abc123"
+                )
+                broken_snapshot.mkdir(parents=True, exist_ok=True)
+                raise RuntimeError(
+                    f"Load model from {broken_snapshot / 'model_optimized.onnx'} failed: "
+                    "File doesn't exist"
+                )
+            super().__init__(model_name=model_name, cache_dir=cache_dir)
+
+    monkeypatch.setattr("mcp_ebook_read.index.vector.QdrantClient", FakeQdrantClient)
+    monkeypatch.setattr("mcp_ebook_read.index.vector.TextEmbedding", FlakyEmbedder)
+    monkeypatch.setattr(
+        "mcp_ebook_read.index.vector._resolve_fastembed_cache_path",
+        lambda: cache_root,
+    )
+    monkeypatch.setattr("mcp_ebook_read.index.vector.time.sleep", lambda *_args: None)
+
+    index = QdrantVectorIndex(
+        url="http://localhost:6333", collection="retry_collection"
+    )
+
+    assert len(attempts) == 2
+    assert not broken_model_dir.exists()
+    assert index.embedder.cache_dir == str(cache_root)
+
+
+def test_vector_index_reports_fastembed_init_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    class BrokenEmbedder(FakeEmbedder):
+        def __init__(
+            self,
+            model_name: str | None = None,
+            cache_dir: str | None = None,
+        ) -> None:
+            raise RuntimeError("TLS handshake failed with unexpected EOF")
+
+    monkeypatch.setattr("mcp_ebook_read.index.vector.QdrantClient", FakeQdrantClient)
+    monkeypatch.setattr("mcp_ebook_read.index.vector.TextEmbedding", BrokenEmbedder)
+    monkeypatch.setattr(
+        "mcp_ebook_read.index.vector._resolve_fastembed_cache_path",
+        lambda: tmp_path / "fastembed",
+    )
+    monkeypatch.setattr("mcp_ebook_read.index.vector.time.sleep", lambda *_args: None)
+
+    with pytest.raises(AppError) as exc:
+        QdrantVectorIndex(url="http://localhost:6333", collection="broken_collection")
+
+    assert exc.value.code == ErrorCode.SEARCH_INDEX_NOT_READY
+    assert exc.value.details["cache_dir"] == str(tmp_path / "fastembed")
 
 
 def test_rebuild_document_creates_collection_and_upserts(
