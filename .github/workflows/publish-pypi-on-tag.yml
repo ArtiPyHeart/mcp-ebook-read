@@ -28,7 +28,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.13"
 
       - name: Set up uv
         uses: astral-sh/setup-uv@v4
@@ -44,7 +44,7 @@ jobs:
           fi
 
       - name: Install dependencies
-        run: uv sync --dev
+        run: uv sync --dev --python 3.13
 
       - name: Lint
         run: uv run ruff check .

@@ -560,6 +560,7 @@ def test_docling_parse_caches_formula_candidates_per_page(
             ),
         ]
 
+    monkeypatch.setattr(parser.formula_extractor, "_ensure_engine", lambda: object())
     monkeypatch.setattr(parser.formula_extractor, "extract", fake_extract)
 
     parsed = parser.parse(str(pdf), "doc-formula-cache")
