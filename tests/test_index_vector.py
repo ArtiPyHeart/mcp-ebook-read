@@ -4,7 +4,9 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
+from filelock import FileLock
 import pytest
+from fastembed import TextEmbedding
 
 from mcp_ebook_read.errors import AppError, ErrorCode
 from mcp_ebook_read.index.vector import QdrantVectorIndex
@@ -33,6 +35,14 @@ class FakeEmbedder:
             FakeEmbeddingVector([float(i + 1), float(i + 2)])
             for i, _ in enumerate(texts)
         ]
+
+
+class GuardedEmbedder(FakeEmbedder):
+    supported_models: list[dict[str, object]] = []
+
+    @classmethod
+    def list_supported_models(cls) -> list[dict[str, object]]:
+        return list(cls.supported_models)
 
 
 class FakeQdrantClient:
@@ -98,6 +108,28 @@ def _build_index(monkeypatch: pytest.MonkeyPatch) -> QdrantVectorIndex:
     monkeypatch.setattr("mcp_ebook_read.index.vector.QdrantClient", FakeQdrantClient)
     monkeypatch.setattr("mcp_ebook_read.index.vector.TextEmbedding", FakeEmbedder)
     return QdrantVectorIndex(url="http://localhost:6333", collection="test_collection")
+
+
+def _make_incomplete_fastembed_cache(
+    cache_root: Path,
+    *,
+    with_lock_files: bool = False,
+) -> tuple[Path, Path]:
+    model_dir = cache_root / "models--qdrant--bge-small-en-v1.5-onnx-q"
+    snapshot_dir = model_dir / "snapshots" / "52398278842ec682c6f32300af41344b1c0b0bb2"
+    snapshot_dir.mkdir(parents=True, exist_ok=True)
+    refs_dir = model_dir / "refs"
+    refs_dir.mkdir(parents=True, exist_ok=True)
+    (refs_dir / "main").write_text(snapshot_dir.name, encoding="utf-8")
+
+    lock_dir = cache_root / ".locks" / model_dir.name
+    if with_lock_files:
+        lock_dir.mkdir(parents=True, exist_ok=True)
+        (
+            lock_dir
+            / "51f1bd0addd6e859e42c2c8021a5e5461385bb676a649f4b269aa445449f2431.lock"
+        ).touch()
+    return model_dir, lock_dir
 
 
 def test_vector_index_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -230,6 +262,68 @@ def test_vector_index_reports_fastembed_init_failure(
 
     assert exc.value.code == ErrorCode.SEARCH_INDEX_NOT_READY
     assert exc.value.details["cache_dir"] == str(tmp_path / "fastembed")
+
+
+def test_vector_index_clears_stale_fastembed_lock_files(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    cache_root = tmp_path / "fastembed"
+    model_dir, lock_dir = _make_incomplete_fastembed_cache(
+        cache_root, with_lock_files=True
+    )
+    GuardedEmbedder.supported_models = TextEmbedding.list_supported_models()
+
+    monkeypatch.setattr("mcp_ebook_read.index.vector.QdrantClient", FakeQdrantClient)
+    monkeypatch.setattr("mcp_ebook_read.index.vector.TextEmbedding", GuardedEmbedder)
+    monkeypatch.setattr(
+        "mcp_ebook_read.index.vector._resolve_fastembed_cache_path",
+        lambda: cache_root,
+    )
+
+    index = QdrantVectorIndex(
+        url="http://localhost:6333", collection="repair_collection"
+    )
+
+    assert isinstance(index.embedder, GuardedEmbedder)
+    assert not model_dir.exists()
+    assert not lock_dir.exists()
+
+
+def test_vector_index_fails_fast_when_fastembed_lock_is_active(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    cache_root = tmp_path / "fastembed"
+    model_dir, lock_dir = _make_incomplete_fastembed_cache(
+        cache_root, with_lock_files=True
+    )
+    lock_file = next(lock_dir.glob("*.lock"))
+    held_lock = FileLock(str(lock_file))
+    held_lock.acquire(timeout=0)
+    GuardedEmbedder.supported_models = TextEmbedding.list_supported_models()
+
+    class ShouldNotInitEmbedder(GuardedEmbedder):
+        def __init__(self, *args, **kwargs) -> None:  # noqa: ANN002, ANN003
+            raise AssertionError("TextEmbedding constructor should not run")
+
+    monkeypatch.setattr("mcp_ebook_read.index.vector.QdrantClient", FakeQdrantClient)
+    monkeypatch.setattr(
+        "mcp_ebook_read.index.vector.TextEmbedding", ShouldNotInitEmbedder
+    )
+    monkeypatch.setattr(
+        "mcp_ebook_read.index.vector._resolve_fastembed_cache_path",
+        lambda: cache_root,
+    )
+
+    try:
+        with pytest.raises(AppError) as exc:
+            QdrantVectorIndex(url="http://localhost:6333", collection="blocked_cache")
+    finally:
+        held_lock.release()
+
+    assert exc.value.code == ErrorCode.SEARCH_INDEX_NOT_READY
+    assert "locked by another process" in exc.value.message
+    assert exc.value.details["model_cache_dir"] == str(model_dir)
+    assert exc.value.details["lock_files"] == [str(lock_file)]
 
 
 def test_rebuild_document_creates_collection_and_upserts(

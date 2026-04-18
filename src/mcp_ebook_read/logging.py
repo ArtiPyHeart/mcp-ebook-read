@@ -8,6 +8,8 @@ import sys
 from datetime import UTC, datetime
 from uuid import uuid4
 
+_STANDARD_LOG_RECORD_FIELDS = set(logging.makeLogRecord({}).__dict__)
+
 
 class JsonFormatter(logging.Formatter):
     """Write logs as json objects to stderr."""
@@ -21,6 +23,10 @@ class JsonFormatter(logging.Formatter):
         }
         if hasattr(record, "trace_id"):
             payload["trace_id"] = record.trace_id
+        for key, value in record.__dict__.items():
+            if key in _STANDARD_LOG_RECORD_FIELDS or key == "trace_id":
+                continue
+            payload[key] = value
         if record.exc_info:
             payload["exc_info"] = self.formatException(record.exc_info)
         return json.dumps(payload, ensure_ascii=True)

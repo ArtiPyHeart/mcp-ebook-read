@@ -9,6 +9,7 @@ import re
 import shutil
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from uuid import NAMESPACE_URL, uuid5
@@ -23,8 +24,18 @@ from mcp_ebook_read.schema.models import ChunkRecord
 
 logger = logging.getLogger(__name__)
 
+_DEFAULT_FASTEMBED_MODEL = "BAAI/bge-small-en-v1.5"
 _FASTEMBED_INIT_RETRIES = 3
 _FASTEMBED_RETRY_BASE_DELAY_SECONDS = 1.0
+
+
+@dataclass(frozen=True)
+class _FastembedModelCacheLayout:
+    model_name: str
+    hf_repo: str
+    model_file: str
+    model_cache_dir: Path
+    lock_dir: Path
 
 
 def _default_fastembed_cache_path() -> Path:
@@ -62,6 +73,139 @@ def _extract_broken_model_cache_dir(exc: Exception, cache_dir: Path) -> Path | N
     return None
 
 
+def _resolve_fastembed_model_cache_layout(
+    model_name: str | None, cache_dir: Path
+) -> _FastembedModelCacheLayout | None:
+    resolved_model_name = model_name or _DEFAULT_FASTEMBED_MODEL
+    list_supported_models = getattr(TextEmbedding, "list_supported_models", None)
+    if not callable(list_supported_models):
+        return None
+    for model_info in list_supported_models():
+        current_model_name = model_info.get("model")
+        if not isinstance(current_model_name, str):
+            continue
+        if current_model_name.lower() != resolved_model_name.lower():
+            continue
+        sources = model_info.get("sources")
+        model_file = model_info.get("model_file")
+        hf_repo = sources.get("hf") if isinstance(sources, dict) else None
+        if not isinstance(hf_repo, str) or not hf_repo.strip():
+            return None
+        if not isinstance(model_file, str) or not model_file.strip():
+            return None
+        model_cache_dir = cache_dir / f"models--{hf_repo.replace('/', '--')}"
+        return _FastembedModelCacheLayout(
+            model_name=resolved_model_name,
+            hf_repo=hf_repo,
+            model_file=model_file,
+            model_cache_dir=model_cache_dir,
+            lock_dir=cache_dir / ".locks" / model_cache_dir.name,
+        )
+    return None
+
+
+def _model_snapshot_has_required_artifact(layout: _FastembedModelCacheLayout) -> bool:
+    refs_main = layout.model_cache_dir / "refs" / "main"
+    checked_snapshot_dirs: set[Path] = set()
+
+    def iter_snapshot_dirs() -> list[Path]:
+        candidates: list[Path] = []
+        if refs_main.exists():
+            revision = refs_main.read_text(encoding="utf-8").strip()
+            if revision:
+                candidates.append(layout.model_cache_dir / "snapshots" / revision)
+        snapshots_dir = layout.model_cache_dir / "snapshots"
+        if snapshots_dir.exists():
+            candidates.extend(path for path in snapshots_dir.iterdir() if path.is_dir())
+        unique_candidates: list[Path] = []
+        for candidate in candidates:
+            if candidate in checked_snapshot_dirs:
+                continue
+            checked_snapshot_dirs.add(candidate)
+            unique_candidates.append(candidate)
+        return unique_candidates
+
+    return any(
+        (snapshot_dir / layout.model_file).exists()
+        for snapshot_dir in iter_snapshot_dirs()
+    )
+
+
+def _clear_fastembed_model_cache_artifacts(
+    cache_dir: Path, model_cache_dir: Path
+) -> tuple[str | None, str | None]:
+    cleared_model_cache_dir = None
+    if model_cache_dir.exists():
+        shutil.rmtree(model_cache_dir, ignore_errors=True)
+        cleared_model_cache_dir = str(model_cache_dir)
+
+    lock_dir = cache_dir / ".locks" / model_cache_dir.name
+    cleared_lock_dir = None
+    if lock_dir.exists():
+        shutil.rmtree(lock_dir, ignore_errors=True)
+        cleared_lock_dir = str(lock_dir)
+    return cleared_model_cache_dir, cleared_lock_dir
+
+
+def _prepare_fastembed_cache(
+    model_name: str | None, cache_dir: Path
+) -> dict[str, Any] | None:
+    layout = _resolve_fastembed_model_cache_layout(model_name, cache_dir)
+    if layout is None or not layout.model_cache_dir.exists():
+        return None
+    if _model_snapshot_has_required_artifact(layout):
+        return None
+
+    lock_files = (
+        sorted(layout.lock_dir.glob("*.lock")) if layout.lock_dir.exists() else []
+    )
+    active_lock_files: list[str] = []
+    stale_lock_files: list[str] = []
+    if lock_files:
+        from filelock import FileLock, Timeout
+
+        for lock_file in lock_files:
+            file_lock = FileLock(str(lock_file))
+            try:
+                file_lock.acquire(timeout=0)
+            except Timeout:
+                active_lock_files.append(str(lock_file))
+                continue
+            try:
+                lock_file.unlink(missing_ok=True)
+            finally:
+                file_lock.release()
+            stale_lock_files.append(str(lock_file))
+
+    if active_lock_files:
+        raise AppError(
+            ErrorCode.SEARCH_INDEX_NOT_READY,
+            "FastEmbed cache is incomplete and currently locked by another process.",
+            details={
+                "cache_dir": str(cache_dir),
+                "model_name": layout.model_name,
+                "model_cache_dir": str(layout.model_cache_dir),
+                "lock_files": active_lock_files,
+                "hint": (
+                    "Stop stale mcp-ebook-read processes holding FastEmbed cache locks "
+                    "or set FASTEMBED_CACHE_PATH to a fresh directory."
+                ),
+            },
+        )
+
+    cleared_model_cache_dir, cleared_lock_dir = _clear_fastembed_model_cache_artifacts(
+        cache_dir, layout.model_cache_dir
+    )
+    return {
+        "cache_dir": str(cache_dir),
+        "model_name": layout.model_name,
+        "model_cache_dir": str(layout.model_cache_dir),
+        "cleared_model_cache_dir": cleared_model_cache_dir,
+        "cleared_lock_dir": cleared_lock_dir,
+        "stale_lock_files": stale_lock_files,
+    }
+
+
 def _should_retry_fastembed_init(exc: Exception) -> bool:
     message = str(exc).lower()
     retry_tokens = (
@@ -79,6 +223,10 @@ def _should_retry_fastembed_init(exc: Exception) -> bool:
 
 
 def _build_text_embedder(model_name: str | None, cache_dir: Path) -> TextEmbedding:
+    prepared_cache = _prepare_fastembed_cache(model_name, cache_dir)
+    if prepared_cache is not None:
+        logger.warning("fastembed_cache_repaired", extra=prepared_cache)
+
     last_exc: Exception | None = None
     for attempt in range(1, _FASTEMBED_INIT_RETRIES + 1):
         try:
@@ -91,21 +239,27 @@ def _build_text_embedder(model_name: str | None, cache_dir: Path) -> TextEmbeddi
                 attempt < _FASTEMBED_INIT_RETRIES and _should_retry_fastembed_init(exc)
             )
             cleared_cache_dir = None
+            cleared_lock_dir = None
             if should_retry:
                 broken_model_cache_dir = _extract_broken_model_cache_dir(exc, cache_dir)
                 if broken_model_cache_dir and broken_model_cache_dir.exists():
-                    shutil.rmtree(broken_model_cache_dir, ignore_errors=True)
-                    cleared_cache_dir = str(broken_model_cache_dir)
+                    cleared_cache_dir, cleared_lock_dir = (
+                        _clear_fastembed_model_cache_artifacts(
+                            cache_dir, broken_model_cache_dir
+                        )
+                    )
             logger.warning(
                 "fastembed_init_failed",
                 extra={
                     "attempt": attempt,
                     "retries": _FASTEMBED_INIT_RETRIES,
                     "cache_dir": str(cache_dir),
-                    "model_name": model_name or "BAAI/bge-small-en-v1.5",
+                    "model_name": model_name or _DEFAULT_FASTEMBED_MODEL,
                     "retrying": should_retry,
                     "cleared_cache_dir": cleared_cache_dir,
+                    "cleared_lock_dir": cleared_lock_dir,
                     "error_type": type(exc).__name__,
+                    "error_message": str(exc),
                 },
             )
             if not should_retry:
@@ -118,7 +272,7 @@ def _build_text_embedder(model_name: str | None, cache_dir: Path) -> TextEmbeddi
         "FastEmbed model initialization failed.",
         details={
             "cache_dir": str(cache_dir),
-            "model_name": model_name or "BAAI/bge-small-en-v1.5",
+            "model_name": model_name or _DEFAULT_FASTEMBED_MODEL,
             "attempts": _FASTEMBED_INIT_RETRIES,
         },
     ) from last_exc
