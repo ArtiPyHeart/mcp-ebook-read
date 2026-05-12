@@ -103,28 +103,29 @@ def test_pdf_table_and_figure_tools_wrap_success(monkeypatch) -> None:
     read_table_payload = server.pdf_read_table(doc_id="doc1", table_id="t1")
     list_figures_payload = server.pdf_list_figures(doc_id="doc1", node_id=None, limit=7)
     read_figure_payload = server.pdf_read_figure(doc_id="doc1", figure_id="f1")
+    source_trust = server.SOURCE_TRUST_METADATA
 
     assert list_tables_payload == {
         "ok": True,
-        "data": {"tables_count": 1},
+        "data": {"tables_count": 1, "source_trust": source_trust},
         "error": None,
         "trace_id": "trace-visuals",
     }
     assert read_table_payload == {
         "ok": True,
-        "data": {"table": {"table_id": "t1"}},
+        "data": {"table": {"table_id": "t1"}, "source_trust": source_trust},
         "error": None,
         "trace_id": "trace-visuals",
     }
     assert list_figures_payload == {
         "ok": True,
-        "data": {"figures_count": 1},
+        "data": {"figures_count": 1, "source_trust": source_trust},
         "error": None,
         "trace_id": "trace-visuals",
     }
     assert read_figure_payload == {
         "ok": True,
-        "data": {"figure": {"figure_id": "f1"}},
+        "data": {"figure": {"figure_id": "f1"}, "source_trust": source_trust},
         "error": None,
         "trace_id": "trace-visuals",
     }

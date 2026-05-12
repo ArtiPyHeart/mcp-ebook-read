@@ -18,6 +18,7 @@ from mcp_ebook_read.schema.models import (
     FormulaRecord,
     ImageRecord,
     IngestJobStatus,
+    IngestStage,
     Locator,
     OutlineNode,
     ParsedDocument,
@@ -25,6 +26,7 @@ from mcp_ebook_read.schema.models import (
     PdfParserPerformanceConfig,
     PdfParserTuningProfile,
     PdfTableRecord,
+    Profile,
     TableSegmentRecord,
 )
 from mcp_ebook_read.service import AppService
@@ -36,6 +38,9 @@ class RecordingVectorIndex:
         self.search_calls: list[tuple[str, int, list[str] | None]] = []
         self.search_result: list[dict[str, Any]] = []
         self.delete_calls: list[str] = []
+
+    def assert_ready(self) -> None:
+        return None
 
     def rebuild_document(
         self, doc_id: str, title: str, chunks: list[ChunkRecord]
@@ -121,7 +126,12 @@ class RecordingGrobid:
         self.metadata = metadata or {}
         self.outline = outline or []
         self.error = error
+        self.base_url = "http://grobid.test"
         self.calls: list[str] = []
+
+    def assert_available(self) -> None:
+        if self.error is not None:
+            raise self.error
 
     def parse_fulltext(self, path: str):
         self.calls.append(path)
@@ -802,17 +812,30 @@ def test_document_ingest_jobs_deduplicate_and_list_status(tmp_path: Path) -> Non
     _register_doc(service, doc_id, pdf_path, DocumentType.PDF)
 
     first = service.document_ingest_pdf_book(doc_id=doc_id, path=None, force=True)
+    assert first["progress"]["stage"] == IngestStage.QUEUED
+    assert first["progress"]["done"] == 0
+    assert first["progress"]["total"] == 6
+    assert first["progress"]["current_item"]
     assert parser.started.wait(timeout=2.0)
 
     second = service.document_ingest_pdf_book(doc_id=doc_id, path=None, force=True)
     assert second["deduplicated"] is True
     assert second["job_id"] == first["job_id"]
+    assert second["progress"]["total"] == 6
 
     in_progress = service.document_ingest_status(doc_id=doc_id, job_id=first["job_id"])
     assert in_progress["status"] in {
         IngestJobStatus.QUEUED,
         IngestJobStatus.RUNNING,
     }
+    assert in_progress["progress"]["stage"] in {
+        IngestStage.QUEUED,
+        IngestStage.PARSE,
+        IngestStage.GROBID,
+    }
+    assert 0 <= in_progress["progress"]["done"] <= in_progress["progress"]["total"]
+    if in_progress["status"] == IngestJobStatus.RUNNING:
+        assert isinstance(in_progress["progress"]["elapsed_ms"], int)
 
     parser.release.set()
     completed = _wait_for_ingest_job(
@@ -821,10 +844,16 @@ def test_document_ingest_jobs_deduplicate_and_list_status(tmp_path: Path) -> Non
         job_id=first["job_id"],
     )
     assert completed["status"] == IngestJobStatus.SUCCEEDED
+    assert completed["progress"]["stage"] == IngestStage.COMPLETED
+    assert completed["progress"]["done"] == completed["progress"]["total"]
+    assert completed["progress"]["pct"] == 100.0
+    assert completed["progress"]["diagnostics"]["chunks_count"] == 2
+    assert isinstance(completed["progress"]["elapsed_ms"], int)
 
     listed = service.document_ingest_list_jobs(doc_id=doc_id, limit=10)
     assert listed["doc_id"] == doc_id
     assert listed["jobs"][0]["job_id"] == first["job_id"]
+    assert listed["jobs"][0]["progress"]["stage"] == IngestStage.COMPLETED
 
 
 def test_document_ingest_pdf_book_rejects_epub(tmp_path: Path) -> None:
@@ -919,12 +948,18 @@ def test_search_and_outline_and_render(
     _wait_for_ingest_job(service, doc_id=doc_id, job_id=queued["job_id"])
 
     search_data = service.search("query", [doc_id], 5)
-    assert search_data["hits"] == [{"doc_id": doc_id, "chunk_id": "c0"}]
+    assert search_data["hits"][0]["doc_id"] == doc_id
+    assert search_data["hits"][0]["chunk_id"] == "c0"
+    assert search_data["retrieval"]["mode"] == "hybrid_rrf"
+    assert search_data["hits"][0]["retrieval_sources"] == [
+        {"source": "qdrant", "rank": 1}
+    ]
     assert vector.search_calls == [("query", 5, [doc_id])]
 
     outline = service.get_outline(doc_id)
     assert outline["title"] == "PDF"
     assert len(outline["nodes"]) == 1
+    assert outline["pipeline_status"]["is_stale"] is False
 
     monkeypatch.setattr(
         "mcp_ebook_read.service.render_pdf_page",
@@ -933,6 +968,223 @@ def test_search_and_outline_and_render(
     render = service.render_pdf_page(doc_id=doc_id, page=1, dpi=150)
     assert render["width"] == 800
     assert render["height"] == 600
+
+
+def test_stale_ready_document_reingests_instead_of_cached_reuse(
+    tmp_path: Path,
+) -> None:
+    doc_id = "doc-stale-pipeline"
+    pdf_path = tmp_path / "stale.pdf"
+    pdf_path.write_bytes(b"pdf")
+    parser = RecordingParser(result=_parsed(doc_id, title="Fresh", method="docling"))
+    service = _build_service(
+        tmp_path,
+        pdf_parser=parser,
+        epub_parser=RecordingParser(result=_parsed("x", title="X", method="ebooklib")),
+        grobid=RecordingGrobid(),
+    )
+    _register_doc(service, doc_id, pdf_path, DocumentType.PDF)
+    catalog = service._catalog_for_document_path(pdf_path)
+    catalog.save_document_parse_output(
+        doc_id=doc_id,
+        title="Old",
+        parser_chain=["docling"],
+        metadata={},
+        outline=[OutlineNode(id="old", title="Old", level=1)],
+        overall_confidence=0.8,
+        status=DocumentStatus.READY,
+    )
+    catalog.set_document_status(doc_id, DocumentStatus.READY, profile=Profile.BOOK)
+
+    outline = service.get_outline(doc_id)
+    assert outline["pipeline_status"]["is_stale"] is True
+    assert outline["pipeline_status"]["reason"] == "missing_pipeline_metadata"
+
+    queued = service.document_ingest_pdf_book(doc_id=doc_id, path=None, force=False)
+    assert queued["cached"] is False
+    completed = _wait_for_ingest_job(
+        service,
+        doc_id=doc_id,
+        job_id=queued["job_id"],
+    )
+    assert completed["status"] == IngestJobStatus.SUCCEEDED
+    assert completed["pipeline_status"]["is_stale"] is False
+    assert parser.calls
+
+
+def test_search_uses_local_fts_when_vector_has_no_hits(tmp_path: Path) -> None:
+    doc_id = "doc-local-search"
+    pdf_path = tmp_path / "local-search.pdf"
+    pdf_path.write_bytes(b"pdf")
+    locator = Locator(
+        doc_id=doc_id,
+        chunk_id="local-c0",
+        section_path=["Symbols"],
+        page_range=[7, 8],
+        method="docling",
+    )
+    chunk = ChunkRecord(
+        chunk_id="local-c0",
+        doc_id=doc_id,
+        order_index=0,
+        section_path=["Symbols"],
+        text="Banach fixedpoint theorem with exactterm42.",
+        search_text="banach fixedpoint exactterm42",
+        locator=locator,
+        method="docling",
+    )
+    parsed = ParsedDocument(
+        title="Local Search",
+        parser_chain=["docling"],
+        metadata={},
+        outline=[OutlineNode(id="symbols", title="Symbols", level=1)],
+        chunks=[chunk],
+        formulas=[
+            _formula(
+                doc_id=doc_id,
+                formula_id="local-f0",
+                chunk_id="local-c0",
+                page=7,
+                bbox=None,
+                latex=r"\alpha + \beta = \gamma",
+            )
+        ],
+        reading_markdown="Symbols",
+        overall_confidence=0.9,
+    )
+    service = _build_service(
+        tmp_path,
+        pdf_parser=RecordingParser(result=parsed),
+        epub_parser=RecordingParser(result=_parsed("x", title="X", method="ebooklib")),
+        grobid=RecordingGrobid(),
+    )
+    _register_doc(service, doc_id, pdf_path, DocumentType.PDF)
+    queued = service.document_ingest_pdf_book(doc_id=doc_id, path=None, force=True)
+    _wait_for_ingest_job(service, doc_id=doc_id, job_id=queued["job_id"])
+
+    chunk_search = service.search("exactterm42", [doc_id], 5)
+    assert chunk_search["retrieval"]["local_hits_count"] >= 1
+    assert chunk_search["hits"][0]["source_type"] == "chunk"
+    assert chunk_search["hits"][0]["locator"] == locator.model_dump()
+    assert chunk_search["hits"][0]["retrieval_sources"] == [
+        {"source": "sqlite_fts5", "rank": 1}
+    ]
+
+    formula_search = service.search("alpha beta", [doc_id], 5)
+    assert any(hit["source_id"] == "local-f0" for hit in formula_search["hits"])
+
+
+def test_reading_session_capture_export_and_replay(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    doc_id = "doc-capture"
+    pdf_path = tmp_path / "capture.pdf"
+    pdf_path.write_bytes(b"pdf")
+    service = _build_service(
+        tmp_path,
+        pdf_parser=RecordingParser(
+            result=_parsed(doc_id, title="PDF", method="docling")
+        ),
+        epub_parser=RecordingParser(result=_parsed("x", title="X", method="ebooklib")),
+        grobid=RecordingGrobid(),
+    )
+    _register_doc(service, doc_id, pdf_path, DocumentType.PDF)
+
+    monkeypatch.setenv("MCP_EBOOK_CAPTURE_READING_SESSION", "1")
+    monkeypatch.delenv("MCP_EBOOK_CAPTURE_INCLUDE_QUERY", raising=False)
+    captured = service.capture_tool_call(
+        tool_name="search",
+        use_case="search",
+        kwargs={"query": "private user question", "doc_ids": [doc_id], "top_k": 5},
+        result={"hits": [{"doc_id": doc_id, "chunk_id": "c0"}]},
+        latency_ms=12,
+    )
+    assert captured["eval_capture"]["captured"] is True
+
+    export = service.eval_export_reading_sessions(root=str(tmp_path), limit=10)
+    assert export["events_count"] == 1
+    event = export["events"][0]
+    assert event["doc_id"] == doc_id
+    assert event["input"]["query_sha256"]
+    assert "query" not in event["input"]
+    assert event["returned_ids"]["chunk_ids"] == ["c0"]
+
+    replay = service.eval_replay_reading_sessions(root=str(tmp_path), limit=10)
+    assert replay["replayed_count"] == 0
+    assert replay["skipped_count"] == 1
+
+    monkeypatch.setenv("MCP_EBOOK_CAPTURE_INCLUDE_QUERY", "1")
+    service.capture_tool_call(
+        tool_name="search",
+        use_case="search",
+        kwargs={"query": "replayable drift query", "doc_ids": [doc_id], "top_k": 5},
+        result={"hits": [{"doc_id": doc_id, "chunk_id": "old-hit"}]},
+        latency_ms=9,
+    )
+    replay_with_query = service.eval_replay_reading_sessions(
+        root=str(tmp_path),
+        limit=10,
+    )
+    assert replay_with_query["replayed_count"] == 1
+    assert replay_with_query["drifted_count"] == 1
+
+
+def test_doctor_health_check_reports_sidecar_findings(tmp_path: Path) -> None:
+    doc_id = "doc-doctor"
+    pdf_path = tmp_path / "doctor.pdf"
+    pdf_path.write_bytes(b"pdf")
+    service = _build_service(
+        tmp_path,
+        pdf_parser=RecordingParser(
+            result=_parsed(doc_id, title="PDF", method="docling")
+        ),
+        epub_parser=RecordingParser(result=_parsed("x", title="X", method="ebooklib")),
+        grobid=RecordingGrobid(),
+    )
+    _register_doc(service, doc_id, pdf_path, DocumentType.PDF)
+    catalog = service._catalog_for_document_path(pdf_path)
+    catalog.save_document_parse_output(
+        doc_id=doc_id,
+        title="Doctor",
+        parser_chain=["docling"],
+        metadata={},
+        outline=[OutlineNode(id="n", title="N", level=1)],
+        overall_confidence=0.8,
+        status=DocumentStatus.READY,
+    )
+    catalog.set_document_status(doc_id, DocumentStatus.READY, profile=Profile.BOOK)
+    catalog.replace_images(
+        doc_id,
+        [
+            ImageRecord(
+                image_id="missing-image",
+                doc_id=doc_id,
+                order_index=0,
+                section_path=["N"],
+                media_type="image/png",
+                file_path=str(tmp_path / "missing.png"),
+                source="test",
+            )
+        ],
+    )
+    orphan_dir = catalog.db_path.parent / "docs" / "orphan-doc"
+    orphan_dir.mkdir(parents=True)
+
+    result = service.doctor_health_check(root=str(tmp_path))
+    assert result["ok"] is True
+    assert {component["name"] for component in result["components"]} >= {
+        "qdrant",
+        "grobid",
+        "fastembed_cache",
+        "parsers",
+        "sidecar_catalogs",
+    }
+    finding_codes = {finding["code"] for finding in result["findings"]}
+    assert "READY_DOCUMENT_HAS_NO_CHUNKS" in finding_codes
+    assert "DOCUMENT_PIPELINE_STALE" in finding_codes
+    assert "MISSING_IMAGE_ARTIFACT" in finding_codes
+    assert "ORPHAN_DOC_ARTIFACT_DIR" in finding_codes
 
 
 def test_get_outline_and_render_errors(tmp_path: Path) -> None:
@@ -1342,14 +1594,17 @@ def test_document_ingest_epub_persists_images_and_read(tmp_path: Path) -> None:
     assert listed["images_count"] == 1
     assert listed["images"][0]["image_id"] == "img-1"
     assert Path(listed["images"][0]["image_path"]).exists()
+    assert listed["images"][0]["semantic"]["diagnostics"]["ocr_performed"] is False
 
     node_scoped = service.epub_list_images(doc_id=doc_id, node_id="toc-1", limit=50)
     assert node_scoped["images_count"] == 1
 
     read = service.epub_read_image(doc_id=doc_id, image_id="img-1")
     assert read["image"]["alt"] == "Architecture diagram"
+    assert "Architecture diagram" in read["image"]["semantic"]["summary"]
     assert read["context"] is not None
     assert "Nearby text" in read["context"]["text"]
+    assert "Nearby text" in read["image"]["semantic"]["signals"]["context_excerpt"]
 
 
 def test_epub_node_scoping_uses_spine_and_full_path(tmp_path: Path) -> None:
@@ -1681,6 +1936,7 @@ def test_pdf_list_images_and_read_image(tmp_path: Path) -> None:
 
     read = service.pdf_read_image(doc_id=doc_id, image_id="pdf-img-a")
     assert read["image"]["caption"] == "Figure 1: A"
+    assert "Figure 1: A" in read["image"]["semantic"]["summary"]
     assert read["context"] is not None
     assert "context A" in read["context"]["text"]
 

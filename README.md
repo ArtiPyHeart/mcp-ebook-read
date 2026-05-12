@@ -7,13 +7,13 @@ A local MCP server for Codex to read and retrieve content from EPUB/PDF document
 ### Qdrant (required)
 
 ```bash
-docker rm -f qdrant 2>/dev/null || true && docker run -d --name qdrant -p 6333:6333 -p 6334:6334 qdrant/qdrant:v1.16.3
+docker rm -f qdrant 2>/dev/null || true && docker run -d --name qdrant -p 6333:6333 -p 6334:6334 qdrant/qdrant:v1.18.0
 ```
 
 ### GROBID (required by startup preflight and `document_ingest_pdf_paper`)
 
 ```bash
-docker rm -f grobid 2>/dev/null || true && docker run -d --name grobid -p 8070:8070 lfoppiano/grobid:0.8.0
+docker rm -f grobid 2>/dev/null || true && docker run -d --name grobid --init --ulimit core=0 -p 8070:8070 grobid/grobid:0.9.0-full
 ```
 
 ## Verify Services
@@ -145,6 +145,19 @@ uvx mcp-ebook-formula-benchmark \
 ```
 
 Output is JSON with per-document metrics and a threshold pass/fail flag. Exit code is `0` when thresholds pass, otherwise `2`.
+
+## No-Label Reading Benchmark
+
+Use a public/sample EPUB/PDF corpus to track outline, chunk, formula, image, table, and local search replay stability.
+
+```bash
+uvx mcp-ebook-reading-benchmark \
+  --samples-dir /ABSOLUTE/PATH/TO/reading-benchmark-corpus \
+  --passes 2 \
+  --min-stability-rate 1.0
+```
+
+Output is JSON with per-document structure metrics and a threshold pass/fail flag. Exit code is `0` when thresholds pass, otherwise `2`.
 
 ## Claude Code MCP Configuration (JSON via `uvx`)
 

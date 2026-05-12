@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from contextlib import contextmanager
 from datetime import UTC, datetime
@@ -27,6 +28,8 @@ from mcp_ebook_read.schema.models import (
 
 class CatalogStore:
     """Catalog and chunk persistence backed by sqlite."""
+
+    _FTS_TOKEN_RE = re.compile(r"[0-9A-Za-z_]+|[\u4e00-\u9fff]+")
 
     def __init__(self, db_path: Path) -> None:
         self.db_path = db_path
@@ -168,6 +171,17 @@ class CatalogStore:
                 CREATE INDEX IF NOT EXISTS idx_pdf_figures_doc
                 ON pdf_figures(doc_id, order_index);
 
+                CREATE VIRTUAL TABLE IF NOT EXISTS local_search_fts USING fts5(
+                    doc_id UNINDEXED,
+                    source_type UNINDEXED,
+                    source_id UNINDEXED,
+                    chunk_id UNINDEXED,
+                    section_path_json UNINDEXED,
+                    order_index UNINDEXED,
+                    text,
+                    tokenize='unicode61'
+                );
+
                 CREATE TABLE IF NOT EXISTS ingest_jobs (
                     job_id TEXT PRIMARY KEY,
                     doc_id TEXT NOT NULL,
@@ -177,6 +191,7 @@ class CatalogStore:
                     stage TEXT NOT NULL,
                     force INTEGER NOT NULL,
                     message TEXT,
+                    progress_json TEXT NOT NULL DEFAULT '{}',
                     result_json TEXT,
                     error_json TEXT,
                     created_at TEXT NOT NULL,
@@ -198,6 +213,15 @@ class CatalogStore:
                 conn.execute("ALTER TABLE images ADD COLUMN page INTEGER")
             if "bbox_json" not in image_columns:
                 conn.execute("ALTER TABLE images ADD COLUMN bbox_json TEXT")
+            ingest_job_columns = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(ingest_jobs)").fetchall()
+            }
+            if "progress_json" not in ingest_job_columns:
+                conn.execute(
+                    "ALTER TABLE ingest_jobs "
+                    "ADD COLUMN progress_json TEXT NOT NULL DEFAULT '{}'"
+                )
             conn.execute(
                 """
                 UPDATE ingest_jobs
@@ -260,6 +284,10 @@ class CatalogStore:
 
             old_doc_id = row["doc_id"]
             if old_doc_id != doc.doc_id:
+                conn.execute(
+                    "DELETE FROM local_search_fts WHERE doc_id = ?",
+                    (old_doc_id,),
+                )
                 conn.execute("DELETE FROM documents WHERE doc_id = ?", (old_doc_id,))
                 conn.execute(
                     """
@@ -312,15 +340,23 @@ class CatalogStore:
         normalized = sorted({str(Path(path).resolve()) for path in paths})
         with self._conn() as conn:
             placeholders = ",".join("?" for _ in normalized)
-            count = conn.execute(
-                f"SELECT COUNT(*) AS c FROM documents WHERE path IN ({placeholders})",
+            rows = conn.execute(
+                f"SELECT doc_id FROM documents WHERE path IN ({placeholders})",
                 normalized,
-            ).fetchone()["c"]
+            ).fetchall()
+            doc_ids = [row["doc_id"] for row in rows]
+            if doc_ids:
+                doc_placeholders = ",".join("?" for _ in doc_ids)
+                conn.execute(
+                    "DELETE FROM local_search_fts "
+                    f"WHERE doc_id IN ({doc_placeholders})",
+                    doc_ids,
+                )
             conn.executemany(
                 "DELETE FROM documents WHERE path = ?",
                 [(path,) for path in normalized],
             )
-            return int(count)
+            return len(doc_ids)
 
     def db_size_bytes(self) -> int:
         if not self.db_path.exists():
@@ -373,8 +409,9 @@ class CatalogStore:
                 """
                 INSERT INTO ingest_jobs (
                     job_id, doc_id, path, profile, status, stage, force, message,
-                    result_json, error_json, created_at, updated_at, started_at, finished_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    progress_json, result_json, error_json, created_at, updated_at,
+                    started_at, finished_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     job.job_id,
@@ -385,6 +422,7 @@ class CatalogStore:
                     job.stage,
                     1 if job.force else 0,
                     job.message,
+                    json.dumps(job.progress),
                     json.dumps(job.result) if job.result is not None else None,
                     json.dumps(job.error) if job.error is not None else None,
                     job.created_at,
@@ -456,6 +494,7 @@ class CatalogStore:
         status: IngestJobStatus | None = None,
         stage: IngestStage | None = None,
         message: str | None = None,
+        progress: dict[str, Any] | None = None,
         result: dict[str, Any] | None = None,
         error: dict[str, Any] | None = None,
         started_at: str | None = None,
@@ -472,6 +511,9 @@ class CatalogStore:
         if message is not None:
             assignments.append("message = ?")
             values.append(message)
+        if progress is not None:
+            assignments.append("progress_json = ?")
+            values.append(json.dumps(progress))
         if result is not None:
             assignments.append("result_json = ?")
             values.append(json.dumps(result))
@@ -542,6 +584,10 @@ class CatalogStore:
     def replace_chunks(self, doc_id: str, chunks: list[ChunkRecord]) -> None:
         with self._conn() as conn:
             conn.execute("DELETE FROM chunks WHERE doc_id = ?", (doc_id,))
+            conn.execute(
+                "DELETE FROM local_search_fts WHERE doc_id = ? AND source_type = ?",
+                (doc_id, "chunk"),
+            )
             conn.executemany(
                 """
                 INSERT INTO chunks (
@@ -564,10 +610,34 @@ class CatalogStore:
                     for chunk in chunks
                 ],
             )
+            conn.executemany(
+                """
+                INSERT INTO local_search_fts (
+                    doc_id, source_type, source_id, chunk_id,
+                    section_path_json, order_index, text
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        chunk.doc_id,
+                        "chunk",
+                        chunk.chunk_id,
+                        chunk.chunk_id,
+                        json.dumps(chunk.section_path),
+                        str(chunk.order_index),
+                        self._chunk_search_text(chunk),
+                    )
+                    for chunk in chunks
+                ],
+            )
 
     def replace_formulas(self, doc_id: str, formulas: list[FormulaRecord]) -> None:
         with self._conn() as conn:
             conn.execute("DELETE FROM formulas WHERE doc_id = ?", (doc_id,))
+            conn.execute(
+                "DELETE FROM local_search_fts WHERE doc_id = ? AND source_type = ?",
+                (doc_id, "formula"),
+            )
             if not formulas:
                 return
             conn.executemany(
@@ -589,6 +659,26 @@ class CatalogStore:
                         formula.source,
                         formula.confidence,
                         formula.status,
+                    )
+                    for formula in formulas
+                ],
+            )
+            conn.executemany(
+                """
+                INSERT INTO local_search_fts (
+                    doc_id, source_type, source_id, chunk_id,
+                    section_path_json, order_index, text
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        formula.doc_id,
+                        "formula",
+                        formula.formula_id,
+                        formula.chunk_id,
+                        json.dumps(formula.section_path),
+                        str(formula.page or 0),
+                        self._formula_search_text(formula),
                     )
                     for formula in formulas
                 ],
@@ -634,6 +724,10 @@ class CatalogStore:
     def replace_pdf_tables(self, doc_id: str, tables: list[PdfTableRecord]) -> None:
         with self._conn() as conn:
             conn.execute("DELETE FROM pdf_tables WHERE doc_id = ?", (doc_id,))
+            conn.execute(
+                "DELETE FROM local_search_fts WHERE doc_id = ? AND source_type = ?",
+                (doc_id, "pdf_table"),
+            )
             if not tables:
                 return
             conn.executemany(
@@ -677,6 +771,26 @@ class CatalogStore:
                     for table in tables
                 ],
             )
+            conn.executemany(
+                """
+                INSERT INTO local_search_fts (
+                    doc_id, source_type, source_id, chunk_id,
+                    section_path_json, order_index, text
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        table.doc_id,
+                        "pdf_table",
+                        table.table_id,
+                        None,
+                        json.dumps(table.section_path),
+                        str(table.order_index),
+                        self._pdf_table_search_text(table),
+                    )
+                    for table in tables
+                ],
+            )
 
     def replace_pdf_figures(self, doc_id: str, figures: list[PdfFigureRecord]) -> None:
         with self._conn() as conn:
@@ -710,6 +824,128 @@ class CatalogStore:
                     for figure in figures
                 ],
             )
+
+    def search_local(
+        self,
+        *,
+        query: str,
+        doc_ids: list[str] | None = None,
+        top_k: int = 20,
+    ) -> list[dict[str, Any]]:
+        """Search local FTS evidence rows for exact terms and structured artifacts."""
+
+        if top_k <= 0:
+            return []
+        match_query = self._fts_match_query(query)
+        if match_query is None:
+            return []
+
+        doc_filter = ""
+        values: list[Any] = [match_query]
+        if doc_ids:
+            placeholders = ",".join("?" for _ in doc_ids)
+            doc_filter = f" AND local_search_fts.doc_id IN ({placeholders})"
+            values.extend(doc_ids)
+        values.append(top_k)
+
+        with self._conn() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT
+                    local_search_fts.doc_id,
+                    local_search_fts.source_type,
+                    local_search_fts.source_id,
+                    local_search_fts.chunk_id,
+                    local_search_fts.section_path_json,
+                    local_search_fts.order_index,
+                    snippet(local_search_fts, 6, '[', ']', '...', 24) AS snippet,
+                    bm25(local_search_fts) AS rank_score,
+                    chunks.locator_json AS locator_json
+                FROM local_search_fts
+                LEFT JOIN chunks
+                    ON chunks.doc_id = local_search_fts.doc_id
+                    AND chunks.chunk_id = local_search_fts.chunk_id
+                WHERE local_search_fts MATCH ?{doc_filter}
+                ORDER BY rank_score ASC
+                LIMIT ?
+                """,
+                values,
+            ).fetchall()
+
+        hits: list[dict[str, Any]] = []
+        for index, row in enumerate(rows, start=1):
+            section_path = json.loads(row["section_path_json"])
+            locator = (
+                json.loads(row["locator_json"])
+                if row["locator_json"]
+                else {
+                    "doc_id": row["doc_id"],
+                    "chunk_id": row["chunk_id"] or row["source_id"],
+                    "section_path": section_path,
+                    "method": "sqlite_fts",
+                }
+            )
+            source_type = row["source_type"]
+            hit = {
+                "doc_id": row["doc_id"],
+                "chunk_id": row["chunk_id"] or row["source_id"],
+                "source_type": source_type,
+                "source_id": row["source_id"],
+                "locator": locator,
+                "section_path": section_path,
+                "snippet": row["snippet"],
+                "local_rank": index,
+                "local_score": -float(row["rank_score"]),
+                "retrieval_source": "sqlite_fts",
+            }
+            if source_type == "formula":
+                hit["read_hint"] = (
+                    "Use pdf_book_read_formula or pdf_paper_read_formula with source_id."
+                )
+            elif source_type == "pdf_table":
+                hit["read_hint"] = "Use pdf_read_table with source_id."
+            hits.append(hit)
+        return hits
+
+    @classmethod
+    def _fts_match_query(cls, query: str) -> str | None:
+        tokens = [item.lower() for item in cls._FTS_TOKEN_RE.findall(query)]
+        unique_tokens = list(dict.fromkeys(token for token in tokens if token))
+        if not unique_tokens:
+            return None
+        return " OR ".join(f'"{token}"' for token in unique_tokens[:32])
+
+    @staticmethod
+    def _chunk_search_text(chunk: ChunkRecord) -> str:
+        return "\n".join(
+            [
+                " / ".join(chunk.section_path),
+                chunk.search_text,
+                chunk.text,
+            ]
+        )
+
+    @staticmethod
+    def _formula_search_text(formula: FormulaRecord) -> str:
+        return "\n".join(
+            [
+                " / ".join(formula.section_path),
+                formula.latex,
+                formula.source,
+                formula.status,
+            ]
+        )
+
+    @staticmethod
+    def _pdf_table_search_text(table: PdfTableRecord) -> str:
+        return "\n".join(
+            [
+                " / ".join(table.section_path),
+                table.caption or "",
+                " ".join(table.headers),
+                table.markdown,
+            ]
+        )
 
     def get_chunk(self, doc_id: str, chunk_id: str) -> ChunkRecord | None:
         with self._conn() as conn:
@@ -944,6 +1180,7 @@ class CatalogStore:
             stage=row["stage"],
             force=bool(row["force"]),
             message=row["message"],
+            progress=json.loads(row["progress_json"]) if row["progress_json"] else {},
             result=json.loads(row["result_json"]) if row["result_json"] else None,
             error=json.loads(row["error_json"]) if row["error_json"] else None,
             created_at=row["created_at"],

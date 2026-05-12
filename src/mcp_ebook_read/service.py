@@ -60,6 +60,14 @@ from mcp_ebook_read.store.catalog import CatalogStore
 
 logger = logging.getLogger(__name__)
 
+_PIPELINE_METADATA_KEY = "mcp_ebook_read_pipeline"
+_PIPELINE_SCHEMA_VERSION = 1
+_CHUNKER_VERSION = "chunker-v2-outline-aware"
+_SEARCH_TEXT_VERSION = "search-text-v2-fts5"
+_PDF_FORMULA_PIPELINE_VERSION = "docling-formula-enrichment-pix2text-v1"
+_PDF_VISUAL_PIPELINE_VERSION = "docling-visuals-on-demand-v1"
+_EPUB_IMAGE_PIPELINE_VERSION = "ebooklib-image-extraction-v1"
+
 
 class AppService:
     """Orchestrates scan, ingest, indexing and read/render operations."""
@@ -94,6 +102,20 @@ class AppService:
             daemon=True,
         )
         self._ingest_worker.start()
+
+    _INGEST_STAGE_TOTAL = 6
+    _INGEST_STAGE_DONE: dict[IngestStage, int] = {
+        IngestStage.QUEUED: 0,
+        IngestStage.GROBID: 1,
+        IngestStage.PARSE: 2,
+        IngestStage.PERSIST: 3,
+        IngestStage.INDEX: 4,
+        IngestStage.FINALIZE: 5,
+        IngestStage.CACHED: 6,
+        IngestStage.COMPLETED: 6,
+        IngestStage.FAILED: 6,
+        IngestStage.CANCELED: 6,
+    }
 
     def close(self) -> None:
         """Release process-scoped resources owned by the service."""
@@ -365,8 +387,8 @@ class AppService:
                         "GROBID_TIMEOUT_SECONDS": "120",
                     },
                     "quick_start": {
-                        "qdrant": "docker rm -f qdrant 2>/dev/null || true && docker run -d --name qdrant -p 6333:6333 -p 6334:6334 qdrant/qdrant:v1.16.3",
-                        "grobid": "docker rm -f grobid 2>/dev/null || true && docker run -d --name grobid -p 8070:8070 lfoppiano/grobid:0.8.0",
+                        "qdrant": "docker rm -f qdrant 2>/dev/null || true && docker run -d --name qdrant -p 6333:6333 -p 6334:6334 qdrant/qdrant:v1.18.0",
+                        "grobid": "docker rm -f grobid 2>/dev/null || true && docker run -d --name grobid --init --ulimit core=0 -p 8070:8070 grobid/grobid:0.9.0-full",
                     },
                     "setup_reference": "See README.md: One-Command Docker Setup and Run MCP Server",
                 },
@@ -595,7 +617,141 @@ class AppService:
             "images_count": len(catalog.list_images(doc.doc_id)),
             "outline_depth": max((node.level for node in doc.outline), default=0),
             "overall_confidence": doc.overall_confidence,
+            "pipeline_status": self._document_pipeline_status(doc),
         }
+
+    def _stable_digest(self, payload: dict[str, Any]) -> str:
+        encoded = json.dumps(
+            payload,
+            sort_keys=True,
+            ensure_ascii=False,
+            default=str,
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    def _model_payload(self, value: Any) -> Any:
+        if value is None:
+            return None
+        model_dump = getattr(value, "model_dump", None)
+        if callable(model_dump):
+            return model_dump(mode="json")
+        return value
+
+    def _pipeline_config_payload(self) -> dict[str, Any]:
+        return {
+            "pdf_parser": {
+                "class": type(self.pdf_parser).__name__,
+                "enable_docling_formula_enrichment": getattr(
+                    self.pdf_parser,
+                    "enable_docling_formula_enrichment",
+                    None,
+                ),
+                "require_formula_engine": getattr(
+                    self.pdf_parser,
+                    "require_formula_engine",
+                    None,
+                ),
+                "performance_config": self._model_payload(
+                    getattr(self.pdf_parser, "performance_config", None)
+                ),
+            },
+            "epub_parser": {"class": type(self.epub_parser).__name__},
+            "pdf_image_extractor": {
+                "class": type(self.pdf_image_extractor).__name__
+                if self.pdf_image_extractor is not None
+                else None,
+                "min_area_ratio": getattr(
+                    self.pdf_image_extractor,
+                    "min_area_ratio",
+                    None,
+                ),
+            },
+            "pdf_visual_extractor": {
+                "class": type(self.pdf_visual_extractor).__name__
+                if self.pdf_visual_extractor is not None
+                else None,
+                "performance_config": self._model_payload(
+                    getattr(self.pdf_visual_extractor, "performance_config", None)
+                ),
+            },
+        }
+
+    def _pipeline_metadata(
+        self, *, doc_type: DocumentType, profile: Profile
+    ) -> dict[str, Any]:
+        versions = {
+            "chunker": _CHUNKER_VERSION,
+            "search_text": _SEARCH_TEXT_VERSION,
+            "pdf_formula": _PDF_FORMULA_PIPELINE_VERSION
+            if doc_type == DocumentType.PDF
+            else None,
+            "pdf_visuals": _PDF_VISUAL_PIPELINE_VERSION
+            if doc_type == DocumentType.PDF
+            else None,
+            "epub_images": _EPUB_IMAGE_PIPELINE_VERSION
+            if doc_type == DocumentType.EPUB
+            else None,
+        }
+        config_digest = self._stable_digest(self._pipeline_config_payload())
+        payload = {
+            "schema_version": _PIPELINE_SCHEMA_VERSION,
+            "doc_type": doc_type.value,
+            "profile": profile.value,
+            "versions": versions,
+            "config_digest": config_digest,
+        }
+        return {
+            **payload,
+            "digest": self._stable_digest(payload),
+        }
+
+    def _document_pipeline_status(self, doc: DocumentRecord) -> dict[str, Any]:
+        current = self._pipeline_metadata(doc_type=doc.type, profile=doc.profile)
+        stored = doc.metadata.get(_PIPELINE_METADATA_KEY)
+        if doc.status != DocumentStatus.READY:
+            return {
+                "is_stale": False,
+                "reason": "document_not_ready",
+                "current_digest": current["digest"],
+                "stored_digest": stored.get("digest")
+                if isinstance(stored, dict)
+                else None,
+            }
+        if not isinstance(stored, dict):
+            return {
+                "is_stale": True,
+                "reason": "missing_pipeline_metadata",
+                "current_digest": current["digest"],
+                "stored_digest": None,
+                "current_versions": current["versions"],
+                "hint": self._reingest_hint(doc),
+            }
+        if stored.get("digest") != current["digest"]:
+            return {
+                "is_stale": True,
+                "reason": "pipeline_digest_mismatch",
+                "current_digest": current["digest"],
+                "stored_digest": stored.get("digest"),
+                "current_versions": current["versions"],
+                "stored_versions": stored.get("versions"),
+                "hint": self._reingest_hint(doc),
+            }
+        return {
+            "is_stale": False,
+            "reason": "current",
+            "current_digest": current["digest"],
+            "stored_digest": stored.get("digest"),
+            "current_versions": current["versions"],
+        }
+
+    def _reingest_hint(self, doc: DocumentRecord) -> str:
+        if doc.type == DocumentType.EPUB:
+            tool_name = "document_ingest_epub_book"
+        elif doc.profile == Profile.PAPER:
+            tool_name = "document_ingest_pdf_paper"
+        else:
+            tool_name = "document_ingest_pdf_book"
+        return f"Run {tool_name}(doc_id='{doc.doc_id}', force=true) to refresh persisted artifacts."
 
     def _serialize_ingest_job(self, job: IngestJobRecord) -> dict[str, Any]:
         return {
@@ -607,12 +763,61 @@ class AppService:
             "stage": job.stage,
             "force": job.force,
             "message": job.message,
+            "progress": self._serialize_ingest_progress(job),
             "result": job.result,
             "error": job.error,
             "created_at": job.created_at,
             "updated_at": job.updated_at,
             "started_at": job.started_at,
             "finished_at": job.finished_at,
+        }
+
+    def _serialize_ingest_progress(self, job: IngestJobRecord) -> dict[str, Any]:
+        progress = dict(job.progress or {})
+        started_at = self._parse_iso_datetime(job.started_at)
+        finished_at = self._parse_iso_datetime(job.finished_at)
+        if started_at is None:
+            return progress
+
+        end_at = finished_at or datetime.now(UTC)
+        elapsed_ms = max(0, int((end_at - started_at).total_seconds() * 1000))
+        progress["elapsed_ms"] = elapsed_ms
+
+        done = progress.get("done")
+        total = progress.get("total")
+        if (
+            job.status == IngestJobStatus.RUNNING
+            and isinstance(done, int)
+            and isinstance(total, int)
+            and 0 < done < total
+        ):
+            progress["eta_ms"] = int(elapsed_ms / done * (total - done))
+        return progress
+
+    def _parse_iso_datetime(self, value: str | None) -> datetime | None:
+        if not value:
+            return None
+        try:
+            return datetime.fromisoformat(value)
+        except ValueError:
+            return None
+
+    def _ingest_progress(
+        self,
+        *,
+        stage: IngestStage,
+        message: str | None,
+        diagnostics: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        total = self._INGEST_STAGE_TOTAL
+        done = self._INGEST_STAGE_DONE[stage]
+        return {
+            "stage": stage.value,
+            "done": done,
+            "total": total,
+            "pct": round(done / total * 100, 1),
+            "current_item": message,
+            "diagnostics": diagnostics or {},
         }
 
     def _ingest_job_payload(
@@ -630,6 +835,602 @@ class AppService:
         )
         return payload
 
+    def _reading_capture_enabled(self) -> bool:
+        return os.environ.get(
+            "MCP_EBOOK_CAPTURE_READING_SESSION", ""
+        ).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+
+    def _reading_capture_include_query(self) -> bool:
+        return os.environ.get(
+            "MCP_EBOOK_CAPTURE_INCLUDE_QUERY", ""
+        ).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+
+    def _reading_session_log_path(self, catalog: CatalogStore) -> Path:
+        return catalog.db_path.parent / "eval" / "reading-session.jsonl"
+
+    def _infer_capture_doc_id(
+        self,
+        *,
+        kwargs: dict[str, Any],
+        result: dict[str, Any],
+    ) -> str | None:
+        doc_id = kwargs.get("doc_id")
+        if isinstance(doc_id, str) and doc_id:
+            return doc_id
+
+        locator = kwargs.get("locator")
+        if isinstance(locator, dict):
+            locator_doc_id = locator.get("doc_id")
+            if isinstance(locator_doc_id, str) and locator_doc_id:
+                return locator_doc_id
+
+        doc_ids = kwargs.get("doc_ids")
+        if isinstance(doc_ids, list) and doc_ids:
+            first_doc_id = doc_ids[0]
+            if isinstance(first_doc_id, str) and first_doc_id:
+                return first_doc_id
+
+        for hit in result.get("hits") or []:
+            hit_doc_id = hit.get("doc_id")
+            if isinstance(hit_doc_id, str) and hit_doc_id:
+                return hit_doc_id
+        return None
+
+    def _capture_input_payload(self, kwargs: dict[str, Any]) -> dict[str, Any]:
+        payload: dict[str, Any] = {}
+        for key in (
+            "doc_id",
+            "doc_ids",
+            "node_id",
+            "top_k",
+            "limit",
+            "image_id",
+            "table_id",
+            "figure_id",
+            "formula_id",
+            "format",
+            "max_chunks",
+        ):
+            if key in kwargs:
+                payload[key] = kwargs[key]
+
+        query = kwargs.get("query")
+        if isinstance(query, str):
+            payload["query_sha256"] = hashlib.sha256(query.encode("utf-8")).hexdigest()
+            if self._reading_capture_include_query():
+                payload["query"] = query
+
+        locator = kwargs.get("locator")
+        if isinstance(locator, dict):
+            payload["locator"] = {
+                key: locator.get(key)
+                for key in (
+                    "doc_id",
+                    "chunk_id",
+                    "section_path",
+                    "page_range",
+                    "method",
+                )
+                if key in locator
+            }
+        return payload
+
+    def _returned_ids(self, result: Any) -> dict[str, list[str]]:
+        buckets = {
+            "chunk_ids": set(),
+            "formula_ids": set(),
+            "image_ids": set(),
+            "table_ids": set(),
+            "figure_ids": set(),
+        }
+        key_to_bucket = {
+            "chunk_id": "chunk_ids",
+            "formula_id": "formula_ids",
+            "image_id": "image_ids",
+            "table_id": "table_ids",
+            "figure_id": "figure_ids",
+        }
+
+        def visit(value: Any) -> None:
+            if isinstance(value, dict):
+                for key, item in value.items():
+                    bucket = key_to_bucket.get(key)
+                    if bucket and isinstance(item, str):
+                        buckets[bucket].add(item)
+                    visit(item)
+            elif isinstance(value, list):
+                for item in value:
+                    visit(item)
+
+        visit(result)
+        return {key: sorted(values) for key, values in buckets.items()}
+
+    def capture_tool_call(
+        self,
+        *,
+        tool_name: str,
+        use_case: str,
+        kwargs: dict[str, Any],
+        result: dict[str, Any],
+        latency_ms: int,
+    ) -> dict[str, Any]:
+        if not self._reading_capture_enabled() or use_case not in {
+            "search",
+            "read",
+            "image",
+            "table",
+            "figure",
+            "formula",
+            "outline",
+            "render",
+        }:
+            return result
+
+        output = dict(result)
+        try:
+            doc_id = self._infer_capture_doc_id(kwargs=kwargs, result=result)
+            if doc_id is None:
+                output["eval_capture"] = {
+                    "enabled": True,
+                    "captured": False,
+                    "reason": "doc_id_not_found",
+                }
+                return output
+
+            doc, catalog = self._require_doc(
+                doc_id,
+                error_code=ErrorCode.INGEST_DOC_NOT_FOUND,
+                message="Document not found for reading-session capture.",
+            )
+            event_id = uuid4().hex
+            event = {
+                "event_id": event_id,
+                "ts": self._now_iso(),
+                "tool_name": tool_name,
+                "doc_id": doc.doc_id,
+                "input": self._capture_input_payload(kwargs),
+                "returned_ids": self._returned_ids(result),
+                "latency_ms": latency_ms,
+                "parser_chain": doc.parser_chain,
+                "pipeline_status": self._document_pipeline_status(doc),
+            }
+            log_path = self._reading_session_log_path(catalog)
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            with log_path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
+            output["eval_capture"] = {
+                "enabled": True,
+                "captured": True,
+                "event_id": event_id,
+            }
+            return output
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("reading_session_capture_failed")
+            output["eval_capture"] = {
+                "enabled": True,
+                "captured": False,
+                "reason": "capture_failed",
+                "error": str(exc),
+            }
+            return output
+
+    def _read_reading_session_events(
+        self, root: str, limit: int
+    ) -> list[dict[str, Any]]:
+        if limit <= 0:
+            return []
+        root_path = Path(root).expanduser().resolve()
+        self._discover_sidecar_catalogs(str(root_path))
+        events: list[dict[str, Any]] = []
+        for catalog in self._catalogs.values():
+            try:
+                catalog.db_path.resolve().relative_to(root_path)
+            except ValueError:
+                continue
+            log_path = self._reading_session_log_path(catalog)
+            if not log_path.exists():
+                continue
+            for line in log_path.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                events.append(json.loads(line))
+        events.sort(key=lambda event: event.get("ts") or "")
+        return events[-limit:]
+
+    def eval_export_reading_sessions(
+        self,
+        *,
+        root: str,
+        limit: int = 500,
+    ) -> dict[str, Any]:
+        events = self._read_reading_session_events(root, limit)
+        return {
+            "root": str(Path(root).expanduser().resolve()),
+            "capture_enabled": self._reading_capture_enabled(),
+            "query_capture_enabled": self._reading_capture_include_query(),
+            "events_count": len(events),
+            "events": events,
+            "privacy": {
+                "file_paths": "scrubbed",
+                "queries": "captured only when MCP_EBOOK_CAPTURE_INCLUDE_QUERY=1",
+            },
+        }
+
+    def eval_replay_reading_sessions(
+        self,
+        *,
+        root: str,
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        events = self._read_reading_session_events(root, limit)
+        replayed: list[dict[str, Any]] = []
+        skipped: list[dict[str, Any]] = []
+        for event in events:
+            tool_name = event.get("tool_name")
+            event_input = event.get("input") or {}
+            query = event_input.get("query")
+            if tool_name not in {"search", "search_in_outline_node"} or not query:
+                skipped.append(
+                    {
+                        "event_id": event.get("event_id"),
+                        "tool_name": tool_name,
+                        "reason": "not_replayable_without_captured_query",
+                    }
+                )
+                continue
+
+            if tool_name == "search":
+                current = self.search(
+                    query=query,
+                    doc_ids=event_input.get("doc_ids"),
+                    top_k=int(event_input.get("top_k") or 20),
+                )
+            else:
+                current = self.search_in_outline_node(
+                    doc_id=event_input["doc_id"],
+                    node_id=event_input["node_id"],
+                    query=query,
+                    top_k=int(event_input.get("top_k") or 20),
+                )
+            current_ids = self._returned_ids(current)
+            original_ids = event.get("returned_ids") or {}
+            replayed.append(
+                {
+                    "event_id": event.get("event_id"),
+                    "tool_name": tool_name,
+                    "drifted": current_ids != original_ids,
+                    "original_ids": original_ids,
+                    "current_ids": current_ids,
+                }
+            )
+
+        return {
+            "root": str(Path(root).expanduser().resolve()),
+            "events_count": len(events),
+            "replayed_count": len(replayed),
+            "skipped_count": len(skipped),
+            "drifted_count": sum(1 for item in replayed if item["drifted"]),
+            "replayed": replayed,
+            "skipped": skipped,
+        }
+
+    def _doctor_component(
+        self,
+        *,
+        name: str,
+        status: str,
+        details: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return {
+            "name": name,
+            "status": status,
+            "details": details or {},
+        }
+
+    def _qdrant_doc_point_count(self, doc_id: str) -> tuple[int | None, str | None]:
+        client = getattr(self.vector_index, "client", None)
+        collection = getattr(self.vector_index, "collection", None)
+        if client is None or collection is None:
+            return None, "qdrant_client_not_available"
+        try:
+            from qdrant_client.http import models as qdrant_models
+
+            response = client.count(
+                collection_name=collection,
+                count_filter=qdrant_models.Filter(
+                    must=[
+                        qdrant_models.FieldCondition(
+                            key="doc_id",
+                            match=qdrant_models.MatchValue(value=doc_id),
+                        )
+                    ]
+                ),
+                exact=True,
+            )
+            return int(response.count), None
+        except Exception as exc:  # noqa: BLE001
+            return None, str(exc)
+
+    def _artifact_findings_for_doc(
+        self,
+        *,
+        catalog: CatalogStore,
+        doc: DocumentRecord,
+    ) -> list[dict[str, Any]]:
+        findings: list[dict[str, Any]] = []
+        for image in catalog.list_images(doc.doc_id):
+            if not Path(image.file_path).exists():
+                findings.append(
+                    {
+                        "severity": "warning",
+                        "code": "MISSING_IMAGE_ARTIFACT",
+                        "doc_id": doc.doc_id,
+                        "image_id": image.image_id,
+                        "path": image.file_path,
+                        "hint": self._reingest_hint(doc),
+                    }
+                )
+        for table in catalog.list_pdf_tables(doc.doc_id):
+            if not Path(table.file_path).exists():
+                findings.append(
+                    {
+                        "severity": "warning",
+                        "code": "MISSING_TABLE_ARTIFACT",
+                        "doc_id": doc.doc_id,
+                        "table_id": table.table_id,
+                        "path": table.file_path,
+                        "hint": "Call pdf_list_tables or reingest the document to regenerate table evidence.",
+                    }
+                )
+            for segment in table.segments:
+                if not Path(segment.file_path).exists():
+                    findings.append(
+                        {
+                            "severity": "warning",
+                            "code": "MISSING_TABLE_SEGMENT_ARTIFACT",
+                            "doc_id": doc.doc_id,
+                            "table_id": table.table_id,
+                            "path": segment.file_path,
+                            "hint": "Call pdf_list_tables or reingest the document to regenerate table evidence.",
+                        }
+                    )
+        for figure in catalog.list_pdf_figures(doc.doc_id):
+            if not Path(figure.file_path).exists():
+                findings.append(
+                    {
+                        "severity": "warning",
+                        "code": "MISSING_FIGURE_ARTIFACT",
+                        "doc_id": doc.doc_id,
+                        "figure_id": figure.figure_id,
+                        "path": figure.file_path,
+                        "hint": "Call pdf_list_figures or reingest the document to regenerate figure evidence.",
+                    }
+                )
+        for formula in catalog.list_formulas(doc.doc_id):
+            if (
+                formula.chunk_id
+                and catalog.get_chunk(doc.doc_id, formula.chunk_id) is None
+            ):
+                findings.append(
+                    {
+                        "severity": "warning",
+                        "code": "FORMULA_CHUNK_MISSING",
+                        "doc_id": doc.doc_id,
+                        "formula_id": formula.formula_id,
+                        "chunk_id": formula.chunk_id,
+                        "hint": self._reingest_hint(doc),
+                    }
+                )
+        return findings
+
+    def doctor_health_check(
+        self,
+        *,
+        root: str | None = None,
+    ) -> dict[str, Any]:
+        components: list[dict[str, Any]] = []
+        findings: list[dict[str, Any]] = []
+
+        vector_assert_ready = getattr(self.vector_index, "assert_ready", None)
+        if callable(vector_assert_ready):
+            try:
+                vector_assert_ready()
+                components.append(
+                    self._doctor_component(
+                        name="qdrant",
+                        status="ok",
+                        details={
+                            "url": getattr(self.vector_index, "url", None),
+                            "collection": getattr(
+                                self.vector_index, "collection", None
+                            ),
+                        },
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001
+                components.append(
+                    self._doctor_component(
+                        name="qdrant",
+                        status="error",
+                        details=to_error_payload(exc),
+                    )
+                )
+        else:
+            components.append(
+                self._doctor_component(
+                    name="qdrant",
+                    status="unknown",
+                    details={"reason": "vector_index_assert_ready_not_available"},
+                )
+            )
+
+        try:
+            self.grobid_client.assert_available()
+            components.append(
+                self._doctor_component(
+                    name="grobid",
+                    status="ok",
+                    details={"base_url": self.grobid_client.base_url},
+                )
+            )
+        except Exception as exc:  # noqa: BLE001
+            components.append(
+                self._doctor_component(
+                    name="grobid",
+                    status="error",
+                    details=to_error_payload(exc),
+                )
+            )
+
+        cache_dir = getattr(self.vector_index, "fastembed_cache_dir", None)
+        components.append(
+            self._doctor_component(
+                name="fastembed_cache",
+                status="ok"
+                if isinstance(cache_dir, Path) and cache_dir.exists()
+                else "warning",
+                details={"path": str(cache_dir) if cache_dir is not None else None},
+            )
+        )
+        components.append(
+            self._doctor_component(
+                name="parsers",
+                status="ok",
+                details={
+                    "pdf_parser": type(self.pdf_parser).__name__,
+                    "epub_parser": type(self.epub_parser).__name__,
+                    "pdf_image_extractor": type(self.pdf_image_extractor).__name__
+                    if self.pdf_image_extractor is not None
+                    else None,
+                    "pdf_visual_extractor": type(self.pdf_visual_extractor).__name__
+                    if self.pdf_visual_extractor is not None
+                    else None,
+                },
+            )
+        )
+
+        catalog_reports: list[dict[str, Any]] = []
+        if root is not None:
+            root_path = Path(root).expanduser().resolve()
+            catalogs = self._discover_sidecar_catalogs(str(root_path))
+            for catalog in catalogs:
+                docs = catalog.list_documents()
+                known_doc_ids = {doc.doc_id for doc in docs}
+                report = {
+                    "catalog_path": str(catalog.db_path),
+                    "documents_count": len(docs),
+                    "db_size_bytes": catalog.db_size_bytes(),
+                    "documents": [],
+                }
+                for doc in docs:
+                    chunks_count = len(catalog.list_chunks(doc.doc_id))
+                    pipeline_status = self._document_pipeline_status(doc)
+                    vector_count, vector_error = self._qdrant_doc_point_count(
+                        doc.doc_id
+                    )
+                    doc_report = {
+                        "doc_id": doc.doc_id,
+                        "type": doc.type,
+                        "profile": doc.profile,
+                        "status": doc.status,
+                        "chunks_count": chunks_count,
+                        "path_exists": Path(doc.path).exists(),
+                        "pipeline_status": pipeline_status,
+                        "vector_points_count": vector_count,
+                        "vector_count_error": vector_error,
+                    }
+                    artifact_findings = self._artifact_findings_for_doc(
+                        catalog=catalog,
+                        doc=doc,
+                    )
+                    doc_report["artifact_findings_count"] = len(artifact_findings)
+                    findings.extend(artifact_findings)
+                    report["documents"].append(doc_report)
+                    if doc.status == DocumentStatus.READY and chunks_count == 0:
+                        findings.append(
+                            {
+                                "severity": "warning",
+                                "code": "READY_DOCUMENT_HAS_NO_CHUNKS",
+                                "doc_id": doc.doc_id,
+                                "hint": self._reingest_hint(doc),
+                            }
+                        )
+                    if not doc_report["path_exists"]:
+                        findings.append(
+                            {
+                                "severity": "warning",
+                                "code": "SOURCE_PATH_MISSING",
+                                "doc_id": doc.doc_id,
+                                "hint": "Run storage_cleanup_sidecars(root=...) to prune missing documents.",
+                            }
+                        )
+                    if pipeline_status["is_stale"]:
+                        findings.append(
+                            {
+                                "severity": "warning",
+                                "code": "DOCUMENT_PIPELINE_STALE",
+                                "doc_id": doc.doc_id,
+                                "hint": pipeline_status.get("hint"),
+                            }
+                        )
+                    if vector_count is not None and vector_count != chunks_count:
+                        findings.append(
+                            {
+                                "severity": "warning",
+                                "code": "VECTOR_CHUNK_COUNT_MISMATCH",
+                                "doc_id": doc.doc_id,
+                                "chunks_count": chunks_count,
+                                "vector_points_count": vector_count,
+                                "hint": self._reingest_hint(doc),
+                            }
+                        )
+                docs_dir = catalog.db_path.parent / "docs"
+                if docs_dir.exists():
+                    for child in docs_dir.iterdir():
+                        if child.is_dir() and child.name not in known_doc_ids:
+                            findings.append(
+                                {
+                                    "severity": "warning",
+                                    "code": "ORPHAN_DOC_ARTIFACT_DIR",
+                                    "catalog_path": str(catalog.db_path),
+                                    "doc_dir": str(child),
+                                    "hint": "Run storage_cleanup_sidecars(root=..., remove_orphan_artifacts=true).",
+                                }
+                            )
+                catalog_reports.append(report)
+        components.append(
+            self._doctor_component(
+                name="sidecar_catalogs",
+                status="ok",
+                details={
+                    "root": str(Path(root).expanduser().resolve()) if root else None,
+                    "catalogs_count": len(catalog_reports),
+                    "catalogs": catalog_reports,
+                },
+            )
+        )
+
+        error_count = sum(1 for item in components if item["status"] == "error")
+        warning_count = sum(1 for item in components if item["status"] == "warning")
+        warning_count += sum(1 for item in findings if item["severity"] == "warning")
+        return {
+            "ok": error_count == 0,
+            "error_count": error_count,
+            "warning_count": warning_count,
+            "components": components,
+            "findings": findings,
+        }
+
     def _set_job_stage(
         self,
         *,
@@ -638,16 +1439,20 @@ class AppService:
         status: IngestJobStatus | None = None,
         stage: IngestStage | None = None,
         message: str | None = None,
+        progress: dict[str, Any] | None = None,
         result: dict[str, Any] | None = None,
         error: dict[str, Any] | None = None,
         started_at: str | None = None,
         finished_at: str | None = None,
     ) -> None:
+        if progress is None and stage is not None:
+            progress = self._ingest_progress(stage=stage, message=message)
         catalog.update_ingest_job(
             job_id,
             status=status,
             stage=stage,
             message=message,
+            progress=progress,
             result=result,
             error=error,
             started_at=started_at,
@@ -678,8 +1483,14 @@ class AppService:
         if active is not None and active.profile == profile:
             return self._ingest_job_payload(active, deduplicated=True)
 
-        if doc.status == DocumentStatus.READY and not force and doc.profile == profile:
+        if (
+            doc.status == DocumentStatus.READY
+            and not force
+            and doc.profile == profile
+            and not self._document_pipeline_status(doc)["is_stale"]
+        ):
             now = self._now_iso()
+            message = "Cached READY document reused; no ingest work was scheduled."
             job = IngestJobRecord(
                 job_id=uuid4().hex,
                 doc_id=doc.doc_id,
@@ -688,7 +1499,11 @@ class AppService:
                 status=IngestJobStatus.SUCCEEDED,
                 stage=IngestStage.CACHED,
                 force=force,
-                message="Cached READY document reused; no ingest work was scheduled.",
+                message=message,
+                progress=self._ingest_progress(
+                    stage=IngestStage.CACHED,
+                    message=message,
+                ),
                 result=self._ingest_result_from_doc(doc, catalog),
                 created_at=now,
                 updated_at=now,
@@ -699,6 +1514,7 @@ class AppService:
             return self._ingest_job_payload(job, cached=True)
 
         now = self._now_iso()
+        message = f"{ingest_mode} queued for background execution."
         job = IngestJobRecord(
             job_id=uuid4().hex,
             doc_id=doc.doc_id,
@@ -707,7 +1523,11 @@ class AppService:
             status=IngestJobStatus.QUEUED,
             stage=IngestStage.QUEUED,
             force=force,
-            message=f"{ingest_mode} queued for background execution.",
+            message=message,
+            progress=self._ingest_progress(
+                stage=IngestStage.QUEUED,
+                message=message,
+            ),
             created_at=now,
             updated_at=now,
         )
@@ -809,6 +1629,11 @@ class AppService:
                 status=IngestJobStatus.FAILED,
                 stage=IngestStage.FAILED,
                 message=str(exc),
+                progress=self._ingest_progress(
+                    stage=IngestStage.FAILED,
+                    message=str(exc),
+                    diagnostics={"error_code": error.get("code")},
+                ),
                 error=error,
                 finished_at=self._now_iso(),
             )
@@ -824,6 +1649,15 @@ class AppService:
             status=IngestJobStatus.SUCCEEDED,
             stage=IngestStage.COMPLETED,
             message="Background ingest job completed successfully.",
+            progress=self._ingest_progress(
+                stage=IngestStage.COMPLETED,
+                message="Background ingest job completed successfully.",
+                diagnostics={
+                    "chunks_count": result.get("chunks_count"),
+                    "formulas_count": result.get("formulas_count"),
+                    "images_count": result.get("images_count"),
+                },
+            ),
             result=result,
             finished_at=self._now_iso(),
         )
@@ -997,7 +1831,12 @@ class AppService:
         force: bool,
         stage_callback: Callable[[IngestStage, str], None] | None = None,
     ) -> dict[str, Any]:
-        if doc.status == DocumentStatus.READY and not force and doc.profile == profile:
+        if (
+            doc.status == DocumentStatus.READY
+            and not force
+            and doc.profile == profile
+            and not self._document_pipeline_status(doc)["is_stale"]
+        ):
             return {
                 "doc_id": doc.doc_id,
                 "profile": doc.profile,
@@ -1009,6 +1848,7 @@ class AppService:
                 "images_count": len(catalog.list_images(doc.doc_id)),
                 "outline_depth": max((node.level for node in doc.outline), default=0),
                 "overall_confidence": doc.overall_confidence,
+                "pipeline_status": self._document_pipeline_status(doc),
             }
 
         self._bind_doc_catalog(doc.doc_id, catalog)
@@ -1111,6 +1951,13 @@ class AppService:
                 catalog.replace_pdf_tables(doc.doc_id, [])
                 catalog.replace_pdf_figures(doc.doc_id, [])
             catalog.replace_images(doc.doc_id, image_records)
+            parsed.metadata = {
+                **parsed.metadata,
+                _PIPELINE_METADATA_KEY: self._pipeline_metadata(
+                    doc_type=doc.type,
+                    profile=profile,
+                ),
+            }
             if stage_callback is not None:
                 stage_callback(
                     IngestStage.INDEX,
@@ -1142,6 +1989,22 @@ class AppService:
                     (node.level for node in parsed.outline), default=0
                 ),
                 "overall_confidence": parsed.overall_confidence,
+                "pipeline_status": self._document_pipeline_status(
+                    DocumentRecord(
+                        doc_id=doc.doc_id,
+                        path=doc.path,
+                        type=doc.type,
+                        sha256=doc.sha256,
+                        mtime=doc.mtime,
+                        title=parsed.title,
+                        status=DocumentStatus.READY,
+                        profile=profile,
+                        parser_chain=parsed.parser_chain,
+                        metadata=parsed.metadata,
+                        outline=parsed.outline,
+                        overall_confidence=parsed.overall_confidence,
+                    )
+                ),
             }
         except Exception:
             catalog.set_document_status(
@@ -1214,6 +2077,7 @@ class AppService:
         payload = self._serialize_ingest_job(job)
         payload["document_status"] = doc.status
         payload["document_profile"] = doc.profile
+        payload["pipeline_status"] = self._document_pipeline_status(doc)
         if job.status == IngestJobStatus.SUCCEEDED and job.result is None:
             payload["result"] = self._ingest_result_from_doc(doc, catalog)
         return payload
@@ -1371,11 +2235,101 @@ class AppService:
             )
         return "\n\n".join(item.text for item in chunks)
 
+    def _catalogs_for_search(self, doc_ids: list[str] | None) -> list[CatalogStore]:
+        if not doc_ids:
+            return list(dict.fromkeys(self._catalogs.values()))
+
+        catalogs: dict[str, CatalogStore] = {}
+        for doc_id in doc_ids:
+            _, catalog = self._require_doc(
+                doc_id,
+                error_code=ErrorCode.INGEST_DOC_NOT_FOUND,
+                message="Document not found for search.",
+            )
+            catalogs[self._catalog_key(catalog)] = catalog
+        return list(catalogs.values())
+
+    def _local_search(
+        self, query: str, doc_ids: list[str] | None, top_k: int
+    ) -> list[dict[str, Any]]:
+        hits: list[dict[str, Any]] = []
+        for catalog in self._catalogs_for_search(doc_ids):
+            hits.extend(catalog.search_local(query=query, doc_ids=doc_ids, top_k=top_k))
+        hits.sort(key=lambda item: item.get("local_score", 0), reverse=True)
+        return hits[:top_k]
+
+    def _search_hybrid(
+        self, query: str, doc_ids: list[str] | None, top_k: int
+    ) -> dict[str, Any]:
+        vector_hits = self.vector_index.search(
+            query=query, top_k=top_k, doc_ids=doc_ids
+        )
+        local_hits = self._local_search(query=query, doc_ids=doc_ids, top_k=top_k)
+        hits = self._fuse_search_hits(vector_hits=vector_hits, local_hits=local_hits)
+        return {
+            "hits": hits[:top_k],
+            "retrieval": {
+                "mode": "hybrid_rrf",
+                "vector_backend": "qdrant",
+                "local_backend": "sqlite_fts5",
+                "vector_hits_count": len(vector_hits),
+                "local_hits_count": len(local_hits),
+            },
+        }
+
+    def _fuse_search_hits(
+        self,
+        *,
+        vector_hits: list[dict[str, Any]],
+        local_hits: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        rrf_k = 60
+        fused: dict[tuple[str, str, str], dict[str, Any]] = {}
+
+        def hit_key(hit: dict[str, Any]) -> tuple[str, str, str]:
+            source_type = hit.get("source_type") or "chunk"
+            source_id = hit.get("source_id") or hit.get("chunk_id") or ""
+            return (str(hit.get("doc_id") or ""), str(source_type), str(source_id))
+
+        def add_hit(hit: dict[str, Any], source: str, rank: int) -> None:
+            key = hit_key(hit)
+            if key not in fused:
+                fused[key] = dict(hit)
+                fused[key]["_rrf_score"] = 0.0
+                fused[key]["_retrieval_sources"] = []
+            else:
+                for field in (
+                    "locator",
+                    "source_type",
+                    "source_id",
+                    "section_path",
+                    "snippet",
+                    "read_hint",
+                ):
+                    if field not in fused[key] and field in hit:
+                        fused[key][field] = hit[field]
+            fused[key]["_rrf_score"] += 1 / (rrf_k + rank)
+            fused[key]["_retrieval_sources"].append({"source": source, "rank": rank})
+
+        for rank, hit in enumerate(vector_hits, start=1):
+            add_hit(hit, "qdrant", rank)
+        for rank, hit in enumerate(local_hits, start=1):
+            add_hit(hit, "sqlite_fts5", rank)
+
+        results = sorted(
+            fused.values(),
+            key=lambda item: item["_rrf_score"],
+            reverse=True,
+        )
+        for item in results:
+            item["hybrid_score"] = item.pop("_rrf_score")
+            item["retrieval_sources"] = item.pop("_retrieval_sources")
+        return results
+
     def search(
         self, query: str, doc_ids: list[str] | None, top_k: int
     ) -> dict[str, Any]:
-        hits = self.vector_index.search(query=query, top_k=top_k, doc_ids=doc_ids)
-        return {"hits": hits}
+        return self._search_hybrid(query=query, doc_ids=doc_ids, top_k=top_k)
 
     def search_in_outline_node(
         self,
@@ -1387,11 +2341,13 @@ class AppService:
     ) -> dict[str, Any]:
         _, node, node_path, _ = self._resolve_outline_node(doc_id, node_id)
         expanded_top_k = max(top_k * 5, top_k)
-        raw_hits = self.vector_index.search(
-            query=query, top_k=expanded_top_k, doc_ids=[doc_id]
+        search_result = self._search_hybrid(
+            query=query,
+            doc_ids=[doc_id],
+            top_k=expanded_top_k,
         )
         filtered_hits: list[dict[str, Any]] = []
-        for hit in raw_hits:
+        for hit in search_result["hits"]:
             locator = hit.get("locator") or {}
             if self._matches_outline_node(
                 page_range=locator.get("page_range"),
@@ -1407,6 +2363,7 @@ class AppService:
         return {
             "node": node.model_dump(),
             "hits": filtered_hits[:top_k],
+            "retrieval": search_result["retrieval"],
         }
 
     def read(
@@ -1546,7 +2503,47 @@ class AppService:
             "status": formula.status,
         }
 
-    def _image_payload(self, image: ImageRecord) -> dict[str, Any]:
+    def _image_semantic_enrichment(
+        self,
+        image: ImageRecord,
+        *,
+        context_text: str | None = None,
+    ) -> dict[str, Any]:
+        signals = {
+            "section_path": image.section_path,
+            "alt": image.alt,
+            "caption": image.caption,
+            "anchor": image.anchor,
+            "href": image.href,
+            "context_excerpt": context_text[:500] if context_text else None,
+        }
+        summary_parts = [
+            part
+            for part in (
+                image.caption,
+                image.alt,
+                " / ".join(image.section_path),
+                context_text[:160] if context_text else None,
+            )
+            if part
+        ]
+        return {
+            "summary": " | ".join(summary_parts) if summary_parts else None,
+            "signals": signals,
+            "diagnostics": {
+                "mode": "metadata_and_nearby_text_only",
+                "ocr_performed": False,
+                "visual_embedding_performed": False,
+                "original_image_untouched": True,
+            },
+        }
+
+    def _image_payload(
+        self,
+        image: ImageRecord,
+        *,
+        context_text: str | None = None,
+    ) -> dict[str, Any]:
         return {
             "image_id": image.image_id,
             "section_path": image.section_path,
@@ -1561,6 +2558,10 @@ class AppService:
             "image_path": image.file_path,
             "width": image.width,
             "height": image.height,
+            "semantic": self._image_semantic_enrichment(
+                image,
+                context_text=context_text,
+            ),
         }
 
     def _table_payload(
@@ -1991,7 +2992,10 @@ class AppService:
 
         return {
             "doc_title": doc.title,
-            "image": self._image_payload(image),
+            "image": self._image_payload(
+                image,
+                context_text=matched_chunk.text if matched_chunk else None,
+            ),
             "context": {
                 "text": matched_chunk.text,
                 "locator": matched_chunk.locator.model_dump(),
@@ -2097,7 +3101,10 @@ class AppService:
 
         return {
             "doc_title": doc.title,
-            "image": self._image_payload(image),
+            "image": self._image_payload(
+                image,
+                context_text=matched_chunk.text if matched_chunk else None,
+            ),
             "context": {
                 "text": matched_chunk.text,
                 "locator": matched_chunk.locator.model_dump(),
@@ -2666,6 +3673,7 @@ class AppService:
         return {
             "title": doc.title,
             "nodes": [node.model_dump() for node in doc.outline],
+            "pipeline_status": self._document_pipeline_status(doc),
         }
 
     def render_pdf_page(self, doc_id: str, page: int, dpi: int) -> dict[str, Any]:

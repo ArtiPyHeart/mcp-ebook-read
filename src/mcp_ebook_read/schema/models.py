@@ -246,6 +246,7 @@ class IngestJobRecord(BaseModel):
     stage: IngestStage
     force: bool = False
     message: str | None = None
+    progress: dict[str, Any] = Field(default_factory=dict)
     result: dict[str, Any] | None = None
     error: dict[str, Any] | None = None
     created_at: str
