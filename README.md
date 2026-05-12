@@ -13,7 +13,7 @@ docker rm -f qdrant 2>/dev/null || true && docker run -d --name qdrant -p 6333:6
 ### GROBID (required by startup preflight and `document_ingest_pdf_paper`)
 
 ```bash
-docker rm -f grobid 2>/dev/null || true && docker run -d --name grobid --init --ulimit core=0 -p 8070:8070 grobid/grobid:0.9.0-full
+docker rm -f grobid 2>/dev/null || true && docker run -d --name grobid --init --ulimit core=0 -p 8070:8070 grobid/grobid:0.9.0-crf
 ```
 
 ## Verify Services

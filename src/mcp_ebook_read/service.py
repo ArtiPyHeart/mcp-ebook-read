@@ -388,7 +388,7 @@ class AppService:
                     },
                     "quick_start": {
                         "qdrant": "docker rm -f qdrant 2>/dev/null || true && docker run -d --name qdrant -p 6333:6333 -p 6334:6334 qdrant/qdrant:v1.18.0",
-                        "grobid": "docker rm -f grobid 2>/dev/null || true && docker run -d --name grobid --init --ulimit core=0 -p 8070:8070 grobid/grobid:0.9.0-full",
+                        "grobid": "docker rm -f grobid 2>/dev/null || true && docker run -d --name grobid --init --ulimit core=0 -p 8070:8070 grobid/grobid:0.9.0-crf",
                     },
                     "setup_reference": "See README.md: One-Command Docker Setup and Run MCP Server",
                 },
