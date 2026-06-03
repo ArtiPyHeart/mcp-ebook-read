@@ -37,6 +37,19 @@ _CODE_LIKE_TOKENS = ("def ", "class ", "return ", "import ", "while ", "for ")
 _FORMULA_SOURCE = "pix2text"
 _UNRESOLVED_FORMULA = "[Formula unresolved. Use render_pdf_page for verification.]"
 _TABLEFORMER_LOGGER_NAME = "mcp_ebook_read.docling.tableformer"
+_DOCLING_PARSE_ATTEMPTS = 2
+_DOCLING_TRANSIENT_ERROR_TOKENS = (
+    "connection aborted",
+    "connection reset",
+    "connectionerror",
+    "huggingface.co",
+    "maxretryerror",
+    "read timed out",
+    "ssleoferror",
+    "temporarily unavailable",
+    "timeout",
+    "unexpected_eof_while_reading",
+)
 
 logger = logging.getLogger(__name__)
 
@@ -382,6 +395,11 @@ def _configure_docling_runtime_logging() -> None:
     matching_post_processor.MatchingPostProcessor._mcp_ebook_read_log_patch_applied = (
         True
     )
+
+
+def _should_retry_docling_parse(exc: Exception) -> bool:
+    message = f"{type(exc).__name__}: {exc}".lower()
+    return any(token in message for token in _DOCLING_TRANSIENT_ERROR_TOKENS)
 
 
 class _Pix2TextFormulaExtractor:
@@ -992,18 +1010,37 @@ class DoclingPdfParser:
                 f"Document not found: {pdf_path}",
             )
 
-        try:
-            converter = self._get_docling_converter()
-            result = converter.convert(str(path))
-            document = result.document
-            markdown = document.export_to_markdown()
-        except AppError:
-            raise
-        except Exception as exc:  # noqa: BLE001
-            raise AppError(
-                ErrorCode.INGEST_PDF_DOCLING_FAILED,
-                f"Docling parse failed for {pdf_path}",
-            ) from exc
+        for attempt in range(1, _DOCLING_PARSE_ATTEMPTS + 1):
+            try:
+                converter = self._get_docling_converter()
+                result = converter.convert(str(path))
+                document = result.document
+                markdown = document.export_to_markdown()
+                break
+            except AppError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                should_retry = (
+                    attempt < _DOCLING_PARSE_ATTEMPTS
+                    and _should_retry_docling_parse(exc)
+                )
+                if should_retry:
+                    logger.warning(
+                        "docling_parse_transient_failure_retrying",
+                        extra={
+                            "pdf_path": str(path),
+                            "attempt": attempt,
+                            "max_attempts": _DOCLING_PARSE_ATTEMPTS,
+                            "error_type": type(exc).__name__,
+                        },
+                    )
+                    self.close()
+                    time.sleep(1.0)
+                    continue
+                raise AppError(
+                    ErrorCode.INGEST_PDF_DOCLING_FAILED,
+                    f"Docling parse failed for {pdf_path}",
+                ) from exc
 
         sections = _split_markdown_into_sections(markdown)
         formula_markers_total = sum(

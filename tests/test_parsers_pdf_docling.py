@@ -215,6 +215,19 @@ class FailingConverter:
         raise RuntimeError("docling failed")
 
 
+class TransientThenSuccessfulConverter:
+    calls = 0
+
+    def convert(self, _path: str) -> FakeConvertResult:
+        TransientThenSuccessfulConverter.calls += 1
+        if TransientThenSuccessfulConverter.calls == 1:
+            raise RuntimeError(
+                "HTTPSConnectionPool(host='huggingface.co', port=443): "
+                "MaxRetryError SSLError SSLEOFError"
+            )
+        return FakeConvertResult("# Intro\nRecovered")
+
+
 class FormulaConverter:
     def convert(self, _path: str) -> FakeConvertResult:
         return FakeConvertResult("# Intro\nx(t) = sin(t)\n<!-- formula-not-decoded -->")
@@ -270,6 +283,29 @@ def test_docling_parse_failure(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) 
         parser.parse(str(pdf), "doc1")
 
     assert exc.value.code == ErrorCode.INGEST_PDF_DOCLING_FAILED
+
+
+def test_docling_parse_retries_transient_hf_download_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    parser = DoclingPdfParser()
+    pdf = tmp_path / "x.pdf"
+    pdf.write_bytes(b"pdf")
+    TransientThenSuccessfulConverter.calls = 0
+
+    install_fake_docling(monkeypatch, TransientThenSuccessfulConverter)
+    monkeypatch.setattr("mcp_ebook_read.parsers.pdf_docling.time.sleep", lambda _: None)
+    monkeypatch.setattr(
+        "mcp_ebook_read.parsers.pdf_docling.fitz.open",
+        lambda _path: FakePdfDoc(title="Recovered PDF", toc=[[1, "Intro", 1]]),
+    )
+
+    parsed = parser.parse(str(pdf), "doc-retry")
+
+    assert TransientThenSuccessfulConverter.calls == 2
+    assert parsed.title == "Recovered PDF"
+    assert len(parsed.chunks) == 1
+    assert parsed.chunks[0].text == "Recovered"
 
 
 def test_docling_parse_success(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

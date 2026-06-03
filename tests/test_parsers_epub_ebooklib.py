@@ -163,6 +163,73 @@ def test_epub_parse_success(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> 
     assert "Chapter One / Section 1.1" in parsed.reading_markdown
 
 
+def test_epub_parse_splits_toc_anchor_sections_without_headings(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    parser = EbooklibEpubParser()
+    epub_path = tmp_path / "book.epub"
+    epub_path.write_bytes(b"epub")
+
+    chapter_html = b"""
+    <html><body>
+      <span id="filepos0001"></span>
+      <p>Chapter One</p>
+      <p>First chapter body.</p>
+      <span id="filepos0002"></span>
+      <p>Section 1.1</p>
+      <p>Nested section body.</p>
+      <span id="filepos0003"></span>
+      <p>Chapter Two</p>
+      <p>Second chapter body.</p>
+    </body></html>
+    """
+    book = FakeEpubBook(
+        title="Anchored EPUB",
+        spine=[("text00000", "yes")],
+        items={
+            "text00000": FakeEpubItem(chapter_html, name="text00000.html"),
+        },
+        toc=[
+            (
+                epub.Link("text00000.html#filepos0001", "Chapter One", None),
+                [epub.Link("text00000.html#filepos0002", "Section 1.1", None)],
+            ),
+            epub.Link("text00000.html#filepos0003", "Chapter Two", None),
+        ],
+    )
+    monkeypatch.setattr(
+        "mcp_ebook_read.parsers.epub_ebooklib.epub.read_epub", lambda _path: book
+    )
+
+    parsed = parser.parse(str(epub_path), "doc-anchored-epub")
+
+    assert [chunk.section_path for chunk in parsed.chunks] == [
+        ["Chapter One"],
+        ["Chapter One", "Section 1.1"],
+        ["Chapter Two"],
+    ]
+    assert [chunk.locator.epub_locator for chunk in parsed.chunks] == [
+        {
+            "spine_id": "text00000",
+            "href": "text00000.html",
+            "anchor": "filepos0001",
+        },
+        {
+            "spine_id": "text00000",
+            "href": "text00000.html",
+            "anchor": "filepos0002",
+        },
+        {
+            "spine_id": "text00000",
+            "href": "text00000.html",
+            "anchor": "filepos0003",
+        },
+    ]
+    assert "First chapter body." in parsed.chunks[0].text
+    assert "Nested section body." in parsed.chunks[1].text
+    assert "Second chapter body." in parsed.chunks[2].text
+
+
 def test_epub_parse_extracts_images(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

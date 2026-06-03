@@ -122,6 +122,20 @@ def _extract_figcaption_text(img_node: html.HtmlElement) -> str:
     return _normalize_text(" ".join(figure_nodes[0].xpath(".//figcaption//text()")))
 
 
+def _element_anchor(node: html.HtmlElement) -> str:
+    for attr in ("id", "name"):
+        direct = _normalize_text(str(node.get(attr) or ""))
+        if direct:
+            return direct
+
+    for child in node.xpath(".//*[@id or @name]"):
+        for attr in ("id", "name"):
+            anchored = _normalize_text(str(child.get(attr) or ""))
+            if anchored:
+                return anchored
+    return ""
+
+
 class EbooklibEpubParser:
     """Single path EPUB parser."""
 
@@ -276,10 +290,17 @@ class EbooklibEpubParser:
                             resolved = resolved + heading_stack
                 return resolved or heading_stack.copy() or spine_path
 
+            def resolve_anchor_path(anchor: str) -> list[str] | None:
+                if not spine_href or not anchor:
+                    return None
+                resolved = toc_paths.get(f"{spine_href}#{anchor}")
+                return resolved.copy() if resolved else None
+
             body_nodes = dom.xpath("//body")
             scope = body_nodes[0] if body_nodes else dom
             content_nodes = scope.xpath(
                 ".//h1 | .//h2 | .//h3 | .//h4 | .//h5 | .//h6 | "
+                ".//*[@id or @name] | "
                 ".//p | .//li[not(descendant::p)] | "
                 ".//blockquote[not(descendant::p)] | .//pre"
             )
@@ -337,25 +358,35 @@ class EbooklibEpubParser:
 
             for node in content_nodes:
                 tag_name = _tag_name(str(node.tag))
+                node_anchor = _element_anchor(node)
                 if re.fullmatch(r"h[1-6]", tag_name):
                     flush_section()
 
                     heading_text = _normalize_text(" ".join(node.itertext()))
                     if not heading_text:
-                        current_anchor = _normalize_text(node.get("id") or "")
+                        current_anchor = node_anchor
                         continue
 
                     level = int(tag_name[1])
-                    anchor = _normalize_text(node.get("id") or "")
                     current_section_path = resolve_section_path(
                         heading_stack=heading_path,
                         level=level,
                         heading_text=heading_text,
-                        anchor=anchor,
+                        anchor=node_anchor,
                     )
-                    current_anchor = anchor
+                    current_anchor = node_anchor
                     current_paragraphs = []
                     continue
+
+                anchor_path = resolve_anchor_path(node_anchor)
+                if anchor_path and (
+                    anchor_path != current_section_path
+                    or node_anchor != current_anchor
+                ):
+                    flush_section()
+                    current_section_path = anchor_path
+                    current_anchor = node_anchor
+                    current_paragraphs = []
 
                 text = _normalize_text(" ".join(node.itertext()))
                 if not text:
@@ -366,7 +397,8 @@ class EbooklibEpubParser:
             flush_section()
 
             image_scan_nodes = scope.xpath(
-                ".//h1 | .//h2 | .//h3 | .//h4 | .//h5 | .//h6 | .//img"
+                ".//h1 | .//h2 | .//h3 | .//h4 | .//h5 | .//h6 | "
+                ".//*[@id or @name] | .//img"
             )
             image_heading_path: list[str] = []
             image_section_path = spine_path.copy()
@@ -374,22 +406,27 @@ class EbooklibEpubParser:
 
             for node in image_scan_nodes:
                 tag_name = _tag_name(str(node.tag))
+                node_anchor = _element_anchor(node)
                 if re.fullmatch(r"h[1-6]", tag_name):
                     heading_text = _normalize_text(" ".join(node.itertext()))
                     if not heading_text:
-                        image_anchor = _normalize_text(node.get("id") or "")
+                        image_anchor = node_anchor
                         continue
 
                     level = int(tag_name[1])
-                    anchor = _normalize_text(node.get("id") or "")
                     image_section_path = resolve_section_path(
                         heading_stack=image_heading_path,
                         level=level,
                         heading_text=heading_text,
-                        anchor=anchor,
+                        anchor=node_anchor,
                     )
-                    image_anchor = anchor
+                    image_anchor = node_anchor
                     continue
+
+                anchor_path = resolve_anchor_path(node_anchor)
+                if anchor_path:
+                    image_section_path = anchor_path
+                    image_anchor = node_anchor
 
                 src = str(node.get("src") or "").strip()
                 if not src:
