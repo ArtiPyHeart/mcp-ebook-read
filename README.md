@@ -7,7 +7,7 @@ A local MCP server for Codex to read and retrieve content from EPUB/PDF document
 ### Qdrant (required)
 
 ```bash
-docker rm -f qdrant 2>/dev/null || true && docker run -d --name qdrant -p 6333:6333 -p 6334:6334 qdrant/qdrant:v1.18.0
+docker rm -f qdrant 2>/dev/null || true && docker run -d --name qdrant -p 6333:6333 -p 6334:6334 qdrant/qdrant:v1.18.1
 ```
 
 ### GROBID (required by startup preflight and `document_ingest_pdf_paper`)
