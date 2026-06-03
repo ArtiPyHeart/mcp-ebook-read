@@ -42,12 +42,14 @@ def _parsed(
     replaced: int,
     fallback: int,
     unresolved: int,
+    docling_latex: int = 0,
 ) -> ParsedDocument:
     return ParsedDocument(
         title="Doc",
         parser_chain=["docling"],
         metadata={
             "formula_markers_total": markers_total,
+            "formula_extracted_by_docling_latex": docling_latex,
             "formula_replaced_by_pix2text": replaced,
             "formula_replaced_by_fallback": fallback,
             "formula_unresolved": unresolved,
@@ -91,6 +93,26 @@ def test_summarize_parsed_formula_quality() -> None:
     assert metrics["latex_blocks_total"] == 2
     assert metrics["latex_blocks_heuristic_valid"] == 1
     assert len(metrics["formula_signature"]) == 64
+
+
+def test_summarize_parsed_formula_quality_counts_docling_latex() -> None:
+    parsed = _parsed(
+        "doc-native",
+        chunk_text="$$x = y$$",
+        markers_total=0,
+        replaced=0,
+        fallback=0,
+        unresolved=0,
+        docling_latex=1,
+    )
+
+    metrics = summarize_parsed_formula_quality(parsed)
+
+    assert metrics["formula_extracted_by_docling_latex"] == 1
+    assert metrics["formula_candidates_total"] == 1
+    assert metrics["formula_recovered_total"] == 1
+    assert metrics["formula_recovered_rate"] == 1.0
+    assert metrics["formula_unresolved_rate"] == 0.0
 
 
 def test_run_pdf_formula_benchmark_with_stability_and_error(tmp_path: Path) -> None:

@@ -182,9 +182,10 @@ def install_fake_pix2text(
 
     class FakePix2Text:
         @classmethod
-        def from_config(cls, **_kwargs):  # noqa: ANN003
+        def from_config(cls, **kwargs):  # noqa: ANN003
             if state is not None:
                 state["from_config_calls"] = int(state.get("from_config_calls", 0)) + 1
+                state["from_config_kwargs"] = kwargs
             return cls()
 
         def recognize_text_formula(
@@ -231,6 +232,13 @@ class TransientThenSuccessfulConverter:
 class FormulaConverter:
     def convert(self, _path: str) -> FakeConvertResult:
         return FakeConvertResult("# Intro\nx(t) = sin(t)\n<!-- formula-not-decoded -->")
+
+
+class NativeLatexFormulaConverter:
+    def convert(self, _path: str) -> FakeConvertResult:
+        return FakeConvertResult(
+            "# Intro\nNative formula text\n$$\n\\frac{a}{b}\n$$\nMore text\n$$x = y$$"
+        )
 
 
 class MultiFormulaConverter:
@@ -369,6 +377,49 @@ def test_docling_parse_skips_page_loading_without_formula_markers(
     assert fake_doc.load_page_calls == 0
 
 
+def test_docling_parse_records_native_latex_blocks_without_pix2text(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    parser = DoclingPdfParser()
+    pdf = tmp_path / "native_formula.pdf"
+    pdf.write_bytes(b"pdf")
+
+    install_fake_docling(monkeypatch, NativeLatexFormulaConverter)
+    fake_doc = CountingLoadPagePdfDoc(
+        title="Native Formula PDF",
+        page_count=2,
+        toc=[[1, "Intro", 1]],
+    )
+    monkeypatch.setattr(
+        "mcp_ebook_read.parsers.pdf_docling.fitz.open",
+        lambda _path: fake_doc,
+    )
+
+    parsed = parser.parse(str(pdf), "doc-native-formula")
+
+    assert parsed.parser_chain == ["docling"]
+    assert parsed.metadata["formula_markers_total"] == 0
+    assert parsed.metadata["formula_extracted_by_docling_latex"] == 2
+    assert parsed.metadata["formula_records_total"] == 2
+    assert parsed.metadata["formula_engine"] is None
+    assert fake_doc.load_page_calls == 0
+    assert [formula.source for formula in parsed.formulas] == [
+        "docling_latex",
+        "docling_latex",
+    ]
+    assert [formula.status for formula in parsed.formulas] == [
+        "resolved",
+        "resolved",
+    ]
+    assert [formula.latex for formula in parsed.formulas] == [
+        r"\frac{a}{b}",
+        "x = y",
+    ]
+    assert all(
+        formula.chunk_id == parsed.chunks[0].chunk_id for formula in parsed.formulas
+    )
+
+
 def test_docling_parse_replaces_formula_marker(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -503,6 +554,44 @@ def test_docling_parse_formula_engine_missing_fails_fast(
         parser.parse(str(pdf), "doc-formula-missing")
 
     assert exc.value.code == ErrorCode.INGEST_PDF_FORMULA_ENGINE_UNAVAILABLE
+
+
+def test_pix2text_init_patches_rapidocr_root_and_uses_cpu(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    state: dict[str, object] = {}
+    install_fake_pix2text(monkeypatch, outputs=[], state=state)
+
+    cnstd_module = types.ModuleType("cnstd")
+    cnstd_module.__path__ = []
+    ppocr_module = types.ModuleType("cnstd.ppocr")
+    ppocr_module.__path__ = []
+    rapid_detector_module = types.ModuleType("cnstd.ppocr.rapid_detector")
+
+    class Config:
+        DEFAULT_CFG: dict[str, object] = {}
+
+    model_root = tmp_path / "cnstd-cache"
+    rapid_detector_module.Config = Config
+    rapid_detector_module.data_dir = lambda: model_root
+    ppocr_module.rapid_detector = rapid_detector_module
+    monkeypatch.setitem(sys.modules, "cnstd", cnstd_module)
+    monkeypatch.setitem(sys.modules, "cnstd.ppocr", ppocr_module)
+    monkeypatch.setitem(
+        sys.modules,
+        "cnstd.ppocr.rapid_detector",
+        rapid_detector_module,
+    )
+
+    parser = DoclingPdfParser()
+    parser.formula_extractor._ensure_engine()
+
+    assert Config.DEFAULT_CFG["model_root_dir"] == str(model_root)
+    assert model_root.is_dir()
+    assert state["from_config_kwargs"] == {
+        "device": "cpu",
+        "enable_table": False,
+    }
 
 
 def test_docling_parse_filters_noisy_toc_titles(

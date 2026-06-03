@@ -32,6 +32,8 @@ from mcp_ebook_read.schema.models import (
 
 
 _FORMULA_MARKER = "<!-- formula-not-decoded -->"
+_DOCLING_LATEX_SOURCE = "docling_latex"
+_DOCLING_LATEX_BLOCK_PATTERN = re.compile(r"\$\$(.*?)\$\$", re.DOTALL)
 _MAX_HEADING_LENGTH = 160
 _CODE_LIKE_TOKENS = ("def ", "class ", "return ", "import ", "while ", "for ")
 _FORMULA_SOURCE = "pix2text"
@@ -74,6 +76,7 @@ class _FormulaCandidate:
 @dataclass(slots=True)
 class _FormulaReplacementStats:
     markers_total: int = 0
+    extracted_by_docling_latex: int = 0
     replaced_by_engine: int = 0
     replaced_by_fallback: int = 0
     unresolved: int = 0
@@ -337,6 +340,28 @@ def _extract_formula_candidates_from_text(
     return candidates
 
 
+def _extract_docling_latex_formulas(
+    text: str, *, page_range: list[int]
+) -> list[_ResolvedFormula]:
+    formulas: list[_ResolvedFormula] = []
+    page = page_range[0] if page_range else None
+    for matched in _DOCLING_LATEX_BLOCK_PATTERN.findall(text):
+        latex = matched.strip()
+        if not latex:
+            continue
+        formulas.append(
+            _ResolvedFormula(
+                latex=latex,
+                page=page,
+                bbox=None,
+                source=_DOCLING_LATEX_SOURCE,
+                confidence=None,
+                status="resolved",
+            )
+        )
+    return formulas
+
+
 def _looks_like_latex(text: str) -> bool:
     tokens = (
         "\\frac",
@@ -402,6 +427,26 @@ def _should_retry_docling_parse(exc: Exception) -> bool:
     return any(token in message for token in _DOCLING_TRANSIENT_ERROR_TOKENS)
 
 
+def _configure_pix2text_runtime() -> None:
+    try:
+        from cnstd.ppocr import rapid_detector  # type: ignore
+    except Exception:  # noqa: BLE001
+        return
+
+    config_cls = getattr(rapid_detector, "Config", None)
+    default_cfg = getattr(config_cls, "DEFAULT_CFG", None)
+    if not isinstance(default_cfg, dict) or default_cfg.get("model_root_dir"):
+        return
+
+    data_dir = getattr(rapid_detector, "data_dir", None)
+    if callable(data_dir):
+        model_root = Path(data_dir())
+    else:
+        model_root = Path.home() / ".cnstd"
+    model_root.mkdir(parents=True, exist_ok=True)
+    default_cfg["model_root_dir"] = str(model_root)
+
+
 class _Pix2TextFormulaExtractor:
     def __init__(self, *, batch_size: int = 1) -> None:
         self.batch_size = max(1, batch_size)
@@ -421,7 +466,8 @@ class _Pix2TextFormulaExtractor:
                     "install_hint": "Install dependency: uv add pix2text",
                 },
             ) from exc
-        self._engine = Pix2Text.from_config()
+        _configure_pix2text_runtime()
+        self._engine = Pix2Text.from_config(device="cpu", enable_table=False)
         return self._engine
 
     def _normalize_output(self, raw: Any) -> list[dict[str, Any]]:
@@ -1106,6 +1152,10 @@ class DoclingPdfParser:
             section_formulas: list[list[_ResolvedFormula]] = []
 
             for section, page_range in zip(sections, page_ranges, strict=True):
+                native_formulas = _extract_docling_latex_formulas(
+                    section.text,
+                    page_range=page_range,
+                )
                 enhanced_text, section_stats, recovered_formulas = (
                     self._replace_formula_markers(
                         text=section.text,
@@ -1117,10 +1167,11 @@ class DoclingPdfParser:
                     )
                 )
                 formula_stats.markers_total += section_stats.markers_total
+                formula_stats.extracted_by_docling_latex += len(native_formulas)
                 formula_stats.replaced_by_engine += section_stats.replaced_by_engine
                 formula_stats.replaced_by_fallback += section_stats.replaced_by_fallback
                 formula_stats.unresolved += section_stats.unresolved
-                section_formulas.append(recovered_formulas)
+                section_formulas.append(native_formulas + recovered_formulas)
                 enhanced_sections.append(
                     _SectionBlock(
                         path=section.path,
@@ -1176,7 +1227,8 @@ class DoclingPdfParser:
                 page = recovered.page if recovered.page is not None else page_range[0]
                 formula_identity = (
                     f"{doc_id}:{section_idx}:{formula_idx}:{page}:"
-                    f"{recovered.bbox}:{recovered.status}:{recovered.latex}"
+                    f"{recovered.bbox}:{recovered.source}:"
+                    f"{recovered.status}:{recovered.latex}"
                 )
                 formula_id = hashlib.sha1(
                     formula_identity.encode(), usedforsecurity=False
@@ -1208,6 +1260,7 @@ class DoclingPdfParser:
                 "toc_nodes_raw": len(toc),
                 "toc_nodes_clean": len(outline),
                 "formula_markers_total": formula_stats.markers_total,
+                "formula_extracted_by_docling_latex": formula_stats.extracted_by_docling_latex,
                 "formula_replaced_by_pix2text": formula_stats.replaced_by_engine,
                 "formula_replaced_by_fallback": formula_stats.replaced_by_fallback,
                 "formula_unresolved": formula_stats.unresolved,

@@ -113,7 +113,9 @@ Optional:
 - For large papers, increase `GROBID_TIMEOUT_SECONDS` (for example `120`) to reduce timeout failures.
 - PDF ingest now uses a mixed formula pipeline:
   - Docling structure extraction with `do_formula_enrichment`.
-  - Pix2Text as the primary formula recovery engine.
+  - Docling-native `$$...$$` LaTeX blocks are registered directly in the formula catalog.
+  - Pix2Text runs as a marker fallback when Docling emits unresolved formula markers.
+  - Pix2Text runs on CPU by default to avoid platform accelerator instability.
   - Fail-fast when formula markers exist but Pix2Text is unavailable.
 - Optional formula env controls:
   - `DOCLING_FORMULA_ENRICHMENT` (`true` by default)

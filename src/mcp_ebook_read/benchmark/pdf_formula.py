@@ -110,10 +110,16 @@ def is_latex_heuristically_valid(latex: str) -> bool:
 def summarize_parsed_formula_quality(parsed: ParsedDocument) -> dict[str, Any]:
     """Compute no-label formula quality metrics for a parsed document."""
     markers_total = _to_int(parsed.metadata.get("formula_markers_total"))
+    extracted_by_docling_latex = _to_int(
+        parsed.metadata.get("formula_extracted_by_docling_latex")
+    )
     replaced_by_engine = _to_int(parsed.metadata.get("formula_replaced_by_pix2text"))
     replaced_by_fallback = _to_int(parsed.metadata.get("formula_replaced_by_fallback"))
     unresolved = _to_int(parsed.metadata.get("formula_unresolved"))
-    recovered_total = replaced_by_engine + replaced_by_fallback
+    formula_candidates_total = markers_total + extracted_by_docling_latex
+    recovered_total = (
+        extracted_by_docling_latex + replaced_by_engine + replaced_by_fallback
+    )
 
     latex_blocks: list[str] = []
     for chunk in parsed.chunks:
@@ -125,6 +131,7 @@ def summarize_parsed_formula_quality(parsed: ParsedDocument) -> dict[str, Any]:
     signature_payload = {
         "formula_stats": {
             "markers_total": markers_total,
+            "extracted_by_docling_latex": extracted_by_docling_latex,
             "replaced_by_engine": replaced_by_engine,
             "replaced_by_fallback": replaced_by_fallback,
             "unresolved": unresolved,
@@ -139,14 +146,18 @@ def summarize_parsed_formula_quality(parsed: ParsedDocument) -> dict[str, Any]:
 
     return {
         "formula_markers_total": markers_total,
+        "formula_extracted_by_docling_latex": extracted_by_docling_latex,
+        "formula_candidates_total": formula_candidates_total,
         "formula_recovered_total": recovered_total,
         "formula_replaced_by_pix2text": replaced_by_engine,
         "formula_replaced_by_fallback": replaced_by_fallback,
         "formula_unresolved": unresolved,
         "formula_recovered_rate": _safe_div(
-            recovered_total, markers_total, zero_value=0.0
+            recovered_total, formula_candidates_total, zero_value=0.0
         ),
-        "formula_unresolved_rate": _safe_div(unresolved, markers_total, zero_value=0.0),
+        "formula_unresolved_rate": _safe_div(
+            unresolved, formula_candidates_total, zero_value=0.0
+        ),
         "latex_blocks_total": len(latex_blocks),
         "latex_blocks_heuristic_valid": valid_blocks,
         "latex_blocks_heuristic_valid_rate": _safe_div(
@@ -246,6 +257,12 @@ def run_pdf_formula_benchmark(
 
     ok_docs = [item for item in documents if item.get("status") == "ok"]
     markers_total = sum(item["first_pass"]["formula_markers_total"] for item in ok_docs)
+    extracted_by_docling_latex = sum(
+        item["first_pass"]["formula_extracted_by_docling_latex"] for item in ok_docs
+    )
+    formula_candidates_total = sum(
+        item["first_pass"]["formula_candidates_total"] for item in ok_docs
+    )
     recovered_total = sum(
         item["first_pass"]["formula_recovered_total"] for item in ok_docs
     )
@@ -263,13 +280,15 @@ def run_pdf_formula_benchmark(
         "docs_ok": len(ok_docs),
         "docs_failed": len(documents) - len(ok_docs),
         "formula_markers_total": markers_total,
+        "formula_extracted_by_docling_latex": extracted_by_docling_latex,
+        "formula_candidates_total": formula_candidates_total,
         "formula_recovered_total": recovered_total,
         "formula_unresolved_total": unresolved_total,
         "formula_recovered_rate": _safe_div(
-            recovered_total, markers_total, zero_value=0.0
+            recovered_total, formula_candidates_total, zero_value=0.0
         ),
         "formula_unresolved_rate": _safe_div(
-            unresolved_total, markers_total, zero_value=0.0
+            unresolved_total, formula_candidates_total, zero_value=0.0
         ),
         "latex_blocks_total": latex_blocks_total,
         "latex_blocks_heuristic_valid_total": latex_valid_total,
