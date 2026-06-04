@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from collections import defaultdict
+from dataclasses import dataclass
 from datetime import UTC, datetime
 import json
 import hashlib
@@ -69,6 +70,13 @@ _PDF_VISUAL_PIPELINE_VERSION = "docling-visuals-on-demand-v1"
 _EPUB_IMAGE_PIPELINE_VERSION = "ebooklib-image-extraction-v1"
 
 
+@dataclass(frozen=True, slots=True)
+class _IngestQueueItem:
+    catalog_key: str
+    doc_id: str
+    job_id: str
+
+
 class AppService:
     """Orchestrates scan, ingest, indexing and read/render operations."""
 
@@ -93,7 +101,7 @@ class AppService:
         self._catalogs: dict[str, CatalogStore] = {}
         self._doc_catalog_index: dict[str, str] = {}
         self._known_roots: set[str] = set()
-        self._ingest_queue: Queue[tuple[str, str]] = Queue()
+        self._ingest_queue: Queue[_IngestQueueItem] = Queue()
         self._ingest_lock = threading.Lock()
         self._closed = False
         self._ingest_worker = threading.Thread(
@@ -500,6 +508,28 @@ class AppService:
                 error_code,
                 message,
                 details=self._missing_doc_details(doc_id),
+            )
+        return doc, catalog
+
+    def _require_doc_from_catalog(
+        self,
+        *,
+        catalog_key: str,
+        doc_id: str,
+        error_code: ErrorCode,
+        message: str,
+    ) -> tuple[DocumentRecord, CatalogStore]:
+        catalog = self._catalogs.get(catalog_key)
+        doc = catalog.get_document_by_id(doc_id) if catalog is not None else None
+        if doc is None or catalog is None:
+            raise AppError(
+                error_code,
+                message,
+                details={
+                    "doc_id": doc_id,
+                    "catalog_key": catalog_key,
+                    "loaded_catalogs": sorted(self._catalogs.keys()),
+                },
             )
         return doc, catalog
 
@@ -1532,12 +1562,20 @@ class AppService:
             updated_at=now,
         )
         catalog.create_ingest_job(job)
-        self._ingest_queue.put((doc.doc_id, job.job_id))
+        catalog_key = self._catalog_key(catalog)
+        self._ingest_queue.put(
+            _IngestQueueItem(
+                catalog_key=catalog_key,
+                doc_id=doc.doc_id,
+                job_id=job.job_id,
+            )
+        )
         logger.info(
             "ingest_job_queued",
             extra={
                 "doc_id": doc.doc_id,
                 "job_id": job.job_id,
+                "catalog_key": catalog_key,
                 "profile": profile,
                 "path": doc.path,
             },
@@ -1547,31 +1585,40 @@ class AppService:
     def _ingest_worker_loop(self) -> None:
         while True:
             try:
-                doc_id, job_id = self._ingest_queue.get(timeout=0.5)
+                item = self._ingest_queue.get(timeout=0.5)
             except Empty:
                 continue
             try:
-                self._run_ingest_job(doc_id=doc_id, job_id=job_id)
+                self._run_ingest_job(item=item)
             except Exception:  # noqa: BLE001
                 logger.exception(
                     "ingest_worker_unhandled_error",
-                    extra={"doc_id": doc_id, "job_id": job_id},
+                    extra={
+                        "doc_id": item.doc_id,
+                        "job_id": item.job_id,
+                        "catalog_key": item.catalog_key,
+                    },
                 )
             finally:
                 self._ingest_queue.task_done()
 
-    def _run_ingest_job(self, *, doc_id: str, job_id: str) -> None:
-        doc, catalog = self._require_doc(
-            doc_id,
+    def _run_ingest_job(self, *, item: _IngestQueueItem) -> None:
+        doc, catalog = self._require_doc_from_catalog(
+            catalog_key=item.catalog_key,
+            doc_id=item.doc_id,
             error_code=ErrorCode.INGEST_DOC_NOT_FOUND,
             message="Document not found while executing ingest job",
         )
-        job = catalog.get_ingest_job(doc_id, job_id)
+        job = catalog.get_ingest_job(item.doc_id, item.job_id)
         if job is None:
             raise AppError(
                 ErrorCode.INGEST_DOC_NOT_FOUND,
                 "Ingest job not found",
-                details={"doc_id": doc_id, "job_id": job_id},
+                details={
+                    "doc_id": item.doc_id,
+                    "job_id": item.job_id,
+                    "catalog_key": item.catalog_key,
+                },
             )
         if job.status != IngestJobStatus.QUEUED:
             return
@@ -1579,7 +1626,7 @@ class AppService:
         started_at = self._now_iso()
         self._set_job_stage(
             catalog=catalog,
-            job_id=job_id,
+            job_id=item.job_id,
             status=IngestJobStatus.RUNNING,
             stage=IngestStage.PARSE,
             message="Worker started background ingest job.",
@@ -1587,13 +1634,18 @@ class AppService:
         )
         logger.info(
             "ingest_job_started",
-            extra={"doc_id": doc_id, "job_id": job_id, "profile": job.profile},
+            extra={
+                "doc_id": item.doc_id,
+                "job_id": item.job_id,
+                "catalog_key": item.catalog_key,
+                "profile": job.profile,
+            },
         )
 
         def stage_callback(stage: IngestStage, message: str) -> None:
             self._set_job_stage(
                 catalog=catalog,
-                job_id=job_id,
+                job_id=item.job_id,
                 status=IngestJobStatus.RUNNING,
                 stage=stage,
                 message=message,
@@ -1601,8 +1653,9 @@ class AppService:
             logger.info(
                 "ingest_job_stage",
                 extra={
-                    "doc_id": doc_id,
-                    "job_id": job_id,
+                    "doc_id": item.doc_id,
+                    "job_id": item.job_id,
+                    "catalog_key": item.catalog_key,
                     "stage": stage,
                     "stage_message": message,
                 },
@@ -1625,7 +1678,7 @@ class AppService:
             error["traceback"] = traceback.format_exc()
             self._set_job_stage(
                 catalog=catalog,
-                job_id=job_id,
+                job_id=item.job_id,
                 status=IngestJobStatus.FAILED,
                 stage=IngestStage.FAILED,
                 message=str(exc),
@@ -1639,13 +1692,17 @@ class AppService:
             )
             logger.exception(
                 "ingest_job_failed",
-                extra={"doc_id": doc_id, "job_id": job_id},
+                extra={
+                    "doc_id": item.doc_id,
+                    "job_id": item.job_id,
+                    "catalog_key": item.catalog_key,
+                },
             )
             return
 
         self._set_job_stage(
             catalog=catalog,
-            job_id=job_id,
+            job_id=item.job_id,
             status=IngestJobStatus.SUCCEEDED,
             stage=IngestStage.COMPLETED,
             message="Background ingest job completed successfully.",
@@ -1664,8 +1721,9 @@ class AppService:
         logger.info(
             "ingest_job_succeeded",
             extra={
-                "doc_id": doc_id,
-                "job_id": job_id,
+                "doc_id": item.doc_id,
+                "job_id": item.job_id,
+                "catalog_key": item.catalog_key,
                 "chunks": result["chunks_count"],
             },
         )

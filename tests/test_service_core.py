@@ -442,6 +442,27 @@ def _wait_for_ingest_job(
     raise AssertionError(f"Timed out waiting for ingest job {job_id}: {last}")
 
 
+def _wait_for_catalog_ingest_job(
+    catalog,  # noqa: ANN001
+    *,
+    doc_id: str,
+    job_id: str,
+    timeout_seconds: float = 5.0,
+):
+    deadline = time.monotonic() + timeout_seconds
+    last = None
+    while time.monotonic() < deadline:
+        last = catalog.get_ingest_job(doc_id, job_id)
+        if last is not None and last.status in {
+            IngestJobStatus.SUCCEEDED,
+            IngestJobStatus.FAILED,
+            IngestJobStatus.CANCELED,
+        }:
+            return last
+        time.sleep(0.01)
+    raise AssertionError(f"Timed out waiting for catalog ingest job {job_id}: {last}")
+
+
 def test_library_scan_invalid_root(tmp_path: Path) -> None:
     service = _build_service(
         tmp_path,
@@ -854,6 +875,65 @@ def test_document_ingest_jobs_deduplicate_and_list_status(tmp_path: Path) -> Non
     assert listed["doc_id"] == doc_id
     assert listed["jobs"][0]["job_id"] == first["job_id"]
     assert listed["jobs"][0]["progress"]["stage"] == IngestStage.COMPLETED
+
+
+def test_document_ingest_worker_uses_queued_catalog_for_duplicate_doc_ids(
+    tmp_path: Path,
+) -> None:
+    doc_id = "same-content-doc"
+    first_path = tmp_path / "alpha" / "shared.pdf"
+    second_path = tmp_path / "beta" / "shared.pdf"
+    first_path.parent.mkdir()
+    second_path.parent.mkdir()
+    first_path.write_bytes(b"same pdf bytes")
+    second_path.write_bytes(b"same pdf bytes")
+
+    parser = RecordingParser(result=_parsed(doc_id, title="Shared", method="docling"))
+    service = _build_service(
+        tmp_path,
+        pdf_parser=parser,
+        epub_parser=RecordingParser(result=_parsed("x", title="X", method="ebooklib")),
+        grobid=RecordingGrobid(),
+    )
+    _register_doc(service, doc_id, first_path, DocumentType.PDF)
+    first_catalog = service._catalog_for_document_path(first_path)
+    _register_doc(service, doc_id, second_path, DocumentType.PDF)
+    second_catalog = service._catalog_for_document_path(second_path)
+
+    first = service.document_ingest_pdf_book(
+        path=str(first_path.resolve()),
+        doc_id=None,
+        force=True,
+    )
+    second = service.document_ingest_pdf_book(
+        path=str(second_path.resolve()),
+        doc_id=None,
+        force=True,
+    )
+
+    first_job = _wait_for_catalog_ingest_job(
+        first_catalog,
+        doc_id=doc_id,
+        job_id=first["job_id"],
+    )
+    second_job = _wait_for_catalog_ingest_job(
+        second_catalog,
+        doc_id=doc_id,
+        job_id=second["job_id"],
+    )
+
+    assert first_job.status == IngestJobStatus.SUCCEEDED
+    assert second_job.status == IngestJobStatus.SUCCEEDED
+    assert first_catalog.get_document_by_path(str(first_path.resolve())).status == (
+        DocumentStatus.READY
+    )
+    assert second_catalog.get_document_by_path(str(second_path.resolve())).status == (
+        DocumentStatus.READY
+    )
+    assert parser.calls == [
+        (str(first_path.resolve()), doc_id),
+        (str(second_path.resolve()), doc_id),
+    ]
 
 
 def test_document_ingest_pdf_book_rejects_epub(tmp_path: Path) -> None:
