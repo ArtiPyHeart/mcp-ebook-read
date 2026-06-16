@@ -843,12 +843,17 @@ class AppService:
             ),
         )
 
+    @staticmethod
+    def _scanned_doc_id(path: Path, sha256: str) -> str:
+        path_hash = hashlib.sha256(str(path.resolve()).encode("utf-8")).hexdigest()
+        return f"{sha256[:16]}-{path_hash[:8]}"
+
     def _scan_document_file(self, path: Path) -> dict[str, Any]:
         abs_path = str(path.resolve())
         file_type = self._doc_type_from_path(path)
         sha256 = self._compute_sha256(path)
         return {
-            "doc_id": sha256[:16],
+            "doc_id": self._scanned_doc_id(path, sha256),
             "path": abs_path,
             "path_obj": path,
             "type": file_type,

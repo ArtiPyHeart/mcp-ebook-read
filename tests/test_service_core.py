@@ -788,6 +788,48 @@ def test_library_scan_add_unchanged_removed(tmp_path: Path) -> None:
     assert scan_catalog.get_document_by_path(str(epub.resolve())) is None
 
 
+def test_library_scan_allows_duplicate_file_content(tmp_path: Path) -> None:
+    root = tmp_path / "library"
+    first_dir = root / "alpha"
+    second_dir = root / "beta"
+    first_dir.mkdir(parents=True)
+    second_dir.mkdir(parents=True)
+    payload = b"same-pdf-bytes"
+    first_pdf = first_dir / "duplicate.pdf"
+    second_pdf = second_dir / "duplicate.pdf"
+    first_pdf.write_bytes(payload)
+    second_pdf.write_bytes(payload)
+
+    service = _build_service(
+        tmp_path,
+        pdf_parser=RecordingParser(result=_parsed("x", title="X", method="docling")),
+        epub_parser=RecordingParser(result=_parsed("x", title="X", method="ebooklib")),
+        grobid=RecordingGrobid(),
+    )
+
+    first = service.library_scan(str(root), ["**/*.pdf"])
+    expected_content_prefix = hashlib.sha256(payload).hexdigest()[:16]
+    doc_ids = {row["doc_id"] for row in first["added"]}
+
+    assert len(first["added"]) == 2
+    assert first["scan_performance"]["candidate_documents"] == 2
+    assert len(doc_ids) == 2
+    assert all(doc_id.startswith(f"{expected_content_prefix}-") for doc_id in doc_ids)
+    assert all(len(doc_id) == 25 for doc_id in doc_ids)
+
+    catalog = service._catalog_for_library_root(root)
+    documents = catalog.list_documents()
+    assert len(documents) == 2
+    assert {doc.path for doc in documents} == {
+        str(first_pdf.resolve()),
+        str(second_pdf.resolve()),
+    }
+
+    second = service.library_scan(str(root), ["**/*.pdf"])
+    assert second["unchanged_count"] == 2
+    assert not second["added"]
+
+
 def test_library_scan_hash_worker_count_scales_with_safe_limits(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
