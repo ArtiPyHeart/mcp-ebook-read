@@ -401,6 +401,7 @@ def _register_doc(
     doc_type: DocumentType,
     *,
     root: Path | None = None,
+    profile: Profile = Profile.BOOK,
 ) -> None:
     catalog = service._catalog_for_document_path(path, root=root)
     catalog.upsert_scanned_document(
@@ -410,6 +411,7 @@ def _register_doc(
             type=doc_type,
             sha256=("a" if doc_type == DocumentType.PDF else "b") * 64,
             mtime=1.0,
+            profile=profile,
         )
     )
     service._bind_doc_catalog(doc_id, catalog)
@@ -830,6 +832,39 @@ def test_library_scan_allows_duplicate_file_content(tmp_path: Path) -> None:
     assert not second["added"]
 
 
+def test_library_scan_infers_paper_profile_from_papers_path(tmp_path: Path) -> None:
+    root = tmp_path / "library"
+    papers_dir = root / "papers" / "market-microstructure"
+    books_dir = root / "books"
+    papers_dir.mkdir(parents=True)
+    books_dir.mkdir(parents=True)
+    paper_pdf = papers_dir / "paper.pdf"
+    book_pdf = books_dir / "book.pdf"
+    paper_pdf.write_bytes(b"paper")
+    book_pdf.write_bytes(b"book")
+
+    service = _build_service(
+        tmp_path,
+        pdf_parser=RecordingParser(result=_parsed("x", title="X", method="docling")),
+        epub_parser=RecordingParser(result=_parsed("x", title="X", method="ebooklib")),
+        grobid=RecordingGrobid(),
+    )
+
+    result = service.library_scan(str(root), ["**/*.pdf"])
+    payload_by_path = {row["path"]: row for row in result["added"]}
+
+    assert payload_by_path[str(paper_pdf.resolve())]["profile"] == Profile.PAPER
+    assert payload_by_path[str(book_pdf.resolve())]["profile"] == Profile.BOOK
+
+    catalog = service._catalog_for_library_root(root)
+    paper_doc = catalog.get_document_by_path(str(paper_pdf.resolve()))
+    book_doc = catalog.get_document_by_path(str(book_pdf.resolve()))
+    assert paper_doc is not None
+    assert paper_doc.profile == Profile.PAPER
+    assert book_doc is not None
+    assert book_doc.profile == Profile.BOOK
+
+
 def test_library_scan_hash_worker_count_scales_with_safe_limits(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -956,7 +991,7 @@ def test_library_scan_cleans_catalog_when_folder_becomes_empty(tmp_path: Path) -
     assert catalog.get_document_by_id(doc_id) is None
 
 
-def test_document_ingest_pdf_book_success(tmp_path: Path) -> None:
+def test_document_ingest_success(tmp_path: Path) -> None:
     doc_id = "docpdf1"
     pdf_path = tmp_path / "book.pdf"
     pdf_path.write_bytes(b"pdf")
@@ -970,7 +1005,7 @@ def test_document_ingest_pdf_book_success(tmp_path: Path) -> None:
     )
     _register_doc(service, doc_id, pdf_path, DocumentType.PDF)
 
-    queued = service.document_ingest_pdf_book(
+    queued = service.document_ingest(
         doc_id=doc_id,
         path=None,
         force=True,
@@ -996,7 +1031,7 @@ def test_document_ingest_pdf_book_success(tmp_path: Path) -> None:
     assert loaded.title == "PDF Book"
 
 
-def test_document_ingest_pdf_book_persists_fast_preflight_metadata(
+def test_document_ingest_persists_fast_preflight_metadata(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     doc_id = "docpdf-fast"
@@ -1074,7 +1109,7 @@ def test_document_ingest_pdf_book_persists_fast_preflight_metadata(
         },
     )
 
-    queued = service.document_ingest_pdf_book(
+    queued = service.document_ingest(
         doc_id=doc_id,
         path=None,
         force=True,
@@ -1116,7 +1151,7 @@ def test_document_ingest_pdf_book_persists_fast_preflight_metadata(
         loaded.metadata["pdf_parser_lanes"]["diagnostic_preflight"]["parser"]
         == "pymupdf"
     )
-    cached = service.document_ingest_pdf_book(doc_id=doc_id, path=None, force=False)
+    cached = service.document_ingest(doc_id=doc_id, path=None, force=False)
     assert cached["cached"] is True
     assert cached["result"]["pdf_parse_phase_seconds"] == {
         "total": 0.5,
@@ -1124,7 +1159,7 @@ def test_document_ingest_pdf_book_persists_fast_preflight_metadata(
     }
 
 
-def test_document_ingest_pdf_book_keeps_docling_when_fast_preflight_fails(
+def test_document_ingest_keeps_docling_when_fast_preflight_fails(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     doc_id = "docpdf-fast-error"
@@ -1148,7 +1183,7 @@ def test_document_ingest_pdf_book_keeps_docling_when_fast_preflight_fails(
 
     monkeypatch.setattr("mcp_ebook_read.service.Pypdfium2PdfParser", BrokenFastParser)
 
-    queued = service.document_ingest_pdf_book(
+    queued = service.document_ingest(
         doc_id=doc_id,
         path=None,
         force=True,
@@ -1201,7 +1236,7 @@ def test_document_ingest_pdf_visual_extractors_run_concurrently(
     )
     _register_doc(service, doc_id, pdf_path, DocumentType.PDF)
 
-    queued = service.document_ingest_pdf_book(
+    queued = service.document_ingest(
         doc_id=doc_id,
         path=None,
         force=True,
@@ -1290,7 +1325,7 @@ def test_document_ingest_pdf_uses_embedded_docling_visuals_without_second_conver
     )
     _register_doc(service, doc_id, pdf_path, DocumentType.PDF)
 
-    queued = service.document_ingest_pdf_book(
+    queued = service.document_ingest(
         doc_id=doc_id,
         path=None,
         force=True,
@@ -1412,7 +1447,9 @@ def test_document_ingest_path_creates_sidecar_under_default_root_not_cwd(
     epub_bytes = b"epub"
     epub_path = book_dir / "book.epub"
     epub_path.write_bytes(epub_bytes)
-    doc_id = hashlib.sha256(epub_bytes).hexdigest()[:16]
+    doc_id = AppService._scanned_doc_id(
+        epub_path, hashlib.sha256(epub_bytes).hexdigest()
+    )
 
     epub_parser = RecordingParser(
         result=_parsed(doc_id, title="EPUB Book", method="ebooklib")
@@ -1425,7 +1462,7 @@ def test_document_ingest_path_creates_sidecar_under_default_root_not_cwd(
     )
 
     monkeypatch.chdir(cwd)
-    queued = service.document_ingest_epub_book(
+    queued = service.document_ingest(
         doc_id=None,
         path=str(epub_path),
         force=True,
@@ -1453,7 +1490,9 @@ def test_document_ingest_path_uses_explicit_root_sidecar(tmp_path: Path) -> None
     epub_bytes = b"epub"
     epub_path = book_dir / "book.epub"
     epub_path.write_bytes(epub_bytes)
-    doc_id = hashlib.sha256(epub_bytes).hexdigest()[:16]
+    doc_id = AppService._scanned_doc_id(
+        epub_path, hashlib.sha256(epub_bytes).hexdigest()
+    )
 
     service = _build_service(
         tmp_path,
@@ -1464,7 +1503,7 @@ def test_document_ingest_path_uses_explicit_root_sidecar(tmp_path: Path) -> None
         grobid=RecordingGrobid(),
     )
 
-    queued = service.document_ingest_epub_book(
+    queued = service.document_ingest(
         doc_id=None,
         path=str(epub_path),
         root=str(library_root),
@@ -1494,7 +1533,7 @@ def test_document_ingest_stage_log_uses_safe_extra_key(
     _register_doc(service, doc_id, pdf_path, DocumentType.PDF)
 
     with caplog.at_level(logging.INFO, logger="mcp_ebook_read.service"):
-        queued = service.document_ingest_pdf_book(
+        queued = service.document_ingest(
             doc_id=doc_id,
             path=None,
             force=True,
@@ -1514,159 +1553,6 @@ def test_document_ingest_stage_log_uses_safe_extra_key(
         getattr(record, "stage_message", None) == "Parsing PDF book with Docling."
         for record in stage_records
     )
-
-
-def test_document_autotune_pdf_parser_persists_profile_and_updates_parser(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    pdf_path = tmp_path / "autotune.pdf"
-    pdf_path.write_bytes(b"%PDF-1.4")
-    parser = RecordingParser(result=_parsed("doc1", title="PDF", method="docling"))
-    service = _build_service(
-        tmp_path,
-        pdf_parser=parser,
-        epub_parser=RecordingParser(
-            result=_parsed("doc2", title="EPUB", method="epub")
-        ),
-        grobid=RecordingGrobid(),
-    )
-    profile_path = tmp_path / "runtime" / "docling_tuning.json"
-    monkeypatch.setenv("PDF_DOCLING_TUNING_PROFILE_PATH", str(profile_path))
-
-    result = service.document_autotune_pdf_parser(
-        doc_id=None,
-        path=str(pdf_path),
-        sample_pages=11,
-    )
-
-    assert result["doc_id"] is None
-    assert result["path"] == str(pdf_path.resolve())
-    assert result["profile_path"] == str(profile_path)
-    assert result["selected_config"]["num_threads"] == 8
-    assert parser.performance_config.num_threads == 8
-    assert profile_path.exists()
-
-
-def test_document_autotune_pdf_parser_accepts_scanned_doc_id(tmp_path: Path) -> None:
-    pdf_path = tmp_path / "library" / "scan.pdf"
-    pdf_path.parent.mkdir(parents=True, exist_ok=True)
-    pdf_path.write_bytes(b"%PDF-1.4")
-    parser = RecordingParser(result=_parsed("doc1", title="PDF", method="docling"))
-    service = _build_service(
-        tmp_path,
-        pdf_parser=parser,
-        epub_parser=RecordingParser(
-            result=_parsed("doc2", title="EPUB", method="epub")
-        ),
-        grobid=RecordingGrobid(),
-    )
-    _register_doc(service, "doc-scan", pdf_path, DocumentType.PDF)
-
-    result = service.document_autotune_pdf_parser(
-        doc_id="doc-scan",
-        path=None,
-        sample_pages=7,
-    )
-
-    assert result["doc_id"] == "doc-scan"
-    assert result["sample_pages"] == 7
-
-
-def test_pdf_diagnose_parser_lanes_runs_non_persistent_probe(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    pdf_path = tmp_path / "diagnose.pdf"
-    pdf_path.write_bytes(b"%PDF-1.4")
-    parser = RecordingParser(result=_parsed("doc1", title="PDF", method="docling"))
-    service = _build_service(
-        tmp_path,
-        pdf_parser=parser,
-        epub_parser=RecordingParser(
-            result=_parsed("doc2", title="EPUB", method="epub")
-        ),
-        grobid=RecordingGrobid(),
-    )
-
-    from mcp_ebook_read.benchmark import parser_engines
-
-    def fake_run_parser_engine_benchmark(**kwargs: Any) -> dict[str, Any]:
-        assert kwargs["document_paths"] == [pdf_path.resolve()]
-        assert kwargs["engines"] == [
-            "pypdfium2_pdf",
-            "pymupdf_pdf",
-            "docling_raw_pdf_no_formula",
-        ]
-        assert kwargs["queries"] == ["market making"]
-        assert kwargs["timeout_seconds"] == 17
-        return {
-            "summary": {"documents_total": 1},
-            "engine_summary": {},
-            "documents": [
-                {
-                    "path": str(pdf_path.resolve()),
-                    "suffix": ".pdf",
-                    "exists": True,
-                    "status": "ok",
-                    "engines": [
-                        {
-                            "engine": "pypdfium2_pdf",
-                            "status": "ok",
-                            "seconds": 0.1,
-                            "metrics": {
-                                "normalized_text_chars": 1000,
-                                "query_replay": {"hit_rate": 1.0},
-                            },
-                        },
-                        {
-                            "engine": "pymupdf_pdf",
-                            "status": "ok",
-                            "seconds": 0.2,
-                            "metrics": {"normalized_text_chars": 990},
-                        },
-                        {
-                            "engine": "docling_raw_pdf_no_formula",
-                            "status": "ok",
-                            "seconds": 9.0,
-                            "metrics": {
-                                "normalized_text_chars": 900,
-                                "formula_markers_total": 12,
-                                "tables": 1,
-                                "figures": 2,
-                                "images": 2,
-                            },
-                        },
-                    ],
-                }
-            ],
-        }
-
-    monkeypatch.setattr(
-        parser_engines,
-        "run_parser_engine_benchmark",
-        fake_run_parser_engine_benchmark,
-    )
-
-    result = service.pdf_diagnose_parser_lanes(
-        doc_id=None,
-        path=str(pdf_path),
-        timeout_seconds=17,
-        queries=["market making"],
-    )
-
-    assert result["diagnostic_scope"] == "parser_lane_probe_no_sidecar_write"
-    assert result["path"] == str(pdf_path.resolve())
-    assert result["interpretation"]["recommended_scheme"] == {
-        "fast_lane": "pypdfium2_pdf",
-        "fidelity_lane": "docling_raw_pdf_no_formula",
-        "diagnostic_lane": "pymupdf_pdf",
-        "candidate_lane": None,
-    }
-    assert result["interpretation"]["fidelity_signals"] == {
-        "formula_markers_total": 12,
-        "tables": 1,
-        "figures": 2,
-        "images": 2,
-    }
 
 
 def test_service_close_closes_pdf_parser_once(tmp_path: Path) -> None:
@@ -1698,11 +1584,11 @@ def test_document_ingest_cached_ready_without_force(tmp_path: Path) -> None:
         epub_parser=RecordingParser(result=_parsed("x", title="X", method="ebooklib")),
         grobid=RecordingGrobid(),
     )
-    _register_doc(service, doc_id, pdf_path, DocumentType.PDF)
+    _register_doc(service, doc_id, pdf_path, DocumentType.PDF, profile=Profile.PAPER)
 
-    first = service.document_ingest_pdf_book(doc_id=doc_id, path=None, force=True)
+    first = service.document_ingest(doc_id=doc_id, path=None, force=True)
     _wait_for_ingest_job(service, doc_id=doc_id, job_id=first["job_id"])
-    second = service.document_ingest_pdf_book(doc_id=doc_id, path=None, force=False)
+    second = service.document_ingest(doc_id=doc_id, path=None, force=False)
 
     assert second["doc_id"] == doc_id
     assert second["cached"] is True
@@ -1710,7 +1596,7 @@ def test_document_ingest_cached_ready_without_force(tmp_path: Path) -> None:
     assert len(parser.calls) == 1
 
 
-def test_document_ingest_pdf_paper_merges_grobid(tmp_path: Path) -> None:
+def test_document_ingest_merges_grobid(tmp_path: Path) -> None:
     doc_id = "docpaper1"
     pdf_path = tmp_path / "paper.pdf"
     pdf_path.write_bytes(b"pdf")
@@ -1727,9 +1613,9 @@ def test_document_ingest_pdf_paper_merges_grobid(tmp_path: Path) -> None:
         epub_parser=RecordingParser(result=_parsed("x", title="X", method="ebooklib")),
         grobid=grobid,
     )
-    _register_doc(service, doc_id, pdf_path, DocumentType.PDF)
+    _register_doc(service, doc_id, pdf_path, DocumentType.PDF, profile=Profile.PAPER)
 
-    queued = service.document_ingest_pdf_paper(
+    queued = service.document_ingest(
         doc_id=doc_id,
         path=None,
         force=True,
@@ -1752,7 +1638,7 @@ def test_document_ingest_pdf_paper_merges_grobid(tmp_path: Path) -> None:
     assert [node.title for node in loaded.outline] == ["Section"]
 
 
-def test_document_ingest_pdf_paper_without_grobid_succeeds_with_diagnostic(
+def test_document_ingest_without_grobid_succeeds_with_diagnostic(
     tmp_path: Path,
 ) -> None:
     doc_id = "docpaper-no-grobid"
@@ -1813,9 +1699,9 @@ def test_document_ingest_pdf_paper_without_grobid_succeeds_with_diagnostic(
         epub_parser=RecordingParser(result=_parsed("x", title="X", method="ebooklib")),
         grobid=grobid,
     )
-    _register_doc(service, doc_id, pdf_path, DocumentType.PDF)
+    _register_doc(service, doc_id, pdf_path, DocumentType.PDF, profile=Profile.PAPER)
 
-    queued = service.document_ingest_pdf_paper(doc_id=doc_id, path=None, force=True)
+    queued = service.document_ingest(doc_id=doc_id, path=None, force=True)
     result = _wait_for_ingest_job(
         service,
         doc_id=doc_id,
@@ -1857,7 +1743,7 @@ def test_document_ingest_failure_sets_failed_status(tmp_path: Path) -> None:
     )
     _register_doc(service, doc_id, epub_path, DocumentType.EPUB)
 
-    queued = service.document_ingest_epub_book(doc_id=doc_id, path=None, force=True)
+    queued = service.document_ingest(doc_id=doc_id, path=None, force=True)
     status = _wait_for_ingest_job(service, doc_id=doc_id, job_id=queued["job_id"])
     assert status["status"] == IngestJobStatus.FAILED
     assert status["error"]["code"] == ErrorCode.INGEST_EPUB_PARSE_FAILED
@@ -1890,7 +1776,7 @@ def test_document_ingest_validation_failure_preserves_previous_sidecar(
     )
     _register_doc(service, doc_id, epub_path, DocumentType.EPUB)
 
-    first = service.document_ingest_epub_book(doc_id=doc_id, path=None, force=True)
+    first = service.document_ingest(doc_id=doc_id, path=None, force=True)
     _wait_for_ingest_job(service, doc_id=doc_id, job_id=first["job_id"])
     catalog = service._catalog_for_document_path(epub_path)
     loaded_before = catalog.get_document_by_id(doc_id)
@@ -1925,7 +1811,7 @@ def test_document_ingest_validation_failure_preserves_previous_sidecar(
 
     monkeypatch.setattr(CatalogStore, "validate_document_graph", fail_validation)
 
-    second = service.document_ingest_epub_book(doc_id=doc_id, path=None, force=True)
+    second = service.document_ingest(doc_id=doc_id, path=None, force=True)
     failed = _wait_for_ingest_job(service, doc_id=doc_id, job_id=second["job_id"])
 
     assert failed["status"] == IngestJobStatus.FAILED
@@ -1953,14 +1839,14 @@ def test_document_ingest_jobs_deduplicate_and_list_status(tmp_path: Path) -> Non
     )
     _register_doc(service, doc_id, pdf_path, DocumentType.PDF)
 
-    first = service.document_ingest_pdf_book(doc_id=doc_id, path=None, force=True)
+    first = service.document_ingest(doc_id=doc_id, path=None, force=True)
     assert first["progress"]["stage"] == IngestStage.QUEUED
     assert first["progress"]["done"] == 0
     assert first["progress"]["total"] == 6
     assert first["progress"]["current_item"]
     assert parser.started.wait(timeout=2.0)
 
-    second = service.document_ingest_pdf_book(doc_id=doc_id, path=None, force=True)
+    second = service.document_ingest(doc_id=doc_id, path=None, force=True)
     assert second["deduplicated"] is True
     assert second["job_id"] == first["job_id"]
     assert second["progress"]["total"] == 6
@@ -2027,13 +1913,13 @@ def test_document_ingest_worker_uses_queued_catalog_for_duplicate_doc_ids(
         second_path, root=second_path.parent
     )
 
-    first = service.document_ingest_pdf_book(
+    first = service.document_ingest(
         path=str(first_path.resolve()),
         doc_id=None,
         root=str(first_path.parent),
         force=True,
     )
-    second = service.document_ingest_pdf_book(
+    second = service.document_ingest(
         path=str(second_path.resolve()),
         doc_id=None,
         root=str(second_path.parent),
@@ -2065,75 +1951,6 @@ def test_document_ingest_worker_uses_queued_catalog_for_duplicate_doc_ids(
     ]
 
 
-def test_document_ingest_pdf_book_rejects_epub(tmp_path: Path) -> None:
-    doc_id = "docepub2"
-    epub_path = tmp_path / "book.epub"
-    epub_path.write_bytes(b"epub")
-
-    service = _build_service(
-        tmp_path,
-        pdf_parser=RecordingParser(result=_parsed("x", title="X", method="docling")),
-        epub_parser=RecordingParser(result=_parsed("x", title="X", method="ebooklib")),
-        grobid=RecordingGrobid(),
-    )
-    _register_doc(service, doc_id, epub_path, DocumentType.EPUB)
-
-    with pytest.raises(AppError) as exc:
-        service.document_ingest_pdf_book(doc_id=doc_id, path=None, force=True)
-
-    assert exc.value.code == ErrorCode.INGEST_UNSUPPORTED_TYPE
-    loaded_catalog = service._catalog_for_document_path(epub_path)
-    loaded = loaded_catalog.get_document_by_id(doc_id)
-    assert loaded is not None
-    assert loaded.status == DocumentStatus.DISCOVERED
-
-
-def test_document_ingest_epub_book_rejects_pdf(tmp_path: Path) -> None:
-    doc_id = "docpdf4"
-    pdf_path = tmp_path / "book.pdf"
-    pdf_path.write_bytes(b"pdf")
-
-    service = _build_service(
-        tmp_path,
-        pdf_parser=RecordingParser(result=_parsed("x", title="X", method="docling")),
-        epub_parser=RecordingParser(result=_parsed("x", title="X", method="ebooklib")),
-        grobid=RecordingGrobid(),
-    )
-    _register_doc(service, doc_id, pdf_path, DocumentType.PDF)
-
-    with pytest.raises(AppError) as exc:
-        service.document_ingest_epub_book(doc_id=doc_id, path=None, force=True)
-
-    assert exc.value.code == ErrorCode.INGEST_UNSUPPORTED_TYPE
-    loaded_catalog = service._catalog_for_document_path(pdf_path)
-    loaded = loaded_catalog.get_document_by_id(doc_id)
-    assert loaded is not None
-    assert loaded.status == DocumentStatus.DISCOVERED
-
-
-def test_document_ingest_pdf_paper_rejects_epub(tmp_path: Path) -> None:
-    doc_id = "docepub2"
-    epub_path = tmp_path / "book.epub"
-    epub_path.write_bytes(b"epub")
-
-    service = _build_service(
-        tmp_path,
-        pdf_parser=RecordingParser(result=_parsed("x", title="X", method="docling")),
-        epub_parser=RecordingParser(result=_parsed("x", title="X", method="ebooklib")),
-        grobid=RecordingGrobid(),
-    )
-    _register_doc(service, doc_id, epub_path, DocumentType.EPUB)
-
-    with pytest.raises(AppError) as exc:
-        service.document_ingest_pdf_paper(doc_id=doc_id, path=None, force=True)
-
-    assert exc.value.code == ErrorCode.INGEST_UNSUPPORTED_TYPE
-    loaded_catalog = service._catalog_for_document_path(epub_path)
-    loaded = loaded_catalog.get_document_by_id(doc_id)
-    assert loaded is not None
-    assert loaded.status == DocumentStatus.DISCOVERED
-
-
 def test_search_and_outline_and_render(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2150,7 +1967,7 @@ def test_search_and_outline_and_render(
         grobid=RecordingGrobid(),
     )
     _register_doc(service, doc_id, pdf_path, DocumentType.PDF)
-    queued = service.document_ingest_pdf_book(doc_id=doc_id, path=None, force=True)
+    queued = service.document_ingest(doc_id=doc_id, path=None, force=True)
     _wait_for_ingest_job(service, doc_id=doc_id, job_id=queued["job_id"])
 
     search_data = service.search("text-0", [doc_id], 5)
@@ -2211,7 +2028,7 @@ def test_stale_ready_document_reingests_instead_of_cached_reuse(
     assert outline["pipeline_status"]["is_stale"] is True
     assert outline["pipeline_status"]["reason"] == "missing_pipeline_metadata"
 
-    queued = service.document_ingest_pdf_book(doc_id=doc_id, path=None, force=False)
+    queued = service.document_ingest(doc_id=doc_id, path=None, force=False)
     assert queued["cached"] is False
     completed = _wait_for_ingest_job(
         service,
@@ -2237,7 +2054,7 @@ def test_source_file_change_marks_ready_document_stale_and_reingests(
         grobid=RecordingGrobid(),
     )
     _register_doc(service, doc_id, pdf_path, DocumentType.PDF)
-    queued = service.document_ingest_pdf_book(doc_id=doc_id, path=None, force=True)
+    queued = service.document_ingest(doc_id=doc_id, path=None, force=True)
     _wait_for_ingest_job(service, doc_id=doc_id, job_id=queued["job_id"])
     assert len(parser.calls) == 1
 
@@ -2249,7 +2066,7 @@ def test_source_file_change_marks_ready_document_stale_and_reingests(
     assert outline["pipeline_status"]["reason"] == "source_file_changed"
     assert outline["pipeline_status"]["freshness"] == "needs_reingest"
 
-    reingest = service.document_ingest_pdf_book(doc_id=doc_id, path=None, force=False)
+    reingest = service.document_ingest(doc_id=doc_id, path=None, force=False)
     assert reingest["cached"] is False
     completed = _wait_for_ingest_job(
         service,
@@ -2308,7 +2125,7 @@ def test_search_uses_local_fts_without_external_vector_backend(tmp_path: Path) -
         grobid=RecordingGrobid(),
     )
     _register_doc(service, doc_id, pdf_path, DocumentType.PDF)
-    queued = service.document_ingest_pdf_book(doc_id=doc_id, path=None, force=True)
+    queued = service.document_ingest(doc_id=doc_id, path=None, force=True)
     _wait_for_ingest_job(service, doc_id=doc_id, job_id=queued["job_id"])
 
     chunk_search = service.search("exactterm42", [doc_id], 5)
@@ -2361,7 +2178,7 @@ def test_document_explore_and_node_use_document_graph(tmp_path: Path) -> None:
         grobid=RecordingGrobid(),
     )
     _register_doc(service, doc_id, pdf_path, DocumentType.PDF)
-    queued = service.document_ingest_pdf_book(doc_id=doc_id, path=None, force=True)
+    queued = service.document_ingest(doc_id=doc_id, path=None, force=True)
     _wait_for_ingest_job(service, doc_id=doc_id, job_id=queued["job_id"])
 
     explored = service.document_explore(
@@ -2456,8 +2273,8 @@ def test_library_explore_searches_root_sidecar(tmp_path: Path) -> None:
     )
     _register_doc(service, pdf_doc_id, pdf_path, DocumentType.PDF, root=root)
     _register_doc(service, epub_doc_id, epub_path, DocumentType.EPUB, root=root)
-    pdf_job = service.document_ingest_pdf_book(doc_id=pdf_doc_id, force=True)
-    epub_job = service.document_ingest_epub_book(doc_id=epub_doc_id, force=True)
+    pdf_job = service.document_ingest(doc_id=pdf_doc_id, force=True)
+    epub_job = service.document_ingest(doc_id=epub_doc_id, force=True)
     _wait_for_ingest_job(service, doc_id=pdf_doc_id, job_id=pdf_job["job_id"])
     _wait_for_ingest_job(service, doc_id=epub_doc_id, job_id=epub_job["job_id"])
 
@@ -2542,8 +2359,8 @@ def test_document_explore_and_node_surface_references_and_citations(
             }
         ),
     )
-    _register_doc(service, doc_id, pdf_path, DocumentType.PDF)
-    queued = service.document_ingest_pdf_paper(doc_id=doc_id, path=None, force=True)
+    _register_doc(service, doc_id, pdf_path, DocumentType.PDF, profile=Profile.PAPER)
+    queued = service.document_ingest(doc_id=doc_id, path=None, force=True)
     _wait_for_ingest_job(service, doc_id=doc_id, job_id=queued["job_id"])
 
     explored = service.document_explore(
@@ -2606,7 +2423,7 @@ def test_document_explore_reports_truncation_and_ambiguity(tmp_path: Path) -> No
         grobid=RecordingGrobid(),
     )
     _register_doc(service, doc_id, pdf_path, DocumentType.PDF)
-    queued = service.document_ingest_pdf_book(doc_id=doc_id, path=None, force=True)
+    queued = service.document_ingest(doc_id=doc_id, path=None, force=True)
     _wait_for_ingest_job(service, doc_id=doc_id, job_id=queued["job_id"])
 
     explored = service.document_explore(
@@ -2655,7 +2472,7 @@ def test_document_node_can_read_artifact_node(tmp_path: Path) -> None:
         grobid=RecordingGrobid(),
     )
     _register_doc(service, doc_id, epub_path, DocumentType.EPUB)
-    queued = service.document_ingest_epub_book(doc_id=doc_id, path=None, force=True)
+    queued = service.document_ingest(doc_id=doc_id, path=None, force=True)
     _wait_for_ingest_job(service, doc_id=doc_id, job_id=queued["job_id"])
     _doc, catalog = service._require_doc(
         doc_id,
@@ -2707,7 +2524,7 @@ def test_epub_ingest_persists_raw_artifacts_as_graph_nodes(tmp_path: Path) -> No
         grobid=RecordingGrobid(),
     )
     _register_doc(service, doc_id, epub_path, DocumentType.EPUB)
-    queued = service.document_ingest_epub_book(doc_id=doc_id, path=None, force=True)
+    queued = service.document_ingest(doc_id=doc_id, path=None, force=True)
     _wait_for_ingest_job(service, doc_id=doc_id, job_id=queued["job_id"])
     _doc, catalog = service._require_doc(
         doc_id,
@@ -2743,7 +2560,7 @@ def test_reading_session_capture_export_and_replay(
         grobid=RecordingGrobid(),
     )
     _register_doc(service, doc_id, pdf_path, DocumentType.PDF)
-    ingest = service.document_ingest_pdf_book(doc_id=doc_id, path=None, force=True)
+    ingest = service.document_ingest(doc_id=doc_id, path=None, force=True)
     _wait_for_ingest_job(service, doc_id=doc_id, job_id=ingest["job_id"])
 
     monkeypatch.setenv("MCP_EBOOK_CAPTURE_READING_SESSION", "1")
@@ -3222,7 +3039,7 @@ def test_document_ingest_epub_persists_images_and_read(tmp_path: Path) -> None:
         grobid=RecordingGrobid(),
     )
     _register_doc(service, doc_id, epub_path, DocumentType.EPUB)
-    queued = service.document_ingest_epub_book(doc_id=doc_id, path=None, force=True)
+    queued = service.document_ingest(doc_id=doc_id, path=None, force=True)
     result = _wait_for_ingest_job(
         service,
         doc_id=doc_id,
@@ -3625,7 +3442,7 @@ def test_pdf_images_are_extracted_eagerly_during_ingest(tmp_path: Path) -> None:
     )
     _register_doc(service, doc_id, pdf_path, DocumentType.PDF)
 
-    queued = service.document_ingest_pdf_book(doc_id=doc_id, path=None, force=True)
+    queued = service.document_ingest(doc_id=doc_id, path=None, force=True)
     ingest = _wait_for_ingest_job(
         service,
         doc_id=doc_id,
@@ -3649,9 +3466,7 @@ def test_pdf_images_are_extracted_eagerly_during_ingest(tmp_path: Path) -> None:
     with pytest.raises(AppError) as missing_evidence_exc:
         service.pdf_read_image(doc_id=doc_id, image_id="eager-img-1")
     assert missing_evidence_exc.value.code == ErrorCode.READ_IMAGE_NOT_FOUND
-    assert (
-        "Re-run document_ingest_pdf_book" in missing_evidence_exc.value.details["hint"]
-    )
+    assert "Re-run document_ingest" in missing_evidence_exc.value.details["hint"]
     assert len(extractor.calls) == 1
 
     catalog = service._catalog_for_document_path(pdf_path)
@@ -3862,7 +3677,7 @@ def test_pdf_visuals_are_extracted_eagerly_during_ingest(tmp_path: Path) -> None
     )
     _register_doc(service, doc_id, pdf_path, DocumentType.PDF)
 
-    queued = service.document_ingest_pdf_book(doc_id=doc_id, path=None, force=True)
+    queued = service.document_ingest(doc_id=doc_id, path=None, force=True)
     ingest = _wait_for_ingest_job(
         service,
         doc_id=doc_id,
@@ -3898,20 +3713,14 @@ def test_pdf_visuals_are_extracted_eagerly_during_ingest(tmp_path: Path) -> None
     with pytest.raises(AppError) as missing_table_evidence_exc:
         service.pdf_read_table(doc_id=doc_id, table_id="eager-table-1")
     assert missing_table_evidence_exc.value.code == ErrorCode.READ_TABLE_NOT_FOUND
-    assert (
-        "Re-run document_ingest_pdf_book"
-        in missing_table_evidence_exc.value.details["hint"]
-    )
+    assert "Re-run document_ingest" in missing_table_evidence_exc.value.details["hint"]
     assert len(visual_extractor.calls) == 1
 
     Path(figure_read["figure"]["image_path"]).unlink()
     with pytest.raises(AppError) as missing_figure_evidence_exc:
         service.pdf_read_figure(doc_id=doc_id, figure_id="eager-figure-1")
     assert missing_figure_evidence_exc.value.code == ErrorCode.READ_FIGURE_NOT_FOUND
-    assert (
-        "Re-run document_ingest_pdf_book"
-        in missing_figure_evidence_exc.value.details["hint"]
-    )
+    assert "Re-run document_ingest" in missing_figure_evidence_exc.value.details["hint"]
     assert len(visual_extractor.calls) == 1
 
     catalog = service._catalog_for_document_path(pdf_path)
@@ -3997,10 +3806,10 @@ def test_pdf_book_formula_tools_list_and_read(
         grobid=RecordingGrobid(),
     )
     _register_doc(service, doc_id, pdf_path, DocumentType.PDF)
-    queued = service.document_ingest_pdf_book(doc_id=doc_id, path=None, force=True)
+    queued = service.document_ingest(doc_id=doc_id, path=None, force=True)
     _wait_for_ingest_job(service, doc_id=doc_id, job_id=queued["job_id"])
 
-    listed = service.pdf_book_list_formulas(
+    listed = service.pdf_list_formulas(
         doc_id=doc_id, node_id=None, limit=20, status=None
     )
     assert listed["formulas_count"] == 1
@@ -4023,7 +3832,7 @@ def test_pdf_book_formula_tools_list_and_read(
         "mcp_ebook_read.service.render_pdf_region",
         fake_render_region,
     )
-    read = service.pdf_book_read_formula(doc_id=doc_id, formula_id="f-book-1")
+    read = service.pdf_read_formula(doc_id=doc_id, formula_id="f-book-1")
     assert read["formula"]["latex"] == r"\frac{a}{b}"
     assert read["evidence"] is not None
     assert read["evidence"]["type"] == "formula_region"
@@ -4087,11 +3896,11 @@ def test_pdf_paper_formula_tools_filter_by_node_and_status(tmp_path: Path) -> No
         epub_parser=RecordingParser(result=_parsed("x", title="X", method="ebooklib")),
         grobid=RecordingGrobid(metadata={"paper_title": "Formula Paper"}),
     )
-    _register_doc(service, doc_id, pdf_path, DocumentType.PDF)
-    queued = service.document_ingest_pdf_paper(doc_id=doc_id, path=None, force=True)
+    _register_doc(service, doc_id, pdf_path, DocumentType.PDF, profile=Profile.PAPER)
+    queued = service.document_ingest(doc_id=doc_id, path=None, force=True)
     _wait_for_ingest_job(service, doc_id=doc_id, job_id=queued["job_id"])
 
-    method_only = service.pdf_paper_list_formulas(
+    method_only = service.pdf_list_formulas(
         doc_id=doc_id,
         node_id="toc-method",
         limit=20,
@@ -4099,47 +3908,6 @@ def test_pdf_paper_formula_tools_filter_by_node_and_status(tmp_path: Path) -> No
     )
     assert method_only["formulas_count"] == 1
     assert method_only["formulas"][0]["formula_id"] == "f-paper-2"
-
-
-def test_pdf_formula_tools_reject_profile_mismatch(tmp_path: Path) -> None:
-    doc_id = "doc-pdf-formulas-mismatch"
-    pdf_path = tmp_path / "formula_mismatch.pdf"
-    pdf_path.write_bytes(b"pdf")
-
-    service = _build_service(
-        tmp_path,
-        pdf_parser=RecordingParser(
-            result=_parsed(
-                doc_id,
-                title="Formula Mismatch",
-                method="docling",
-                formulas=[
-                    _formula(
-                        doc_id=doc_id,
-                        formula_id="f-mismatch-1",
-                        chunk_id="c0",
-                        page=1,
-                        bbox=[10.0, 20.0, 120.0, 80.0],
-                        latex="x",
-                    )
-                ],
-            )
-        ),
-        epub_parser=RecordingParser(result=_parsed("x", title="X", method="ebooklib")),
-        grobid=RecordingGrobid(),
-    )
-    _register_doc(service, doc_id, pdf_path, DocumentType.PDF)
-    queued = service.document_ingest_pdf_book(doc_id=doc_id, path=None, force=True)
-    _wait_for_ingest_job(service, doc_id=doc_id, job_id=queued["job_id"])
-
-    with pytest.raises(AppError) as exc:
-        service.pdf_paper_list_formulas(
-            doc_id=doc_id,
-            node_id=None,
-            limit=20,
-            status=None,
-        )
-    assert exc.value.code == ErrorCode.INGEST_UNSUPPORTED_TYPE
 
 
 def test_storage_delete_document_removes_catalog_and_artifacts(
@@ -4158,7 +3926,7 @@ def test_storage_delete_document_removes_catalog_and_artifacts(
         grobid=RecordingGrobid(),
     )
     _register_doc(service, doc_id, pdf_path, DocumentType.PDF)
-    queued = service.document_ingest_pdf_book(doc_id=doc_id, path=None, force=True)
+    queued = service.document_ingest(doc_id=doc_id, path=None, force=True)
     _wait_for_ingest_job(service, doc_id=doc_id, job_id=queued["job_id"])
 
     catalog = service._catalog_for_document_path(pdf_path)
@@ -4248,7 +4016,7 @@ def test_doc_id_tools_require_discovery_after_restart(tmp_path: Path) -> None:
             )
         ],
     )
-    queued = service.document_ingest_pdf_book(doc_id=doc_id, path=None, force=True)
+    queued = service.document_ingest(doc_id=doc_id, path=None, force=True)
     _wait_for_ingest_job(service, doc_id=doc_id, job_id=queued["job_id"])
     catalog = service._catalog_for_document_path(pdf_path)
     chunk = catalog.list_chunks(doc_id)[0]
@@ -4295,7 +4063,7 @@ def test_doc_id_tools_require_discovery_after_restart(tmp_path: Path) -> None:
     )
     assert "text-0" in read["content"]
 
-    formulas = restarted.pdf_book_list_formulas(
+    formulas = restarted.pdf_list_formulas(
         doc_id=doc_id,
         node_id=None,
         limit=20,

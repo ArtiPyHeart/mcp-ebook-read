@@ -883,7 +883,7 @@ class DoclingPdfParser:
         if path.suffix.lower() != ".pdf":
             raise AppError(
                 ErrorCode.INGEST_UNSUPPORTED_TYPE,
-                "document_autotune_pdf_parser only supports PDF documents",
+                "Docling autotune only supports PDF documents",
                 details={"path": str(path)},
             )
 

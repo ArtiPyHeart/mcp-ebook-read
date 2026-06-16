@@ -61,7 +61,6 @@ from mcp_ebook_read.schema.models import (
     Profile,
     PdfTableRecord,
     PdfParserPerformanceConfig,
-    PdfParserTuningProfile,
 )
 from mcp_ebook_read.store.catalog import CatalogStore
 
@@ -288,51 +287,6 @@ class AppService:
             )
         return batch_size
 
-    @staticmethod
-    def _pdf_tuning_profile_path() -> Path:
-        override = os.environ.get("PDF_DOCLING_TUNING_PROFILE_PATH")
-        if override and override.strip():
-            return Path(override).expanduser()
-        if sys.platform == "darwin":
-            return (
-                Path.home()
-                / "Library"
-                / "Caches"
-                / "mcp-ebook-read"
-                / "docling_pdf_tuning.json"
-            )
-        xdg_cache_home = os.environ.get("XDG_CACHE_HOME")
-        if xdg_cache_home and xdg_cache_home.strip():
-            cache_root = Path(xdg_cache_home).expanduser()
-        else:
-            cache_root = Path.home() / ".cache"
-        return cache_root / "mcp-ebook-read" / "docling_pdf_tuning.json"
-
-    @classmethod
-    def _load_pdf_tuning_profile(cls) -> PdfParserTuningProfile | None:
-        profile_path = cls._pdf_tuning_profile_path()
-        if not profile_path.exists():
-            return None
-        try:
-            return PdfParserTuningProfile.model_validate_json(
-                profile_path.read_text(encoding="utf-8")
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                f"pdf_docling_tuning_profile_invalid path={profile_path} error={exc}"
-            )
-            return None
-
-    @classmethod
-    def _write_pdf_tuning_profile(cls, profile: PdfParserTuningProfile) -> Path:
-        profile_path = cls._pdf_tuning_profile_path()
-        profile_path.parent.mkdir(parents=True, exist_ok=True)
-        profile_path.write_text(
-            profile.model_dump_json(indent=2),
-            encoding="utf-8",
-        )
-        return profile_path
-
     @classmethod
     def _resolve_positive_int_env(
         cls,
@@ -384,12 +338,7 @@ class AppService:
 
     @classmethod
     def _resolve_docling_performance_config(cls) -> PdfParserPerformanceConfig:
-        tuned_profile = cls._load_pdf_tuning_profile()
-        base = (
-            tuned_profile.selected_config
-            if tuned_profile is not None
-            else cls._auto_docling_performance_config()
-        )
+        base = cls._auto_docling_performance_config()
         batch_size = cls._resolve_positive_int_env(
             env_name="PDF_DOCLING_BATCH_SIZE",
             default=base.ocr_batch_size,
@@ -705,7 +654,7 @@ class AppService:
                 return doc, catalog
 
             sha256 = self._compute_sha256(resolved_path)
-            resolved_doc_id = sha256[:16]
+            resolved_doc_id = self._scanned_doc_id(resolved_path, sha256)
             if doc_id and doc_id != resolved_doc_id:
                 raise AppError(
                     ErrorCode.INGEST_DOC_NOT_FOUND,
@@ -722,6 +671,7 @@ class AppService:
                 type=doc_type,
                 sha256=sha256,
                 mtime=resolved_path.stat().st_mtime,
+                profile=self._infer_profile_from_path(resolved_path, doc_type),
             )
             catalog.upsert_scanned_document(doc)
             self._bind_doc_catalog(doc.doc_id, catalog)
@@ -802,15 +752,6 @@ class AppService:
             )
         return Path(doc.path).expanduser().resolve(), doc.doc_id
 
-    def _resolve_pdf_path_for_autotune(
-        self, doc_id: str | None, path: str | None
-    ) -> tuple[Path, str | None]:
-        return self._resolve_pdf_path_for_operation(
-            doc_id,
-            path,
-            operation_name="document_autotune_pdf_parser",
-        )
-
     def _doc_type_from_path(self, path: Path) -> DocumentType:
         suffix = path.suffix.lower()
         if suffix == ".pdf":
@@ -821,6 +762,14 @@ class AppService:
             ErrorCode.INGEST_UNSUPPORTED_TYPE,
             f"Unsupported file extension: {path.suffix}",
         )
+
+    @staticmethod
+    def _infer_profile_from_path(path: Path, doc_type: DocumentType) -> Profile:
+        if doc_type == DocumentType.PDF:
+            parts = {part.lower() for part in path.resolve().parts}
+            if "papers" in parts or "paper" in parts:
+                return Profile.PAPER
+        return Profile.BOOK
 
     def _compute_sha256(self, path: Path) -> str:
         h = hashlib.sha256()
@@ -857,6 +806,7 @@ class AppService:
             "path": abs_path,
             "path_obj": path,
             "type": file_type,
+            "profile": self._infer_profile_from_path(path, file_type),
             "sha256": sha256,
             "mtime": path.stat().st_mtime,
         }
@@ -1063,11 +1013,11 @@ class AppService:
 
     def _reingest_call(self, doc: DocumentRecord) -> dict[str, Any]:
         if doc.type == DocumentType.EPUB:
-            tool_name = "document_ingest_epub_book"
+            tool_name = "document_ingest"
         elif doc.profile == Profile.PAPER:
-            tool_name = "document_ingest_pdf_paper"
+            tool_name = "document_ingest"
         else:
-            tool_name = "document_ingest_pdf_book"
+            tool_name = "document_ingest"
         return {
             "tool": tool_name,
             "args": {"doc_id": doc.doc_id, "force": True},
@@ -2069,6 +2019,7 @@ class AppService:
                     doc_id=str(scanned["doc_id"]),
                     path=abs_path,
                     type=scanned["type"],
+                    profile=scanned["profile"],
                     sha256=str(scanned["sha256"]),
                     mtime=float(scanned["mtime"]),
                 )
@@ -2080,6 +2031,7 @@ class AppService:
                     "sha256": doc.sha256,
                     "mtime": doc.mtime,
                     "type": doc.type,
+                    "profile": doc.profile,
                 }
                 if state == "added":
                     added.append(payload)
@@ -3528,170 +3480,7 @@ class AppService:
             )
             raise
 
-    def document_autotune_pdf_parser(
-        self,
-        *,
-        doc_id: str | None,
-        path: str | None,
-        sample_pages: int = 20,
-    ) -> dict[str, Any]:
-        resolved_path, resolved_doc_id = self._resolve_pdf_path_for_autotune(
-            doc_id, path
-        )
-        profile = self.pdf_parser.autotune(
-            pdf_path=str(resolved_path),
-            sample_pages=sample_pages,
-            total_memory_bytes=self._detect_total_memory_bytes(),
-        )
-        profile_path = self._write_pdf_tuning_profile(profile)
-        self.pdf_parser.set_performance_config(profile.selected_config)
-        logger.info(
-            "pdf_docling_autotune_applied "
-            f"path={resolved_path} profile_path={profile_path} "
-            f"threads={profile.selected_config.num_threads} "
-            f"batch={profile.selected_config.ocr_batch_size}"
-        )
-        return {
-            "doc_id": resolved_doc_id,
-            "path": str(resolved_path),
-            "profile_path": str(profile_path),
-            "selected_config": profile.selected_config.model_dump(mode="json"),
-            "benchmarks": [row.model_dump(mode="json") for row in profile.benchmarks],
-            "sample_pages": profile.sample_pages,
-            "cpu_count": profile.cpu_count,
-            "total_memory_bytes": profile.total_memory_bytes,
-        }
-
-    def _pdf_parser_lane_interpretation(
-        self, benchmark: dict[str, Any]
-    ) -> dict[str, Any]:
-        documents = list(benchmark.get("documents") or [])
-        document = documents[0] if documents else {}
-        rows = {
-            str(row.get("engine")): row
-            for row in document.get("engines", [])
-            if isinstance(row, dict)
-        }
-
-        def row_summary(engine: str) -> dict[str, Any]:
-            row = rows.get(engine) or {}
-            metrics = (
-                row.get("metrics", {}) if isinstance(row.get("metrics"), dict) else {}
-            )
-            return {
-                "status": row.get("status", "not_run"),
-                "seconds": row.get("seconds"),
-                "normalized_text_chars": metrics.get("normalized_text_chars"),
-                "query_hit_rate": (metrics.get("query_replay") or {}).get("hit_rate")
-                if isinstance(metrics.get("query_replay"), dict)
-                else None,
-                "formula_markers_total": metrics.get("formula_markers_total"),
-                "tables": metrics.get("tables"),
-                "figures": metrics.get("figures"),
-                "images": metrics.get("images"),
-                "stderr_chars": (row.get("engine_output") or {}).get("stderr_chars", 0)
-                if isinstance(row.get("engine_output"), dict)
-                else 0,
-            }
-
-        pypdfium2 = row_summary("pypdfium2_pdf")
-        docling = row_summary("docling_raw_pdf_no_formula")
-        pymupdf = row_summary("pymupdf_pdf")
-        pdf_oxide = row_summary("pdf_oxide_pdf")
-
-        fidelity_signals = {
-            "formula_markers_total": docling.get("formula_markers_total") or 0,
-            "tables": docling.get("tables") or 0,
-            "figures": docling.get("figures") or 0,
-            "images": docling.get("images") or 0,
-        }
-        high_fidelity_available = docling["status"] == "ok" and any(
-            int(value or 0) > 0 for value in fidelity_signals.values()
-        )
-        fast_text_available = pypdfium2["status"] == "ok"
-        warnings: list[str] = []
-        if pdf_oxide["stderr_chars"]:
-            warnings.append(
-                "pdf_oxide emitted stderr warnings; do not promote it to default "
-                "without inspecting warning semantics."
-            )
-        if docling["status"] in {"timeout", "error"}:
-            warnings.append(
-                "Docling fidelity probe did not complete; keep high-fidelity parsing "
-                "isolated and tune timeout/resources before long ingest runs."
-            )
-
-        return {
-            "recommended_scheme": {
-                "fast_lane": "pypdfium2_pdf" if fast_text_available else None,
-                "fidelity_lane": "docling_raw_pdf_no_formula"
-                if high_fidelity_available or docling["status"] == "ok"
-                else None,
-                "diagnostic_lane": "pymupdf_pdf" if pymupdf["status"] == "ok" else None,
-                "candidate_lane": "pdf_oxide_pdf"
-                if pdf_oxide["status"] == "ok"
-                else None,
-            },
-            "lane_summaries": {
-                "pypdfium2_pdf": pypdfium2,
-                "docling_raw_pdf_no_formula": docling,
-                "pymupdf_pdf": pymupdf,
-                "pdf_oxide_pdf": pdf_oxide,
-            },
-            "fidelity_signals": fidelity_signals,
-            "judgment": (
-                "Use pypdfium2 for fast PDF discovery/preview/local search and "
-                "Docling for formulas, tables, figures, images, and layout-aware "
-                "high-fidelity reading evidence."
-            ),
-            "warnings": warnings,
-        }
-
-    def pdf_diagnose_parser_lanes(
-        self,
-        *,
-        doc_id: str | None,
-        path: str | None,
-        include_fidelity: bool = True,
-        include_pymupdf: bool = True,
-        include_pdf_oxide: bool = False,
-        timeout_seconds: int = 240,
-        queries: list[str] | None = None,
-    ) -> dict[str, Any]:
-        resolved_path, resolved_doc_id = self._resolve_pdf_path_for_operation(
-            doc_id,
-            path,
-            operation_name="pdf_diagnose_parser_lanes",
-        )
-        engines = ["pypdfium2_pdf"]
-        if include_pymupdf:
-            engines.append("pymupdf_pdf")
-        if include_fidelity:
-            engines.append("docling_raw_pdf_no_formula")
-        if include_pdf_oxide:
-            engines.append("pdf_oxide_pdf")
-
-        from mcp_ebook_read.benchmark.parser_engines import (
-            DEFAULT_READING_QUERIES,
-            run_parser_engine_benchmark,
-        )
-
-        benchmark = run_parser_engine_benchmark(
-            document_paths=[resolved_path],
-            engines=engines,
-            queries=list(DEFAULT_READING_QUERIES if queries is None else queries),
-            timeout_seconds=max(1, int(timeout_seconds)),
-        )
-        return {
-            "doc_id": resolved_doc_id,
-            "path": str(resolved_path),
-            "engines": engines,
-            "diagnostic_scope": "parser_lane_probe_no_sidecar_write",
-            "benchmark": benchmark,
-            "interpretation": self._pdf_parser_lane_interpretation(benchmark),
-        }
-
-    def document_ingest_pdf_book(
+    def document_ingest(
         self,
         *,
         doc_id: str | None = None,
@@ -3700,13 +3489,25 @@ class AppService:
         force: bool = False,
     ) -> dict[str, Any]:
         doc, catalog = self._resolve_doc(doc_id, path, root)
+        if doc.type == DocumentType.EPUB:
+            profile = Profile.BOOK
+            expected_doc_type = DocumentType.EPUB
+        elif doc.type == DocumentType.PDF:
+            profile = doc.profile
+            expected_doc_type = DocumentType.PDF
+        else:
+            raise AppError(
+                ErrorCode.INGEST_UNSUPPORTED_TYPE,
+                f"Unsupported document type: {doc.type}",
+                details={"doc_id": doc.doc_id, "path": doc.path, "type": doc.type},
+            )
         return self._submit_ingest_job(
             doc=doc,
             catalog=catalog,
-            profile=Profile.BOOK,
-            expected_doc_type=DocumentType.PDF,
+            profile=profile,
+            expected_doc_type=expected_doc_type,
             force=force,
-            ingest_mode="document_ingest_pdf_book",
+            ingest_mode="document_ingest",
         )
 
     def document_ingest_status(
@@ -3745,42 +3546,6 @@ class AppService:
             "doc_id": doc.doc_id,
             "jobs": [self._serialize_ingest_job(job) for job in jobs],
         }
-
-    def document_ingest_epub_book(
-        self,
-        *,
-        doc_id: str | None = None,
-        path: str | None = None,
-        root: str | None = None,
-        force: bool = False,
-    ) -> dict[str, Any]:
-        doc, catalog = self._resolve_doc(doc_id, path, root)
-        return self._submit_ingest_job(
-            doc=doc,
-            catalog=catalog,
-            profile=Profile.BOOK,
-            expected_doc_type=DocumentType.EPUB,
-            force=force,
-            ingest_mode="document_ingest_epub_book",
-        )
-
-    def document_ingest_pdf_paper(
-        self,
-        *,
-        doc_id: str | None = None,
-        path: str | None = None,
-        root: str | None = None,
-        force: bool = False,
-    ) -> dict[str, Any]:
-        doc, catalog = self._resolve_doc(doc_id, path, root)
-        return self._submit_ingest_job(
-            doc=doc,
-            catalog=catalog,
-            profile=Profile.PAPER,
-            expected_doc_type=DocumentType.PDF,
-            force=force,
-            ingest_mode="document_ingest_pdf_paper",
-        )
 
     def _page_ranges_overlap(
         self,
@@ -4470,12 +4235,12 @@ class AppService:
             formula_id = locator.get("formula_id")
             if formula_id:
                 if doc.profile == Profile.PAPER:
-                    read_result = self.pdf_paper_read_formula(
+                    read_result = self.pdf_read_formula(
                         doc_id=doc_id,
                         formula_id=formula_id,
                     )
                 else:
-                    read_result = self.pdf_book_read_formula(
+                    read_result = self.pdf_read_formula(
                         doc_id=doc_id,
                         formula_id=formula_id,
                     )
@@ -4689,23 +4454,6 @@ class AppService:
                     "doc_id": doc_id,
                     "doc_type": doc.type,
                     "supported_doc_types": [DocumentType.PDF],
-                },
-            )
-        return doc, catalog
-
-    def _ensure_pdf_profile_doc(
-        self, doc_id: str, *, expected_profile: Profile
-    ) -> tuple[DocumentRecord, CatalogStore]:
-        doc, catalog = self._ensure_pdf_doc(doc_id)
-        if doc.profile != expected_profile:
-            raise AppError(
-                ErrorCode.INGEST_UNSUPPORTED_TYPE,
-                "The requested formula tool does not match the ingested PDF profile.",
-                details={
-                    "doc_id": doc_id,
-                    "doc_profile": doc.profile,
-                    "required_profile": expected_profile,
-                    "hint": "Use the matching document_ingest_pdf_book or document_ingest_pdf_paper before formula tools.",
                 },
             )
         return doc, catalog
@@ -5201,7 +4949,7 @@ class AppService:
                     "path": image.file_path,
                     "hint": (
                         "PDF image extraction is eager and read-only at read time. "
-                        "Re-run document_ingest_pdf_book or document_ingest_pdf_paper "
+                        "Re-run document_ingest "
                         "with force=true to regenerate sidecar evidence."
                     ),
                 },
@@ -5356,7 +5104,7 @@ class AppService:
                     "path": table.file_path,
                     "hint": (
                         "PDF table extraction is eager and read-only at read time. "
-                        "Re-run document_ingest_pdf_book or document_ingest_pdf_paper "
+                        "Re-run document_ingest "
                         "with force=true to regenerate sidecar evidence."
                     ),
                 },
@@ -5491,7 +5239,7 @@ class AppService:
                     "path": figure.file_path,
                     "hint": (
                         "PDF figure extraction is eager and read-only at read time. "
-                        "Re-run document_ingest_pdf_book or document_ingest_pdf_paper "
+                        "Re-run document_ingest "
                         "with force=true to regenerate sidecar evidence."
                     ),
                 },
@@ -5575,11 +5323,8 @@ class AppService:
         node_id: str | None,
         limit: int,
         status: str | None,
-        expected_profile: Profile,
     ) -> dict[str, Any]:
-        doc, catalog = self._ensure_pdf_profile_doc(
-            doc_id, expected_profile=expected_profile
-        )
+        doc, catalog = self._ensure_pdf_doc(doc_id)
         formulas = catalog.list_formulas(doc_id)
 
         normalized_status = (status or "").strip().lower()
@@ -5619,7 +5364,7 @@ class AppService:
 
         return {
             "doc_title": doc.title,
-            "profile": expected_profile,
+            "profile": doc.profile,
             "node": node_payload,
             "formulas": [self._formula_payload(item) for item in formulas],
             "formulas_count": len(formulas),
@@ -5631,11 +5376,8 @@ class AppService:
         *,
         doc_id: str,
         formula_id: str,
-        expected_profile: Profile,
     ) -> dict[str, Any]:
-        doc, catalog = self._ensure_pdf_profile_doc(
-            doc_id, expected_profile=expected_profile
-        )
+        doc, catalog = self._ensure_pdf_doc(doc_id)
         formula = catalog.get_formula(formula_id)
         if formula is None or formula.doc_id != doc_id:
             raise AppError(
@@ -5644,7 +5386,7 @@ class AppService:
                 details={
                     "doc_id": doc_id,
                     "formula_id": formula_id,
-                    "hint": "Call the corresponding pdf_*_list_formulas tool first.",
+                    "hint": "Call pdf_list_formulas first.",
                 },
             )
 
@@ -5725,7 +5467,7 @@ class AppService:
 
         return {
             "doc_title": doc.title,
-            "profile": expected_profile,
+            "profile": doc.profile,
             "formula": self._formula_payload(formula),
             "context": {
                 "text": context_chunk.text,
@@ -5736,7 +5478,7 @@ class AppService:
             "evidence": evidence,
         }
 
-    def pdf_book_list_formulas(
+    def pdf_list_formulas(
         self,
         *,
         doc_id: str,
@@ -5749,37 +5491,12 @@ class AppService:
             node_id=node_id,
             limit=limit,
             status=status,
-            expected_profile=Profile.BOOK,
         )
 
-    def pdf_book_read_formula(self, *, doc_id: str, formula_id: str) -> dict[str, Any]:
+    def pdf_read_formula(self, *, doc_id: str, formula_id: str) -> dict[str, Any]:
         return self._read_pdf_formula(
             doc_id=doc_id,
             formula_id=formula_id,
-            expected_profile=Profile.BOOK,
-        )
-
-    def pdf_paper_list_formulas(
-        self,
-        *,
-        doc_id: str,
-        node_id: str | None,
-        limit: int,
-        status: str | None,
-    ) -> dict[str, Any]:
-        return self._list_pdf_formulas(
-            doc_id=doc_id,
-            node_id=node_id,
-            limit=limit,
-            status=status,
-            expected_profile=Profile.PAPER,
-        )
-
-    def pdf_paper_read_formula(self, *, doc_id: str, formula_id: str) -> dict[str, Any]:
-        return self._read_pdf_formula(
-            doc_id=doc_id,
-            formula_id=formula_id,
-            expected_profile=Profile.PAPER,
         )
 
     def get_outline(self, doc_id: str) -> dict[str, Any]:

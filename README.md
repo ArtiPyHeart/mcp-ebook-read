@@ -68,7 +68,6 @@ Optional:
 - `PDF_DOCLING_NUM_THREADS` (auto-derived from CPU cores by default; override Docling CPU threads).
 - `PDF_DOCLING_BATCH_SIZE` (auto-derived from CPU/memory by default; override Docling OCR/layout/table batch sizes together).
 - `PDF_DOCLING_DEVICE` (override Docling accelerator device, for example `auto`, `cpu`, or `mps` on Apple Silicon).
-- `PDF_DOCLING_TUNING_PROFILE_PATH` (override the local autotune profile JSON path).
 - `PDF_PARSE_TIMEOUT_SECONDS` (default `1800`; timeout for isolated Docling/Pix2Text PDF parse and visual extraction workers).
 - `MCP_EBOOK_CAPTURE_READING_SESSION` (`false` by default; set to `1` to capture read/search tool outputs for retrieval drift evaluation).
 - `MCP_EBOOK_CAPTURE_INCLUDE_QUERY` (`false` by default; set to `1` only for local evaluation when replay needs raw query text).
@@ -83,7 +82,7 @@ For each library root, the MCP writes all nested EPUB/PDF state to one root side
 <library_root>/.mcp-ebook-read/
 ```
 
-`library_scan(root=...)` always uses the provided scan root as the library root. Direct `document_ingest_*` tools also accept `root`; if omitted, the MCP process project root is used. The default project root is discovered from the current working directory by walking upward to `.git` or `pyproject.toml`, falling back to the current working directory.
+`library_scan(root=...)` always uses the provided scan root as the library root. `document_ingest` also accepts `root`; if omitted, the MCP process project root is used. The default project root is discovered from the current working directory by walking upward to `.git` or `pyproject.toml`, falling back to the current working directory.
 
 The sidecar contains:
 - `catalog.db`, a SQLite database with documents, chunks, formulas, images, tables, figures, page/reference/citation/artifact graph nodes, local FTS, graph edges, diagnostics, and ingest jobs.
@@ -108,12 +107,9 @@ Ingest finalization is staged. New parse artifacts are first written under a tem
 ## Recommended Reading Workflow
 
 1. Choose a library root. For nested libraries, pass the top-level folder as `root`.
-2. For one known file, call the correct ingest tool directly with `path` and preferably `root`.
+2. For one known file, call `document_ingest` directly with `path` and preferably `root`.
 3. For bulk discovery or doc_id-only workflows after restart, use `library_scan(root=...)` or `storage_list_sidecars(root=...)`; omit `root` only when the project root is the intended library root.
-4. Use the correct ingest tool:
-   - `document_ingest_epub_book`
-   - `document_ingest_pdf_book`
-   - `document_ingest_pdf_paper`
+4. Use `document_ingest`; EPUB/PDF and book/paper mode are inferred from document metadata.
 5. Poll `document_ingest_status` until the job succeeds or fails.
 6. For cross-document questions, start with `library_explore(query=..., root=...)`.
 7. For one known ingested document, use `document_explore(doc_id, query)`.
@@ -122,8 +118,7 @@ Ingest finalization is staged. New parse artifacts are first written under a tem
    - `get_outline`
    - `read_outline_node`
    - `search_in_outline_node`
-   - `pdf_book_list_formulas` / `pdf_book_read_formula`
-   - `pdf_paper_list_formulas` / `pdf_paper_read_formula`
+   - `pdf_list_formulas` / `pdf_read_formula`
    - `epub_list_images` / `epub_read_image`
    - `pdf_list_images` / `pdf_read_image`
    - `pdf_list_tables` / `pdf_read_table`
@@ -162,9 +157,9 @@ On Apple Silicon, the package installs the MLX VLM backend (`mlx-vlm`) via a mac
 
 ## PDF Visual Evidence
 
-PDF ingest is eager by default: general PDF images, Docling tables, and Docling figures are extracted during `document_ingest_pdf_book` / `document_ingest_pdf_paper` and persisted into the sidecar. This avoids agent-side missed content caused by forgetting to trigger a later full extraction step. Docling table/figure visual extraction runs in an isolated worker process and uses `PDF_PARSE_TIMEOUT_SECONDS`.
+PDF ingest is eager by default: general PDF images, Docling tables, and Docling figures are extracted during `document_ingest` and persisted into the sidecar. This avoids agent-side missed content caused by forgetting to trigger a later full extraction step. Docling table/figure visual extraction runs in an isolated worker process and uses `PDF_PARSE_TIMEOUT_SECONDS`.
 
-PDF image/table/figure read tools are read-only over persisted sidecar evidence. They do not re-run extraction at read time; if an evidence file is missing, re-run `document_ingest_pdf_book` or `document_ingest_pdf_paper` with `force=true` to regenerate the sidecar.
+PDF image/table/figure read tools are read-only over persisted sidecar evidence. They do not re-run extraction at read time; if an evidence file is missing, re-run `document_ingest` with `force=true` to regenerate the sidecar.
 
 Use:
 - `pdf_list_images` / `pdf_read_image` for general PDF image evidence;
@@ -176,21 +171,15 @@ Use:
 
 Eager PDF ingest uses local resource-aware defaults:
 - `MCP_EBOOK_INGEST_WORKERS=auto` sizes concurrent document ingest workers from CPU cores and memory.
-- `PDF_DOCLING_NUM_THREADS` and `PDF_DOCLING_BATCH_SIZE` are auto-derived when no tuning profile or explicit env override is present.
+- `PDF_DOCLING_NUM_THREADS` and `PDF_DOCLING_BATCH_SIZE` are auto-derived unless explicitly overridden by env vars.
 - Concurrent PDF parses dynamically divide Docling threads/batches and formula batch size across active PDF workers to avoid oversubscription.
 - Docling table/figure extraction reuses the parse worker's in-memory Docling document when possible, avoiding a second Docling conversion for the same PDF.
-- Apple Silicon installs `mlx-vlm` automatically and can use `PDF_DOCLING_DEVICE=mps`; full Docling VLM/MLX parsing remains a separate profile to benchmark before making it part of default ingest.
+- Apple Silicon installs `mlx-vlm` automatically and can use `PDF_DOCLING_DEVICE=mps`; full Docling VLM/MLX parsing remains a benchmark-only path before making it part of default ingest.
 - `library_scan` computes document SHA256 hashes in parallel and returns `scan_performance` with candidate counts, hash worker count, and timing diagnostics.
 
-Use `document_autotune_pdf_parser` before long PDF ingest runs when you want to benchmark a sampled subset of one PDF and persist the best local profile.
+PDF ingest persists parser-lane summaries under `pdf_parser_lanes`: pypdfium2 fast preflight, PyMuPDF diagnostic inventory, and Docling canonical fidelity metrics. Parser engine benchmarks remain available through the benchmark CLI for development, but normal MCP usage should not run parser tuning tools before ingest.
 
-PDF ingest persists parser-lane summaries under `pdf_parser_lanes`: pypdfium2 fast preflight, PyMuPDF diagnostic inventory, and Docling canonical fidelity metrics. Use `pdf_diagnose_parser_lanes` when you need per-PDF parser strategy evidence without ingesting or writing sidecar state. It compares the fast pypdfium2 lane with optional PyMuPDF diagnostics, optional raw Docling high-fidelity structure, and optional PDF Oxide.
-
-By default the tuning profile lives at:
-- macOS: `~/Library/Caches/mcp-ebook-read/docling_pdf_tuning.json`
-- Linux/other: `$XDG_CACHE_HOME/mcp-ebook-read/docling_pdf_tuning.json` or `~/.cache/mcp-ebook-read/docling_pdf_tuning.json`
-
-`PDF_DOCLING_NUM_THREADS` and `PDF_DOCLING_BATCH_SIZE` override the cached profile when fixed settings are needed. `MCP_EBOOK_INGEST_WORKERS` can be set to a positive integer to force more or fewer concurrent eager ingest jobs.
+`PDF_DOCLING_NUM_THREADS` and `PDF_DOCLING_BATCH_SIZE` provide fixed settings when needed. `MCP_EBOOK_INGEST_WORKERS` can be set to a positive integer to force more or fewer concurrent eager ingest jobs.
 
 ## Benchmarks
 
@@ -248,7 +237,7 @@ uvx mcp-ebook-ingest-benchmark \
   --output .tmp/eval-results/ingest-smoke.json
 ```
 
-Use `--pdf-profile book` or `--pdf-profile paper` with `--manifest` when benchmarking a homogeneous PDF set. For mixed PDF books/papers, prefer `--profile-manifest` with one `paper|book|epub <path>` entry per line. `--pdf-profile auto` is only a benchmark convenience; normal MCP usage should still call the explicit `document_ingest_pdf_book` or `document_ingest_pdf_paper` tool.
+Use `--pdf-profile book` or `--pdf-profile paper` with `--manifest` when benchmarking a homogeneous PDF set. For mixed PDF books/papers, prefer `--profile-manifest` with one `paper|book|epub <path>` entry per line. `--pdf-profile auto` is only a benchmark reporting convenience; normal MCP usage should call `document_ingest`.
 
 ### Parser Engine Benchmark
 

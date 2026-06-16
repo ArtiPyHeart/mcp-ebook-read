@@ -13,6 +13,13 @@ def test_operation_registry_is_unique_and_exposed_by_server() -> None:
     assert set(OPERATIONS_BY_NAME) == set(names)
     assert "search" not in names
     assert "read" not in names
+    assert "document_autotune_pdf_parser" not in names
+    assert "pdf_diagnose_parser_lanes" not in names
+    assert "document_ingest_pdf_book" not in names
+    assert "document_ingest_pdf_paper" not in names
+    assert "document_ingest_epub_book" not in names
+    assert "pdf_book_list_formulas" not in names
+    assert "pdf_paper_list_formulas" not in names
     for operation in OPERATIONS:
         assert getattr(server, operation.name) is not None
 
@@ -60,23 +67,17 @@ def test_operation_metadata_is_explicit() -> None:
 def test_llm_descriptions_pin_reading_routing_language() -> None:
     descriptions = {operation.name: operation.description for operation in OPERATIONS}
 
-    assert "PDF book" in descriptions["document_ingest_pdf_book"]
-    assert "PDF paper" in descriptions["document_ingest_pdf_paper"]
-    assert "EPUB book" in descriptions["document_ingest_epub_book"]
+    assert "EPUB/PDF document" in descriptions["document_ingest"]
+    assert "inferred from document metadata" in descriptions["document_ingest"]
     assert "already-ingested root sidecar" in descriptions["library_explore"]
     assert "infers EPUB/PDF/book/paper mode" in descriptions["document_explore"]
     assert "DocumentGraph node" in descriptions["document_node"]
     assert "outline-first" in descriptions["get_outline"]
     assert "focused reading" in descriptions["search_in_outline_node"]
-    assert "formula-centric book" in descriptions["pdf_book_list_formulas"]
-    assert "formula-centric paper" in descriptions["pdf_paper_list_formulas"]
+    assert "infers book/paper mode" in descriptions["pdf_list_formulas"]
     assert "multimodal" in descriptions["epub_read_image"]
     assert "Docling-extracted PDF tables" in descriptions["pdf_list_tables"]
     assert "Docling-detected PDF figures" in descriptions["pdf_list_figures"]
-    assert (
-        "without ingesting or writing sidecar"
-        in descriptions["pdf_diagnose_parser_lanes"]
-    )
     assert (
         "reading-session capture events" in descriptions["eval_export_reading_sessions"]
     )

@@ -6,64 +6,78 @@ from mcp_ebook_read.errors import AppError, ErrorCode
 from mcp_ebook_read import server
 
 
-def test_document_autotune_pdf_parser_tool_wraps_success(
+def test_document_ingest_tool_wraps_success(
     monkeypatch,
 ) -> None:
-    calls: list[tuple[str | None, str | None, int]] = []
+    calls: list[tuple[str | None, str | None, str | None, bool]] = []
 
-    def autotune(*, doc_id: str | None, path: str | None, sample_pages: int):
-        calls.append((doc_id, path, sample_pages))
-        return {"profile_path": "/tmp/docling.json", "sample_pages": sample_pages}
+    def ingest(
+        *,
+        doc_id: str | None,
+        path: str | None,
+        root: str | None,
+        force: bool,
+    ):
+        calls.append((doc_id, path, root, force))
+        return {"doc_id": doc_id, "job_id": "job-1"}
 
     monkeypatch.setattr(
         server,
         "service",
-        SimpleNamespace(document_autotune_pdf_parser=autotune),
+        SimpleNamespace(document_ingest=ingest),
     )
-    monkeypatch.setattr(server, "make_trace_id", lambda: "trace-autotune")
+    monkeypatch.setattr(server, "make_trace_id", lambda: "trace-ingest")
 
-    payload = server.document_autotune_pdf_parser(
+    payload = server.document_ingest(
         doc_id="doc1",
         path="/tmp/book.pdf",
-        sample_pages=9,
+        root="/tmp/library",
+        force=True,
     )
 
     assert payload == {
         "ok": True,
-        "data": {"profile_path": "/tmp/docling.json", "sample_pages": 9},
+        "data": {"doc_id": "doc1", "job_id": "job-1"},
         "error": None,
-        "trace_id": "trace-autotune",
+        "trace_id": "trace-ingest",
     }
-    assert calls == [("doc1", "/tmp/book.pdf", 9)]
+    assert calls == [("doc1", "/tmp/book.pdf", "/tmp/library", True)]
 
 
-def test_document_autotune_pdf_parser_tool_wraps_error(monkeypatch) -> None:
-    def autotune(*, doc_id: str | None, path: str | None, sample_pages: int):
+def test_document_ingest_tool_wraps_error(monkeypatch) -> None:
+    def ingest(
+        *,
+        doc_id: str | None,
+        path: str | None,
+        root: str | None,
+        force: bool,
+    ):
         raise AppError(
-            ErrorCode.INGEST_PDF_DOCLING_FAILED,
-            "autotune failed",
-            details={"path": path, "sample_pages": sample_pages, "doc_id": doc_id},
+            ErrorCode.INGEST_DOC_NOT_FOUND,
+            "document missing",
+            details={"path": path, "root": root, "doc_id": doc_id, "force": force},
         )
 
     monkeypatch.setattr(
         server,
         "service",
-        SimpleNamespace(document_autotune_pdf_parser=autotune),
+        SimpleNamespace(document_ingest=ingest),
     )
     monkeypatch.setattr(server, "make_trace_id", lambda: "trace-error")
 
-    payload = server.document_autotune_pdf_parser(path="/tmp/book.pdf")
+    payload = server.document_ingest(path="/tmp/book.pdf")
 
     assert payload["ok"] is False
     assert payload["data"] is None
     assert payload["trace_id"] == "trace-error"
     assert payload["error"] == {
-        "code": ErrorCode.INGEST_PDF_DOCLING_FAILED,
-        "message": "autotune failed",
+        "code": ErrorCode.INGEST_DOC_NOT_FOUND,
+        "message": "document missing",
         "details": {
             "path": "/tmp/book.pdf",
-            "sample_pages": 20,
+            "root": None,
             "doc_id": None,
+            "force": False,
         },
     }
 

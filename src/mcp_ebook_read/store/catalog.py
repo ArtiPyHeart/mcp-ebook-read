@@ -2097,8 +2097,10 @@ class CatalogStore:
                 )
                 return "added"
 
-            changed = row["sha256"] != doc.sha256 or float(row["mtime"]) != float(
-                doc.mtime
+            changed = (
+                row["sha256"] != doc.sha256
+                or float(row["mtime"]) != float(doc.mtime)
+                or row["profile"] != doc.profile
             )
             if not changed:
                 return "unchanged"
@@ -2139,10 +2141,17 @@ class CatalogStore:
                 conn.execute(
                     """
                     UPDATE documents
-                    SET sha256 = ?, mtime = ?, status = ?, updated_at = ?
+                    SET sha256 = ?, mtime = ?, profile = ?, status = ?, updated_at = ?
                     WHERE path = ?
                     """,
-                    (doc.sha256, doc.mtime, DocumentStatus.DISCOVERED, now, doc.path),
+                    (
+                        doc.sha256,
+                        doc.mtime,
+                        doc.profile,
+                        DocumentStatus.DISCOVERED,
+                        now,
+                        doc.path,
+                    ),
                 )
             return "updated"
 
@@ -2875,7 +2884,7 @@ class CatalogStore:
                 }
             if source_type == "formula":
                 hit["read_hint"] = (
-                    "Use pdf_book_read_formula or pdf_paper_read_formula with source_id."
+                    "Use pdf_read_formula or pdf_read_formula with source_id."
                 )
             elif source_type == "pdf_table":
                 hit["read_hint"] = "Use pdf_read_table with source_id."

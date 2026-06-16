@@ -76,21 +76,11 @@ class ReadingServiceProtocol(Protocol):
 
     def pdf_read_figure(self, *, doc_id: str, figure_id: str) -> dict[str, Any]: ...
 
-    def pdf_book_list_formulas(
+    def pdf_list_formulas(
         self, *, doc_id: str, node_id: str | None, limit: int, status: str | None
     ) -> dict[str, Any]: ...
 
-    def pdf_book_read_formula(
-        self, *, doc_id: str, formula_id: str
-    ) -> dict[str, Any]: ...
-
-    def pdf_paper_list_formulas(
-        self, *, doc_id: str, node_id: str | None, limit: int, status: str | None
-    ) -> dict[str, Any]: ...
-
-    def pdf_paper_read_formula(
-        self, *, doc_id: str, formula_id: str
-    ) -> dict[str, Any]: ...
+    def pdf_read_formula(self, *, doc_id: str, formula_id: str) -> dict[str, Any]: ...
 
 
 class _DefaultReadingParser:
@@ -413,19 +403,12 @@ def _evaluate_pdf_evidence(
     evidence_counts: dict[str, int],
 ) -> None:
     doc_id = str(doc["doc_id"])
-    profile = _enum_token(doc.get("profile"))
-    if profile == "paper":
-        list_formula = service.pdf_paper_list_formulas
-        read_formula = service.pdf_paper_read_formula
-        formula_prefix = "pdf_paper"
-    else:
-        list_formula = service.pdf_book_list_formulas
-        read_formula = service.pdf_book_read_formula
-        formula_prefix = "pdf_book"
+    list_formula = service.pdf_list_formulas
+    read_formula = service.pdf_read_formula
 
     formulas_payload = _record_call(
         tasks,
-        f"{formula_prefix}_list_formulas",
+        "pdf_list_formulas",
         lambda: list_formula(doc_id=doc_id, node_id=None, limit=3, status=None),
         validator=lambda payload: isinstance(payload.get("formulas"), list),
         summarizer=lambda payload: {
@@ -438,7 +421,7 @@ def _evaluate_pdf_evidence(
         evidence_counts["formula_lists_nonempty"] += 1
         read_payload = _record_call(
             tasks,
-            f"{formula_prefix}_read_formula",
+            "pdf_read_formula",
             lambda: read_formula(doc_id=doc_id, formula_id=formula_id),
             validator=lambda payload: bool((payload.get("formula") or {}).get("latex")),
             summarizer=lambda payload: {
@@ -451,7 +434,7 @@ def _evaluate_pdf_evidence(
     else:
         _record_skipped(
             tasks,
-            f"{formula_prefix}_read_formula",
+            "pdf_read_formula",
             reason="No formulas returned by list tool.",
         )
 

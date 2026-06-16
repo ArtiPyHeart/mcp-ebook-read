@@ -34,15 +34,7 @@ class ProfiledDocument:
 
 
 class IngestServiceProtocol(Protocol):
-    def document_ingest_epub_book(
-        self, *, doc_id: str | None, path: str | None, root: str | None, force: bool
-    ) -> dict[str, Any]: ...
-
-    def document_ingest_pdf_book(
-        self, *, doc_id: str | None, path: str | None, root: str | None, force: bool
-    ) -> dict[str, Any]: ...
-
-    def document_ingest_pdf_paper(
+    def document_ingest(
         self, *, doc_id: str | None, path: str | None, root: str | None, force: bool
     ) -> dict[str, Any]: ...
 
@@ -120,39 +112,14 @@ def _submit_ingest(
     *,
     path: Path,
     root: Path,
-    pdf_profile: str,
     force: bool,
 ) -> tuple[str, dict[str, Any]]:
     suffix = path.suffix.lower()
-    if suffix == ".epub":
-        return (
-            "document_ingest_epub_book",
-            service.document_ingest_epub_book(
-                doc_id=None,
-                path=str(path),
-                root=str(root),
-                force=force,
-            ),
-        )
-    if suffix != ".pdf":
+    if suffix not in {".epub", ".pdf"}:
         raise ValueError(f"Unsupported ingest benchmark document type: {suffix}")
-
-    effective_profile = (
-        _infer_pdf_profile(path) if pdf_profile == "auto" else pdf_profile
-    )
-    if effective_profile == "paper":
-        return (
-            "document_ingest_pdf_paper",
-            service.document_ingest_pdf_paper(
-                doc_id=None,
-                path=str(path),
-                root=str(root),
-                force=force,
-            ),
-        )
     return (
-        "document_ingest_pdf_book",
-        service.document_ingest_pdf_book(
+        "document_ingest",
+        service.document_ingest(
             doc_id=None,
             path=str(path),
             root=str(root),
@@ -250,7 +217,6 @@ def run_service_ingest_benchmark(
                     service,
                     path=path,
                     root=effective_root,
-                    pdf_profile=path_profile or pdf_profile,
                     force=force,
                 )
                 doc_id = str(submitted["doc_id"])

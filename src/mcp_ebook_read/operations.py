@@ -96,37 +96,13 @@ def storage_cleanup_sidecars(
     )
 
 
-def document_ingest_pdf_book(
+def document_ingest(
     doc_id: str | None = None,
     path: str | None = None,
     root: str | None = None,
     force: bool = False,
 ) -> dict[str, Any]:
-    return _service().document_ingest_pdf_book(
-        doc_id=doc_id, path=path, root=root, force=force
-    )
-
-
-def document_ingest_epub_book(
-    doc_id: str | None = None,
-    path: str | None = None,
-    root: str | None = None,
-    force: bool = False,
-) -> dict[str, Any]:
-    return _service().document_ingest_epub_book(
-        doc_id=doc_id, path=path, root=root, force=force
-    )
-
-
-def document_ingest_pdf_paper(
-    doc_id: str | None = None,
-    path: str | None = None,
-    root: str | None = None,
-    force: bool = False,
-) -> dict[str, Any]:
-    return _service().document_ingest_pdf_paper(
-        doc_id=doc_id, path=path, root=root, force=force
-    )
+    return _service().document_ingest(doc_id=doc_id, path=path, root=root, force=force)
 
 
 def document_ingest_status(doc_id: str, job_id: str | None = None) -> dict[str, Any]:
@@ -135,38 +111,6 @@ def document_ingest_status(doc_id: str, job_id: str | None = None) -> dict[str, 
 
 def document_ingest_list_jobs(doc_id: str, limit: int = 20) -> dict[str, Any]:
     return _service().document_ingest_list_jobs(doc_id=doc_id, limit=limit)
-
-
-def document_autotune_pdf_parser(
-    doc_id: str | None = None,
-    path: str | None = None,
-    sample_pages: int = 20,
-) -> dict[str, Any]:
-    return _service().document_autotune_pdf_parser(
-        doc_id=doc_id,
-        path=path,
-        sample_pages=sample_pages,
-    )
-
-
-def pdf_diagnose_parser_lanes(
-    doc_id: str | None = None,
-    path: str | None = None,
-    include_fidelity: bool = True,
-    include_pymupdf: bool = True,
-    include_pdf_oxide: bool = False,
-    timeout_seconds: int = 240,
-    queries: list[str] | None = None,
-) -> dict[str, Any]:
-    return _service().pdf_diagnose_parser_lanes(
-        doc_id=doc_id,
-        path=path,
-        include_fidelity=include_fidelity,
-        include_pymupdf=include_pymupdf,
-        include_pdf_oxide=include_pdf_oxide,
-        timeout_seconds=timeout_seconds,
-        queries=queries,
-    )
 
 
 def document_explore(doc_id: str, query: str, top_k: int = 8) -> dict[str, Any]:
@@ -253,13 +197,13 @@ def pdf_read_figure(doc_id: str, figure_id: str) -> dict[str, Any]:
     return _service().pdf_read_figure(doc_id=doc_id, figure_id=figure_id)
 
 
-def pdf_book_list_formulas(
+def pdf_list_formulas(
     doc_id: str,
     node_id: str | None = None,
     limit: int = 200,
     status: str | None = None,
 ) -> dict[str, Any]:
-    return _service().pdf_book_list_formulas(
+    return _service().pdf_list_formulas(
         doc_id=doc_id,
         node_id=node_id,
         limit=limit,
@@ -267,26 +211,8 @@ def pdf_book_list_formulas(
     )
 
 
-def pdf_book_read_formula(doc_id: str, formula_id: str) -> dict[str, Any]:
-    return _service().pdf_book_read_formula(doc_id=doc_id, formula_id=formula_id)
-
-
-def pdf_paper_list_formulas(
-    doc_id: str,
-    node_id: str | None = None,
-    limit: int = 200,
-    status: str | None = None,
-) -> dict[str, Any]:
-    return _service().pdf_paper_list_formulas(
-        doc_id=doc_id,
-        node_id=node_id,
-        limit=limit,
-        status=status,
-    )
-
-
-def pdf_paper_read_formula(doc_id: str, formula_id: str) -> dict[str, Any]:
-    return _service().pdf_paper_read_formula(doc_id=doc_id, formula_id=formula_id)
+def pdf_read_formula(doc_id: str, formula_id: str) -> dict[str, Any]:
+    return _service().pdf_read_formula(doc_id=doc_id, formula_id=formula_id)
 
 
 def get_outline(doc_id: str) -> dict[str, Any]:
@@ -350,27 +276,11 @@ OPERATIONS: tuple[ToolOperation, ...] = (
         "storage",
     ),
     ToolOperation(
-        "document_ingest_pdf_book",
-        document_ingest_pdf_book,
-        desc.DOCUMENT_INGEST_PDF_BOOK,
+        "document_ingest",
+        document_ingest,
+        desc.DOCUMENT_INGEST,
         "write",
-        "pdf",
-        "ingest",
-    ),
-    ToolOperation(
-        "document_ingest_epub_book",
-        document_ingest_epub_book,
-        desc.DOCUMENT_INGEST_EPUB_BOOK,
-        "write",
-        "epub",
-        "ingest",
-    ),
-    ToolOperation(
-        "document_ingest_pdf_paper",
-        document_ingest_pdf_paper,
-        desc.DOCUMENT_INGEST_PDF_PAPER,
-        "write",
-        "pdf",
+        "document",
         "ingest",
     ),
     ToolOperation(
@@ -388,22 +298,6 @@ OPERATIONS: tuple[ToolOperation, ...] = (
         "read",
         "generic",
         "ingest",
-    ),
-    ToolOperation(
-        "document_autotune_pdf_parser",
-        document_autotune_pdf_parser,
-        desc.DOCUMENT_AUTOTUNE_PDF_PARSER,
-        "write",
-        "pdf",
-        "ingest",
-    ),
-    ToolOperation(
-        "pdf_diagnose_parser_lanes",
-        pdf_diagnose_parser_lanes,
-        desc.PDF_DIAGNOSE_PARSER_LANES,
-        "read",
-        "pdf",
-        "diagnostic",
     ),
     ToolOperation(
         "document_explore",
@@ -482,33 +376,17 @@ OPERATIONS: tuple[ToolOperation, ...] = (
         "figure",
     ),
     ToolOperation(
-        "pdf_book_list_formulas",
-        pdf_book_list_formulas,
-        desc.PDF_BOOK_LIST_FORMULAS,
+        "pdf_list_formulas",
+        pdf_list_formulas,
+        desc.PDF_LIST_FORMULAS,
         "read",
         "pdf",
         "formula",
     ),
     ToolOperation(
-        "pdf_book_read_formula",
-        pdf_book_read_formula,
-        desc.PDF_BOOK_READ_FORMULA,
-        "read",
-        "pdf",
-        "formula",
-    ),
-    ToolOperation(
-        "pdf_paper_list_formulas",
-        pdf_paper_list_formulas,
-        desc.PDF_PAPER_LIST_FORMULAS,
-        "read",
-        "pdf",
-        "formula",
-    ),
-    ToolOperation(
-        "pdf_paper_read_formula",
-        pdf_paper_read_formula,
-        desc.PDF_PAPER_READ_FORMULA,
+        "pdf_read_formula",
+        pdf_read_formula,
+        desc.PDF_READ_FORMULA,
         "read",
         "pdf",
         "formula",

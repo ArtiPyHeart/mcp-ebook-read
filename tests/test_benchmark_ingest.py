@@ -30,23 +30,11 @@ class FakeIngestService:
             "deduplicated": False,
         }
 
-    def document_ingest_epub_book(
+    def document_ingest(
         self, *, doc_id: str | None, path: str | None, root: str | None, force: bool
     ) -> dict[str, Any]:
         assert doc_id is None
-        return self._submit("document_ingest_epub_book", path, root, force)
-
-    def document_ingest_pdf_book(
-        self, *, doc_id: str | None, path: str | None, root: str | None, force: bool
-    ) -> dict[str, Any]:
-        assert doc_id is None
-        return self._submit("document_ingest_pdf_book", path, root, force)
-
-    def document_ingest_pdf_paper(
-        self, *, doc_id: str | None, path: str | None, root: str | None, force: bool
-    ) -> dict[str, Any]:
-        assert doc_id is None
-        return self._submit("document_ingest_pdf_paper", path, root, force)
+        return self._submit("document_ingest", path, root, force)
 
     def document_ingest_status(
         self, doc_id: str, job_id: str | None = None
@@ -119,10 +107,10 @@ def test_run_service_ingest_benchmark_drives_real_tool_routing(
     assert result["summary"]["documents_ok"] == 2
     assert result["summary"]["documents_failed"] == 0
     assert str(old_sidecar) in result["summary"]["deleted_sidecars"]
-    assert {call[0] for call in service.calls} == {
-        "document_ingest_epub_book",
-        "document_ingest_pdf_paper",
-    }
+    assert [call[0] for call in service.calls] == [
+        "document_ingest",
+        "document_ingest",
+    ]
     assert {call[2] for call in service.calls} == {str(tmp_path.resolve())}
     assert all(document["sidecar_bytes"] > 0 for document in result["documents"])
 
@@ -170,11 +158,11 @@ def test_profile_manifest_routes_mixed_pdf_profiles_with_space_paths(
         (book.resolve(), "book"),
         (epub.resolve(), "epub"),
     ]
-    assert {call[0] for call in service.calls} == {
-        "document_ingest_pdf_paper",
-        "document_ingest_pdf_book",
-        "document_ingest_epub_book",
-    }
+    assert [call[0] for call in service.calls] == [
+        "document_ingest",
+        "document_ingest",
+        "document_ingest",
+    ]
     effective_profiles = {
         Path(document["path"]).name: document["effective_profile"]
         for document in result["documents"]

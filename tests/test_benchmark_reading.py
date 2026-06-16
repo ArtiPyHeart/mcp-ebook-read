@@ -188,7 +188,7 @@ def test_run_reading_service_benchmark_exercises_mcp_reading_chain(
         ) -> dict:
             return {"content": "# Intro", "chunks_count": 1, "truncated": False}
 
-        def pdf_book_list_formulas(
+        def pdf_list_formulas(
             self,
             *,
             doc_id: str,
@@ -201,17 +201,11 @@ def test_run_reading_service_benchmark_exercises_mcp_reading_chain(
                 "formulas_count": 1,
             }
 
-        def pdf_book_read_formula(self, *, doc_id: str, formula_id: str) -> dict:
+        def pdf_read_formula(self, *, doc_id: str, formula_id: str) -> dict:
             return {
                 "formula": {"formula_id": formula_id, "latex": "x=y"},
                 "evidence": {"image_path": "formula.png"},
             }
-
-        def pdf_paper_list_formulas(self, **kwargs) -> dict:  # noqa: ANN003
-            raise AssertionError("book profile should not call paper formula list")
-
-        def pdf_paper_read_formula(self, **kwargs) -> dict:  # noqa: ANN003
-            raise AssertionError("book profile should not call paper formula read")
 
         def pdf_list_images(
             self, *, doc_id: str, node_id: str | None, limit: int

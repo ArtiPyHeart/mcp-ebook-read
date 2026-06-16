@@ -7,7 +7,6 @@ import pytest
 from mcp_ebook_read.errors import AppError
 from mcp_ebook_read.schema.models import (
     PdfParserPerformanceConfig,
-    PdfParserTuningProfile,
 )
 from mcp_ebook_read.parsers.pdf_docling import DoclingPdfParser
 from mcp_ebook_read.service import AppService
@@ -57,10 +56,6 @@ def test_from_env_auto_sizes_eager_ingest_resources(
     monkeypatch.delenv("MCP_EBOOK_INGEST_WORKERS", raising=False)
     monkeypatch.delenv("PDF_DOCLING_NUM_THREADS", raising=False)
     monkeypatch.delenv("PDF_DOCLING_BATCH_SIZE", raising=False)
-    monkeypatch.setenv(
-        "PDF_DOCLING_TUNING_PROFILE_PATH",
-        str(tmp_path / "missing-docling-tuning.json"),
-    )
     monkeypatch.setattr("mcp_ebook_read.service.os.cpu_count", lambda: 12)
     monkeypatch.setattr(
         AppService,
@@ -102,66 +97,10 @@ def test_from_env_formula_batch_size_env_override(
     service.close()
 
 
-def test_from_env_loads_docling_tuning_profile(
+def test_from_env_explicit_docling_env_overrides_auto_config(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    profile_path = tmp_path / "docling_tuning.json"
-    profile = PdfParserTuningProfile(
-        created_at="2026-03-15T00:00:00Z",
-        source_path="/tmp/sample.pdf",
-        sample_pages=12,
-        cpu_count=8,
-        total_memory_bytes=32 * 1024**3,
-        selected_config=PdfParserPerformanceConfig(
-            num_threads=6,
-            device="auto",
-            ocr_batch_size=5,
-            layout_batch_size=5,
-            table_batch_size=5,
-        ),
-        benchmarks=[],
-    )
-    profile_path.write_text(profile.model_dump_json(indent=2), encoding="utf-8")
-
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("PDF_DOCLING_TUNING_PROFILE_PATH", str(profile_path))
-    monkeypatch.delenv("PDF_DOCLING_NUM_THREADS", raising=False)
-    monkeypatch.delenv("PDF_DOCLING_BATCH_SIZE", raising=False)
-    monkeypatch.setattr(
-        "mcp_ebook_read.service.GrobidClient.from_env",
-        lambda: OptionalGrobid(),
-    )
-
-    service = AppService.from_env()
-
-    assert service.pdf_parser.performance_config.num_threads == 6
-    assert service.pdf_parser.performance_config.ocr_batch_size == 5
-    service.close()
-
-
-def test_from_env_explicit_docling_env_overrides_tuned_profile(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    profile_path = tmp_path / "docling_tuning.json"
-    profile = PdfParserTuningProfile(
-        created_at="2026-03-15T00:00:00Z",
-        source_path="/tmp/sample.pdf",
-        sample_pages=12,
-        cpu_count=8,
-        total_memory_bytes=32 * 1024**3,
-        selected_config=PdfParserPerformanceConfig(
-            num_threads=6,
-            device="auto",
-            ocr_batch_size=5,
-            layout_batch_size=5,
-            table_batch_size=5,
-        ),
-        benchmarks=[],
-    )
-    profile_path.write_text(profile.model_dump_json(indent=2), encoding="utf-8")
-
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("PDF_DOCLING_TUNING_PROFILE_PATH", str(profile_path))
     monkeypatch.setenv("PDF_DOCLING_NUM_THREADS", "9")
     monkeypatch.setenv("PDF_DOCLING_BATCH_SIZE", "7")
     monkeypatch.setattr(

@@ -97,9 +97,7 @@ def _bootstrap_e2e_service(
     else:
         monkeypatch.delenv("GROBID_URL", raising=False)
         monkeypatch.delenv("GROBID_TIMEOUT_SECONDS", raising=False)
-    tuning_profile_path = tmp_path / "runtime" / "docling_tuning.json"
-    monkeypatch.setenv("PDF_DOCLING_TUNING_PROFILE_PATH", str(tuning_profile_path))
-    return samples_root, tuning_profile_path, AppService.from_env()
+    return samples_root, AppService.from_env()
 
 
 def _resolve_scanned_doc_id(service: AppService, path: Path) -> str:
@@ -123,10 +121,10 @@ def _first_words(text: str, limit: int = 8) -> str:
     return " ".join(text.split()[:limit]).strip()
 
 
-def test_e2e_pdf_book_autotune_ingest_search_and_assets(
+def test_e2e_pdf_book_ingest_search_and_assets(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    samples_root, tuning_profile_path, service = _bootstrap_e2e_service(
+    samples_root, service = _bootstrap_e2e_service(
         monkeypatch=monkeypatch,
         tmp_path=tmp_path,
         collection_suffix="pdf_book",
@@ -147,21 +145,8 @@ def test_e2e_pdf_book_autotune_ingest_search_and_assets(
         sidecars = service.storage_list_sidecars(root=str(library_root), limit=20)
         assert sidecars["documents_count"] == 1
 
-        book_doc_id = _resolve_scanned_doc_id(service, book_pdf)
-        autotune = service.document_autotune_pdf_parser(
-            doc_id=book_doc_id,
-            path=None,
-            sample_pages=5,
-        )
-        assert autotune["doc_id"] == book_doc_id
-        assert autotune["path"] == str(book_pdf.resolve())
-        assert autotune["profile_path"] == str(tuning_profile_path)
-        assert tuning_profile_path.exists()
-        assert autotune["selected_config"]["num_threads"] >= 1
-        assert autotune["selected_config"]["ocr_batch_size"] >= 1
-        assert autotune["benchmarks"]
-
-        queued = service.document_ingest_pdf_book(
+        assert _resolve_scanned_doc_id(service, book_pdf)
+        queued = service.document_ingest(
             doc_id=None,
             path=str(book_pdf),
             force=True,
@@ -236,7 +221,7 @@ def test_e2e_pdf_book_autotune_ingest_search_and_assets(
             )
             assert Path(pdf_image["image"]["image_path"]).exists()
 
-        pdf_book_formulas = service.pdf_book_list_formulas(
+        pdf_book_formulas = service.pdf_list_formulas(
             doc_id=result["doc_id"],
             node_id=node_id,
             limit=20,
@@ -244,7 +229,7 @@ def test_e2e_pdf_book_autotune_ingest_search_and_assets(
         )
         assert pdf_book_formulas["formulas_count"] >= 0
         if pdf_book_formulas["formulas_count"] > 0:
-            pdf_book_formula = service.pdf_book_read_formula(
+            pdf_book_formula = service.pdf_read_formula(
                 doc_id=result["doc_id"],
                 formula_id=pdf_book_formulas["formulas"][0]["formula_id"],
             )
@@ -259,7 +244,7 @@ def test_e2e_pdf_book_autotune_ingest_search_and_assets(
 def test_e2e_epub_book_ingest_read_images_and_delete(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    samples_root, _, service = _bootstrap_e2e_service(
+    samples_root, service = _bootstrap_e2e_service(
         monkeypatch=monkeypatch,
         tmp_path=tmp_path,
         collection_suffix="epub_book",
@@ -279,7 +264,7 @@ def test_e2e_epub_book_ingest_read_images_and_delete(
         sidecars = service.storage_list_sidecars(root=str(library_root), limit=20)
         assert sidecars["documents_count"] == 1
 
-        queued = service.document_ingest_epub_book(
+        queued = service.document_ingest(
             doc_id=None,
             path=str(book_epub),
             force=True,
@@ -332,7 +317,7 @@ def test_e2e_epub_book_ingest_read_images_and_delete(
 def test_e2e_pdf_paper_ingest_outline_formulas_and_cleanup(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    samples_root, _, service = _bootstrap_e2e_service(
+    samples_root, service = _bootstrap_e2e_service(
         monkeypatch=monkeypatch,
         tmp_path=tmp_path,
         collection_suffix="pdf_paper",
@@ -352,7 +337,7 @@ def test_e2e_pdf_paper_ingest_outline_formulas_and_cleanup(
         sidecars = service.storage_list_sidecars(root=str(library_root), limit=20)
         assert sidecars["documents_count"] == 1
 
-        queued = service.document_ingest_pdf_paper(
+        queued = service.document_ingest(
             doc_id=None,
             path=str(paper_pdf),
             force=True,
@@ -377,7 +362,7 @@ def test_e2e_pdf_paper_ingest_outline_formulas_and_cleanup(
         )["hits"]
         assert isinstance(scoped_hits, list)
 
-        pdf_paper_formulas = service.pdf_paper_list_formulas(
+        pdf_paper_formulas = service.pdf_list_formulas(
             doc_id=result["doc_id"],
             node_id=node_id,
             limit=20,
@@ -385,7 +370,7 @@ def test_e2e_pdf_paper_ingest_outline_formulas_and_cleanup(
         )
         assert pdf_paper_formulas["formulas_count"] >= 0
         if pdf_paper_formulas["formulas_count"] > 0:
-            pdf_paper_formula = service.pdf_paper_read_formula(
+            pdf_paper_formula = service.pdf_read_formula(
                 doc_id=result["doc_id"],
                 formula_id=pdf_paper_formulas["formulas"][0]["formula_id"],
             )

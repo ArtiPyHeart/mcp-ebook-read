@@ -64,51 +64,25 @@ STORAGE_CLEANUP_SIDECARS = (
     "process project root is used."
 )
 
-DOCUMENT_INGEST_PDF_BOOK = (
-    "Queue high-fidelity background ingest for a non-scanned PDF book. Pass "
-    "path directly for a new file, or doc_id for an already discovered book. "
+DOCUMENT_INGEST = (
+    "Queue high-fidelity background ingest for one EPUB/PDF document. Pass "
+    "doc_id for an already scanned document, or path for a new local file. "
     "Pass root to choose the unified sidecar at <root>/.mcp-ebook-read; omitted "
-    "root uses the MCP process project root. "
-    "Persists pypdfium2 fast, PyMuPDF diagnostic, and Docling fidelity lane summaries."
-)
-
-DOCUMENT_INGEST_EPUB_BOOK = (
-    "Queue high-fidelity background ingest for an EPUB book. Pass path "
-    "directly for a new file, or doc_id for an already discovered EPUB book. "
-    "Pass root to choose the unified sidecar at <root>/.mcp-ebook-read; omitted "
-    "root uses the MCP process project root."
-)
-
-DOCUMENT_INGEST_PDF_PAPER = (
-    "Queue high-fidelity background ingest for a non-scanned PDF paper. Pass "
-    "path directly for a new file. Pass root to choose the unified sidecar at "
-    "<root>/.mcp-ebook-read; omitted root uses the MCP process project root. "
-    "Optional GROBID enriches metadata while "
-    "Docling remains the canonical page-aware structure parser. Persists "
-    "pypdfium2 fast, PyMuPDF diagnostic, and Docling fidelity lane summaries."
+    "root uses the MCP process project root. EPUB/PDF and book/paper mode are "
+    "inferred from document metadata; library_scan marks PDFs under papers/ as "
+    "paper and all other documents as book. PDF ingest persists pypdfium2 fast "
+    "preflight, PyMuPDF diagnostics, Docling structure, formulas, images, "
+    "tables, and figures."
 )
 
 DOCUMENT_INGEST_STATUS = (
     "Read current status for a background ingest job. Use after any "
-    "document_ingest_* tool until status is succeeded or failed."
+    "document_ingest call until status is succeeded or failed."
 )
 
 DOCUMENT_INGEST_LIST_JOBS = (
     "List recent ingest jobs for one document. Use when the latest job_id was "
     "lost or the user asks for ingest history."
-)
-
-DOCUMENT_AUTOTUNE_PDF_PARSER = (
-    "Benchmark Docling PDF parser profiles on sampled pages and persist the "
-    "best local performance profile. Use before long PDF ingest runs."
-)
-
-PDF_DIAGNOSE_PARSER_LANES = (
-    "Diagnose PDF parser lane tradeoffs on one local PDF without ingesting or "
-    "writing sidecar state. Compares fast pypdfium2 text extraction, optional "
-    "PyMuPDF diagnostics, optional Docling raw high-fidelity structure, and "
-    "optional PDF Oxide. Use this when deciding parser strategy for a difficult "
-    "PDF, not for normal reading."
 )
 
 DOCUMENT_EXPLORE = (
@@ -175,22 +149,15 @@ PDF_READ_FIGURE = (
     "and diagnostics."
 )
 
-PDF_BOOK_LIST_FORMULAS = (
-    "List formulas from a PDF book, optionally scoped to an outline node. Use "
-    "for formula-centric book reading; do not use the paper formula tool here."
+PDF_LIST_FORMULAS = (
+    "List formulas from an ingested PDF, optionally scoped to an outline node. "
+    "The tool infers book/paper mode from doc_id metadata; do not choose a "
+    "separate book or paper formula tool."
 )
 
-PDF_BOOK_READ_FORMULA = (
-    "Read one formula from a PDF book with LaTeX, status, context, and evidence image."
-)
-
-PDF_PAPER_LIST_FORMULAS = (
-    "List formulas from a PDF paper, optionally scoped to an outline node. Use "
-    "for formula-centric paper reading; do not use the book formula tool here."
-)
-
-PDF_PAPER_READ_FORMULA = (
-    "Read one formula from a PDF paper with LaTeX, status, context, and evidence image."
+PDF_READ_FORMULA = (
+    "Read one formula from an ingested PDF with LaTeX, status, context, and "
+    "evidence image. The tool infers book/paper mode from doc_id metadata."
 )
 
 GET_OUTLINE = (
