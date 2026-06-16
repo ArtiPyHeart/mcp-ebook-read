@@ -71,6 +71,7 @@ def test_from_env_auto_sizes_eager_ingest_resources(
 
     assert service.ingest_worker_count == 3
     assert service.pdf_parser.performance_config.num_threads == 12
+    assert service.pdf_parser.performance_config.device == "cpu"
     assert service.pdf_parser.performance_config.ocr_batch_size == 12
     service.close()
 
@@ -103,6 +104,7 @@ def test_from_env_explicit_docling_env_overrides_auto_config(
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("PDF_DOCLING_NUM_THREADS", "9")
     monkeypatch.setenv("PDF_DOCLING_BATCH_SIZE", "7")
+    monkeypatch.setenv("PDF_DOCLING_DEVICE", "mps")
     monkeypatch.setattr(
         "mcp_ebook_read.service.GrobidClient.from_env",
         lambda: OptionalGrobid(),
@@ -111,6 +113,7 @@ def test_from_env_explicit_docling_env_overrides_auto_config(
     service = AppService.from_env()
 
     assert service.pdf_parser.performance_config.num_threads == 9
+    assert service.pdf_parser.performance_config.device == "mps"
     assert service.pdf_parser.performance_config.ocr_batch_size == 7
     assert service.pdf_parser.performance_config.layout_batch_size == 7
     assert service.pdf_parser.performance_config.table_batch_size == 7

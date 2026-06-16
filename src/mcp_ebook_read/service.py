@@ -233,7 +233,7 @@ class AppService:
             batch_size = max(2, min(num_threads, memory_limit, 16))
         return PdfParserPerformanceConfig(
             num_threads=num_threads,
-            device="auto",
+            device="cpu",
             ocr_batch_size=batch_size,
             layout_batch_size=batch_size,
             table_batch_size=batch_size,
@@ -260,6 +260,7 @@ class AppService:
         return bool(
             os.environ.get("PDF_DOCLING_NUM_THREADS")
             or os.environ.get("PDF_DOCLING_BATCH_SIZE")
+            or os.environ.get("PDF_DOCLING_DEVICE")
         )
 
     @classmethod
