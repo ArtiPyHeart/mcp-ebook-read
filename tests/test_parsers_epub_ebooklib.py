@@ -151,6 +151,9 @@ def test_epub_parse_success(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> 
         "spine_id": "chap1",
         "href": "chap1.xhtml",
         "anchor": "s11",
+        "spine_index": "0",
+        "section_index": "1",
+        "cfi_like": "epubcfi-like(/spine[1]/chap1.xhtml/section[2]#s11)",
     }
     assert parsed.chunks[2].section_path == ["Appendix"]
     assert parsed.outline[0].title == "Chapter One"
@@ -160,6 +163,13 @@ def test_epub_parse_success(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> 
     assert parsed.metadata["toc_nodes"] == 3
     assert parsed.metadata["chunking"] == "heading_sections"
     assert parsed.metadata["images_extracted"] == 0
+    assert parsed.metadata["raw_artifacts_count"] == 2
+    assert set(parsed.raw_artifacts) == {
+        "spine-0000-chap1.xhtml",
+        "spine-0001-appendix.xhtml",
+    }
+    assert "First paragraph." in parsed.raw_artifacts["spine-0000-chap1.xhtml"]
+    assert "Appendix text." in parsed.raw_artifacts["spine-0001-appendix.xhtml"]
     assert "Chapter One / Section 1.1" in parsed.reading_markdown
 
 

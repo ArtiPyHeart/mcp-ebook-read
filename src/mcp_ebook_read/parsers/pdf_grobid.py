@@ -112,8 +112,11 @@ class GrobidClient:
             root.xpath("//tei:titleStmt/tei:title[1]//text()", namespaces=NS)
         ).strip()
         abstract = " ".join(root.xpath("//tei:abstract//text()", namespaces=NS)).strip()
-        doi = " ".join(
-            root.xpath("//tei:idno[@type='DOI']/text()", namespaces=NS)
+        doi = str(
+            root.xpath(
+                "string((//tei:sourceDesc//tei:biblStruct[1]//tei:idno[@type='DOI'])[1])",
+                namespaces=NS,
+            )
         ).strip()
 
         sections = root.xpath("//tei:body/tei:div", namespaces=NS)
@@ -133,10 +136,67 @@ class GrobidClient:
         biblio_count = int(
             root.xpath("count(//tei:listBibl/tei:biblStruct)", namespaces=NS)
         )
+        references: list[dict] = []
+        for idx, bibl in enumerate(
+            root.xpath("//tei:listBibl/tei:biblStruct", namespaces=NS),
+            start=1,
+        ):
+            xml_id = (
+                bibl.get("{http://www.w3.org/XML/1998/namespace}id")
+                or bibl.get("xml:id")
+                or f"ref-{idx}"
+            )
+            ref_title = " ".join(
+                bibl.xpath(
+                    ".//tei:analytic/tei:title[1]//text() | .//tei:monogr/tei:title[1]//text()",
+                    namespaces=NS,
+                )
+            ).strip()
+            authors = []
+            for author in bibl.xpath(".//tei:author", namespaces=NS):
+                author_name = " ".join(author.xpath(".//text()", namespaces=NS)).strip()
+                if author_name:
+                    authors.append(author_name)
+            date = " ".join(
+                bibl.xpath(".//tei:date/@when | .//tei:date/text()", namespaces=NS)
+            ).strip()
+            ref_doi = " ".join(
+                bibl.xpath(".//tei:idno[@type='DOI']/text()", namespaces=NS)
+            ).strip()
+            raw_text = " ".join(bibl.xpath(".//text()", namespaces=NS)).strip()
+            references.append(
+                {
+                    "reference_id": xml_id,
+                    "title": ref_title or None,
+                    "authors": authors,
+                    "date": date or None,
+                    "doi": ref_doi or None,
+                    "raw_text": raw_text or None,
+                    "source": "grobid",
+                }
+            )
+
+        citations: list[dict] = []
+        for idx, ref in enumerate(
+            root.xpath("//tei:body//tei:ref[@type='bibr']", namespaces=NS),
+            start=1,
+        ):
+            target = (ref.get("target") or "").strip()
+            text = " ".join(ref.xpath(".//text()", namespaces=NS)).strip()
+            citations.append(
+                {
+                    "citation_id": f"cite-{idx}",
+                    "target": target or None,
+                    "text": text or target or f"cite-{idx}",
+                    "source": "grobid",
+                }
+            )
         metadata = {
             "paper_title": title or None,
             "abstract": abstract or None,
             "doi": doi or None,
             "bibliography_count": biblio_count,
+            "references": references,
+            "citations": citations,
         }
         return GrobidResult(metadata=metadata, outline=outline)

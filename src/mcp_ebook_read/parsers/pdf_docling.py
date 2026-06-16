@@ -563,10 +563,14 @@ class DoclingPdfParser:
         require_formula_engine: bool = True,
         formula_batch_size: int = 1,
         performance_config: PdfParserPerformanceConfig | None = None,
+        enable_visual_images: bool = False,
+        visual_images_scale: float = 2.0,
     ) -> None:
         self.enable_docling_formula_enrichment = enable_docling_formula_enrichment
         self.require_formula_engine = require_formula_engine
         self.performance_config = performance_config or PdfParserPerformanceConfig()
+        self.enable_visual_images = enable_visual_images
+        self.visual_images_scale = max(1.0, visual_images_scale)
         self.formula_extractor = _Pix2TextFormulaExtractor(
             batch_size=formula_batch_size
         )
@@ -647,6 +651,10 @@ class DoclingPdfParser:
         options.ocr_batch_size = config.ocr_batch_size
         options.layout_batch_size = config.layout_batch_size
         options.table_batch_size = config.table_batch_size
+        if self.enable_visual_images:
+            options.generate_page_images = True
+            options.generate_picture_images = True
+            options.images_scale = self.visual_images_scale
         return options
 
     def _build_docling_converter(self) -> Any:
@@ -1048,7 +1056,21 @@ class DoclingPdfParser:
 
         return replaced, stats, formulas
 
-    def parse(self, pdf_path: str, doc_id: str) -> ParsedDocument:
+    def parse(
+        self,
+        pdf_path: str,
+        doc_id: str,
+        *,
+        visual_extractor: Any | None = None,
+        visual_tables_dir: Path | None = None,
+        visual_figures_dir: Path | None = None,
+    ) -> ParsedDocument:
+        parse_started = time.perf_counter()
+        phase_seconds: dict[str, float] = {}
+
+        def record_phase(name: str, started: float) -> None:
+            phase_seconds[name] = time.perf_counter() - started
+
         path = Path(pdf_path)
         if not path.exists():
             raise AppError(
@@ -1058,10 +1080,18 @@ class DoclingPdfParser:
 
         for attempt in range(1, _DOCLING_PARSE_ATTEMPTS + 1):
             try:
+                phase_started = time.perf_counter()
                 converter = self._get_docling_converter()
+                record_phase("docling_converter_prepare", phase_started)
+
+                phase_started = time.perf_counter()
                 result = converter.convert(str(path))
+                record_phase("docling_convert", phase_started)
+
+                phase_started = time.perf_counter()
                 document = result.document
                 markdown = document.export_to_markdown()
+                record_phase("docling_export_markdown", phase_started)
                 break
             except AppError:
                 raise
@@ -1088,13 +1118,19 @@ class DoclingPdfParser:
                     f"Docling parse failed for {pdf_path}",
                 ) from exc
 
+        phase_started = time.perf_counter()
         sections = _split_markdown_into_sections(markdown)
         formula_markers_total = sum(
             section.text.count(_FORMULA_MARKER) for section in sections
         )
-        if formula_markers_total > 0 and self.require_formula_engine:
-            self.formula_extractor._ensure_engine()
+        record_phase("split_sections_and_count_formula_markers", phase_started)
 
+        if formula_markers_total > 0 and self.require_formula_engine:
+            phase_started = time.perf_counter()
+            self.formula_extractor._ensure_engine()
+            record_phase("formula_engine_prepare", phase_started)
+
+        fitz_started = time.perf_counter()
         with fitz.open(str(path)) as pdf_doc:
             title = pdf_doc.metadata.get("title") or path.stem
             page_count = pdf_doc.page_count
@@ -1137,6 +1173,7 @@ class DoclingPdfParser:
                 page_text_cache[page] = text
                 return text
 
+            phase_started = time.perf_counter()
             outline = _build_outline_from_toc(toc, page_count)
             pages_by_title = _build_toc_page_index(outline)
             page_ranges = _assign_section_page_ranges(
@@ -1144,6 +1181,7 @@ class DoclingPdfParser:
                 page_count=page_count,
                 pages_by_title=pages_by_title,
             )
+            record_phase("toc_outline_page_ranges", phase_started)
 
             formula_cache: dict[int, list[_FormulaCandidate]] = {}
             formula_offsets: dict[int, int] = {}
@@ -1151,6 +1189,7 @@ class DoclingPdfParser:
             enhanced_sections: list[_SectionBlock] = []
             section_formulas: list[list[_ResolvedFormula]] = []
 
+            phase_started = time.perf_counter()
             for section, page_range in zip(sections, page_ranges, strict=True):
                 native_formulas = _extract_docling_latex_formulas(
                     section.text,
@@ -1180,7 +1219,10 @@ class DoclingPdfParser:
                         text=enhanced_text,
                     )
                 )
+            record_phase("formula_marker_replacement", phase_started)
+        record_phase("fitz_context_total", fitz_started)
 
+        phase_started = time.perf_counter()
         chunks: list[ChunkRecord] = []
         chunk_ids_by_section_index: dict[int, str] = {}
         for idx, (section, page_range) in enumerate(
@@ -1217,7 +1259,9 @@ class DoclingPdfParser:
 
         if not outline:
             outline = _build_outline_from_sections(enhanced_sections, page_ranges)
+        record_phase("chunk_and_outline_assembly", phase_started)
 
+        phase_started = time.perf_counter()
         formulas: list[FormulaRecord] = []
         for section_idx, (section, page_range, recovered_formulas) in enumerate(
             zip(enhanced_sections, page_ranges, section_formulas, strict=True)
@@ -1247,29 +1291,76 @@ class DoclingPdfParser:
                         status=recovered.status,
                     )
                 )
+        record_phase("formula_record_assembly", phase_started)
 
         parser_chain = [self.method]
         if formula_stats.markers_total > 0:
             parser_chain.append(_FORMULA_SOURCE)
 
+        phase_seconds["total"] = time.perf_counter() - parse_started
+        rounded_phase_seconds = {
+            name: round(seconds, 6) for name, seconds in phase_seconds.items()
+        }
+        formula_candidates_total = sum(len(items) for items in formula_cache.values())
+        metadata = {
+            "pages": page_count,
+            "toc_nodes_raw": len(toc),
+            "toc_nodes_clean": len(outline),
+            "formula_markers_total": formula_stats.markers_total,
+            "formula_extracted_by_docling_latex": (
+                formula_stats.extracted_by_docling_latex
+            ),
+            "formula_replaced_by_pix2text": formula_stats.replaced_by_engine,
+            "formula_replaced_by_fallback": formula_stats.replaced_by_fallback,
+            "formula_unresolved": formula_stats.unresolved,
+            "formula_records_total": len(formulas),
+            "formula_engine": _FORMULA_SOURCE if formula_stats.markers_total else None,
+            "formula_pages_rendered": len(formula_cache),
+            "formula_candidates_total": formula_candidates_total,
+            "pdf_parse_phase_seconds": rounded_phase_seconds,
+            "docling_formula_enrichment_enabled": self.enable_docling_formula_enrichment,
+        }
+        if (
+            visual_extractor is not None
+            and visual_tables_dir is not None
+            and visual_figures_dir is not None
+        ):
+            visual_started = time.perf_counter()
+            visual_result = visual_extractor.extract_from_document(
+                document=document,
+                doc_id=doc_id,
+                chunks=chunks,
+                tables_dir=visual_tables_dir,
+                figures_dir=visual_figures_dir,
+            )
+            phase_seconds["docling_visual_extract_from_existing_document"] = (
+                time.perf_counter() - visual_started
+            )
+            metadata["pdf_parse_phase_seconds"] = {
+                name: round(seconds, 6) for name, seconds in phase_seconds.items()
+            }
+            metadata["_pdf_visuals_from_docling_document"] = {
+                "tables": [
+                    table.model_dump(mode="json") for table in visual_result.tables
+                ],
+                "figures": [
+                    figure.model_dump(mode="json") for figure in visual_result.figures
+                ],
+                "diagnostics": visual_result.diagnostics,
+                "execution": {
+                    "mode": "single_docling_convert",
+                    "source": "docling_parse_worker",
+                },
+            }
+            phase_seconds["total"] = time.perf_counter() - parse_started
+            metadata["pdf_parse_phase_seconds"] = {
+                name: round(seconds, 6) for name, seconds in phase_seconds.items()
+            }
+
         return ParsedDocument(
             title=title,
             parser_chain=parser_chain,
-            metadata={
-                "pages": page_count,
-                "toc_nodes_raw": len(toc),
-                "toc_nodes_clean": len(outline),
-                "formula_markers_total": formula_stats.markers_total,
-                "formula_extracted_by_docling_latex": formula_stats.extracted_by_docling_latex,
-                "formula_replaced_by_pix2text": formula_stats.replaced_by_engine,
-                "formula_replaced_by_fallback": formula_stats.replaced_by_fallback,
-                "formula_unresolved": formula_stats.unresolved,
-                "formula_records_total": len(formulas),
-                "formula_engine": _FORMULA_SOURCE
-                if formula_stats.markers_total
-                else None,
-                "docling_formula_enrichment_enabled": self.enable_docling_formula_enrichment,
-            },
+            metadata=metadata,
             outline=outline,
             chunks=chunks,
             formulas=formulas,

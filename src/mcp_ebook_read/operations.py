@@ -9,7 +9,7 @@ from typing import Any, Literal
 from mcp_ebook_read import tool_descriptions as desc
 
 OperationScope = Literal["read", "write", "admin"]
-OperationFormat = Literal["epub", "pdf", "storage", "library", "generic"]
+OperationFormat = Literal["epub", "pdf", "document", "storage", "library", "generic"]
 OperationUseCase = Literal[
     "scan",
     "storage",
@@ -56,6 +56,10 @@ def _service() -> Any:
 def library_scan(root: str, patterns: list[str] | None = None) -> dict[str, Any]:
     effective_patterns = patterns or ["**/*.pdf", "**/*.epub"]
     return _service().library_scan(root=root, patterns=effective_patterns)
+
+
+def library_explore(root: str, query: str, top_k: int = 12) -> dict[str, Any]:
+    return _service().library_explore(root=root, query=query, top_k=top_k)
 
 
 def storage_list_sidecars(root: str, limit: int = 100) -> dict[str, Any]:
@@ -132,12 +136,32 @@ def document_autotune_pdf_parser(
     )
 
 
-def search(
-    query: str,
-    doc_ids: list[str] | None = None,
-    top_k: int = 20,
+def pdf_diagnose_parser_lanes(
+    doc_id: str | None = None,
+    path: str | None = None,
+    include_fidelity: bool = True,
+    include_pymupdf: bool = True,
+    include_pdf_oxide: bool = False,
+    timeout_seconds: int = 240,
+    queries: list[str] | None = None,
 ) -> dict[str, Any]:
-    return _service().search(query=query, doc_ids=doc_ids, top_k=top_k)
+    return _service().pdf_diagnose_parser_lanes(
+        doc_id=doc_id,
+        path=path,
+        include_fidelity=include_fidelity,
+        include_pymupdf=include_pymupdf,
+        include_pdf_oxide=include_pdf_oxide,
+        timeout_seconds=timeout_seconds,
+        queries=queries,
+    )
+
+
+def document_explore(doc_id: str, query: str, top_k: int = 8) -> dict[str, Any]:
+    return _service().document_explore(doc_id=doc_id, query=query, top_k=top_k)
+
+
+def document_node(doc_id: str, node_id: str) -> dict[str, Any]:
+    return _service().document_node(doc_id=doc_id, node_id=node_id)
 
 
 def search_in_outline_node(
@@ -151,20 +175,6 @@ def search_in_outline_node(
         node_id=node_id,
         query=query,
         top_k=top_k,
-    )
-
-
-def read(
-    locator: dict[str, Any],
-    before: int = 1,
-    after: int = 1,
-    format: str = "markdown",
-) -> dict[str, Any]:
-    return _service().read(
-        locator=locator,
-        before=before,
-        after=after,
-        out_format=format,
     )
 
 
@@ -291,6 +301,14 @@ OPERATIONS: tuple[ToolOperation, ...] = (
         "library_scan", library_scan, desc.LIBRARY_SCAN, "read", "library", "scan"
     ),
     ToolOperation(
+        "library_explore",
+        library_explore,
+        desc.LIBRARY_EXPLORE,
+        "read",
+        "library",
+        "search",
+    ),
+    ToolOperation(
         "storage_list_sidecars",
         storage_list_sidecars,
         desc.STORAGE_LIST_SIDECARS,
@@ -362,7 +380,30 @@ OPERATIONS: tuple[ToolOperation, ...] = (
         "pdf",
         "ingest",
     ),
-    ToolOperation("search", search, desc.SEARCH, "read", "generic", "search"),
+    ToolOperation(
+        "pdf_diagnose_parser_lanes",
+        pdf_diagnose_parser_lanes,
+        desc.PDF_DIAGNOSE_PARSER_LANES,
+        "read",
+        "pdf",
+        "diagnostic",
+    ),
+    ToolOperation(
+        "document_explore",
+        document_explore,
+        desc.DOCUMENT_EXPLORE,
+        "read",
+        "document",
+        "search",
+    ),
+    ToolOperation(
+        "document_node",
+        document_node,
+        desc.DOCUMENT_NODE,
+        "read",
+        "document",
+        "read",
+    ),
     ToolOperation(
         "search_in_outline_node",
         search_in_outline_node,
@@ -371,7 +412,6 @@ OPERATIONS: tuple[ToolOperation, ...] = (
         "generic",
         "search",
     ),
-    ToolOperation("read", read, desc.READ, "read", "generic", "read"),
     ToolOperation(
         "read_outline_node",
         read_outline_node,

@@ -349,7 +349,68 @@ def test_docling_parse_success(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) 
     assert parsed.metadata["toc_nodes_raw"] == 2
     assert parsed.metadata["toc_nodes_clean"] == 2
     assert parsed.metadata["formula_markers_total"] == 0
+    assert parsed.metadata["formula_pages_rendered"] == 0
+    assert parsed.metadata["formula_candidates_total"] == 0
+    assert parsed.metadata["pdf_parse_phase_seconds"]["total"] >= 0
+    assert "docling_convert" in parsed.metadata["pdf_parse_phase_seconds"]
     assert parsed.formulas == []
+
+
+def test_docling_parse_can_extract_visuals_from_same_document(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    parser = DoclingPdfParser(enable_visual_images=True, visual_images_scale=3.0)
+    pdf = tmp_path / "visuals.pdf"
+    pdf.write_bytes(b"pdf")
+
+    install_fake_docling(monkeypatch, SuccessfulConverter)
+    monkeypatch.setattr(
+        "mcp_ebook_read.parsers.pdf_docling.fitz.open",
+        lambda _path: FakePdfDoc(
+            title="Visual PDF",
+            page_count=2,
+            toc=[[1, "Intro", 1]],
+            page_texts=["Intro text", "More text"],
+        ),
+    )
+
+    class RecordingVisualExtractor:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        def extract_from_document(self, **kwargs):  # noqa: ANN001, ANN201
+            self.calls.append(kwargs)
+            return types.SimpleNamespace(
+                tables=[],
+                figures=[],
+                diagnostics={"extractor": "fake-visuals"},
+            )
+
+    visual_extractor = RecordingVisualExtractor()
+    parsed = parser.parse(
+        str(pdf),
+        "doc-visuals",
+        visual_extractor=visual_extractor,
+        visual_tables_dir=tmp_path / "tables",
+        visual_figures_dir=tmp_path / "figures",
+    )
+
+    assert len(visual_extractor.calls) == 1
+    assert visual_extractor.calls[0]["doc_id"] == "doc-visuals"
+    assert visual_extractor.calls[0]["chunks"]
+    embedded = parsed.metadata["_pdf_visuals_from_docling_document"]
+    assert embedded["diagnostics"]["extractor"] == "fake-visuals"
+    assert embedded["execution"]["mode"] == "single_docling_convert"
+    assert (
+        "docling_visual_extract_from_existing_document"
+        in parsed.metadata["pdf_parse_phase_seconds"]
+    )
+    converter = parser._converter
+    assert converter is not None
+    pipeline_options = converter.init_kwargs["format_options"]["pdf"].pipeline_options
+    assert pipeline_options.generate_page_images is True
+    assert pipeline_options.generate_picture_images is True
+    assert pipeline_options.images_scale == 3.0
 
 
 def test_docling_parse_skips_page_loading_without_formula_markers(
@@ -455,6 +516,9 @@ def test_docling_parse_replaces_formula_marker(
     assert parsed.metadata["formula_markers_total"] == 1
     assert parsed.metadata["formula_replaced_by_pix2text"] == 1
     assert parsed.metadata["formula_records_total"] == 1
+    assert parsed.metadata["formula_pages_rendered"] == 1
+    assert parsed.metadata["formula_candidates_total"] == 1
+    assert parsed.metadata["pdf_parse_phase_seconds"]["formula_marker_replacement"] >= 0
     assert "<!-- formula-not-decoded -->" not in parsed.chunks[0].text
     assert r"\frac{a}{b}" in parsed.chunks[0].text
     assert len(parsed.formulas) == 1

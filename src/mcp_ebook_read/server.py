@@ -17,11 +17,12 @@ from mcp_ebook_read.errors import AppError, ErrorCode, to_error_payload
 from mcp_ebook_read.logging import make_trace_id, setup_logging
 from mcp_ebook_read.operations import OPERATIONS, set_service_provider
 from mcp_ebook_read.service import AppService
+from mcp_ebook_read.tool_descriptions import SERVER_INSTRUCTIONS
 
 setup_logging()
 logger = logging.getLogger(__name__)
 
-mcp = FastMCP("mcp-ebook-read")
+mcp = FastMCP("mcp-ebook-read", instructions=SERVER_INSTRUCTIONS)
 service: AppService | None = None
 T = TypeVar("T")
 
@@ -59,10 +60,10 @@ def _shutdown_service() -> None:
 def _require_service() -> AppService:
     if service is None:
         raise AppError(
-            ErrorCode.STARTUP_DEPENDENCY_NOT_READY,
+            ErrorCode.STARTUP_CONFIG_INVALID,
             "Service is not initialized.",
             details={
-                "hint": "Startup preflight failed or cli_entry() was not used.",
+                "hint": "Startup configuration failed or cli_entry() was not used.",
             },
         )
     return service

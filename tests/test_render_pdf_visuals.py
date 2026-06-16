@@ -258,6 +258,44 @@ def test_docling_pdf_visual_extractor_merges_adjacent_tables_and_extracts_figure
     assert result.diagnostics["figures"][figure.figure_id]["issues"] == []
 
 
+def test_docling_pdf_visual_extractor_extracts_from_existing_document(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    extractor = DoclingPdfVisualExtractor()
+    document = _FakeDocument(
+        tables=[
+            _FakeTableItem(
+                page=1,
+                bbox=(10.0, 100.0, 540.0, 220.0),
+                headers=["Metric", "Value"],
+                rows=[["latency", "10ms"]],
+                image=Image.new("RGB", (300, 120), "white"),
+                caption_refs=["#/captions/0"],
+            )
+        ],
+        pictures=[],
+        caption_items=[_FakeTextItem("#/captions/0", "Table 1: Latency")],
+    )
+    monkeypatch.setattr(
+        extractor,
+        "_build_docling_converter",
+        lambda: (_ for _ in ()).throw(AssertionError("converter should not run")),
+    )
+
+    result = extractor.extract_from_document(
+        document=document,
+        doc_id="doc-existing",
+        chunks=[_chunk("doc-existing", "chunk-1", 1, 1)],
+        tables_dir=tmp_path / "tables",
+        figures_dir=tmp_path / "figures",
+    )
+
+    assert len(result.tables) == 1
+    assert result.tables[0].caption == "Table 1: Latency"
+    assert result.diagnostics["summary"]["tables_returned"] == 1
+
+
 def test_docling_pdf_visual_extractor_keeps_tables_separate_when_headers_change(
     tmp_path: Path,
     monkeypatch,

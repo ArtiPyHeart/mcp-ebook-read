@@ -14,16 +14,6 @@ from mcp_ebook_read.schema.models import (
 from mcp_ebook_read.service import AppService
 
 
-class DummyVectorIndex:
-    def rebuild_document(
-        self, doc_id: str, title: str, chunks: list[ChunkRecord]
-    ) -> None:
-        return None
-
-    def search(self, query: str, top_k: int = 20, doc_ids: list[str] | None = None):
-        return []
-
-
 class DummyParser:
     def parse(self, pdf_path: str, doc_id: str):
         raise NotImplementedError
@@ -37,7 +27,6 @@ class DummyGrobid:
 def build_service(tmp_path: Path) -> AppService:
     return AppService(
         sidecar_dir_name=".mcp-ebook-read",
-        vector_index=DummyVectorIndex(),
         pdf_parser=DummyParser(),
         grobid_client=DummyGrobid(),
         epub_parser=DummyParser(),

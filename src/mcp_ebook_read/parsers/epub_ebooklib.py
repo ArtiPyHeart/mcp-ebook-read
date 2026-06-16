@@ -136,6 +136,36 @@ def _element_anchor(node: html.HtmlElement) -> str:
     return ""
 
 
+def _safe_raw_artifact_name(*, spine_index: int, spine_href: str, spine_id: str) -> str:
+    stem = Path(spine_href or spine_id or f"spine-{spine_index}").name
+    if not stem:
+        stem = f"spine-{spine_index}"
+    if not Path(stem).suffix:
+        stem = f"{stem}.xhtml"
+    safe_stem = "".join(
+        char if char.isalnum() or char in {"-", "_", "."} else "_" for char in stem
+    ).strip("._")
+    return f"spine-{spine_index:04d}-{safe_stem or 'document.xhtml'}"
+
+
+def _cfi_like_locator(
+    *,
+    spine_index: int,
+    spine_id: str,
+    spine_href: str,
+    section_index: int,
+    anchor: str,
+) -> str:
+    anchor_part = f"#{anchor}" if anchor else ""
+    href_part = spine_href or spine_id
+    return (
+        "epubcfi-like("
+        f"/spine[{spine_index + 1}]/{href_part}"
+        f"/section[{section_index + 1}]{anchor_part}"
+        ")"
+    )
+
+
 class EbooklibEpubParser:
     """Single path EPUB parser."""
 
@@ -226,6 +256,7 @@ class EbooklibEpubParser:
         chunks: list[ChunkRecord] = []
         markdown_parts: list[str] = []
         extracted_images: list[ExtractedImage] = []
+        raw_artifacts: dict[str, str] = {}
 
         asset_map: dict[str, tuple[bytes, str | None]] = {}
         get_items = getattr(book, "get_items", None)
@@ -253,15 +284,30 @@ class EbooklibEpubParser:
             if item is None or item.get_type() != ITEM_DOCUMENT:
                 continue
 
+            spine_href = _normalize_href_path(str(item.get_name() or spine_id))
             try:
-                dom = html.fromstring(item.get_content())
+                item_content = bytes(item.get_content())
+            except Exception as exc:  # noqa: BLE001
+                raise AppError(
+                    ErrorCode.INGEST_EPUB_PARSE_FAILED,
+                    f"Failed to read XHTML spine item: {spine_id}",
+                ) from exc
+            raw_artifacts[
+                _safe_raw_artifact_name(
+                    spine_index=spine_index,
+                    spine_href=spine_href,
+                    spine_id=spine_id,
+                )
+            ] = item_content.decode("utf-8", errors="replace")
+
+            try:
+                dom = html.fromstring(item_content)
             except Exception as exc:  # noqa: BLE001
                 raise AppError(
                     ErrorCode.INGEST_EPUB_PARSE_FAILED,
                     f"Invalid XHTML in spine item: {spine_id}",
                 ) from exc
 
-            spine_href = _normalize_href_path(str(item.get_name() or spine_id))
             spine_path = toc_paths.get(spine_href, [spine_id])
             if not spine_path:
                 spine_path = [spine_id]
@@ -331,6 +377,15 @@ class EbooklibEpubParser:
                     epub_locator["href"] = spine_href
                 if current_anchor:
                     epub_locator["anchor"] = current_anchor
+                epub_locator["spine_index"] = str(spine_index)
+                epub_locator["section_index"] = str(section_counter)
+                epub_locator["cfi_like"] = _cfi_like_locator(
+                    spine_index=spine_index,
+                    spine_id=spine_id,
+                    spine_href=spine_href,
+                    section_index=section_counter,
+                    anchor=current_anchor,
+                )
 
                 locator = Locator(
                     doc_id=doc_id,
@@ -485,11 +540,12 @@ class EbooklibEpubParser:
                 "toc_nodes": toc_counter,
                 "chunking": "heading_sections",
                 "images_extracted": len(extracted_images),
+                "raw_artifacts_count": len(raw_artifacts),
             },
             outline=outline,
             chunks=chunks,
             images=extracted_images,
             reading_markdown="\n\n".join(markdown_parts),
-            raw_artifacts={},
+            raw_artifacts=raw_artifacts,
             overall_confidence=None,
         )

@@ -130,12 +130,26 @@ def test_matches_outline_node_accepts_prefix_without_spine() -> None:
     )
 
 
-def test_matches_outline_node_falls_back_to_leaf_title_equality() -> None:
+def test_matches_outline_node_rejects_conflicting_full_paths() -> None:
     node = OutlineNode(id="leaf-node", title="Summary", level=2)
     assert (
         matches_outline_node(
             page_range=None,
             section_path=["Appendix", "Summary"],
+            spine_id=None,
+            node=node,
+            node_path=["Chapter One", "Summary"],
+        )
+        is False
+    )
+
+
+def test_matches_outline_node_falls_back_to_bare_leaf_title_equality() -> None:
+    node = OutlineNode(id="leaf-node", title="Summary", level=2)
+    assert (
+        matches_outline_node(
+            page_range=None,
+            section_path=["Summary"],
             spine_id=None,
             node=node,
             node_path=["Chapter One", "Summary"],

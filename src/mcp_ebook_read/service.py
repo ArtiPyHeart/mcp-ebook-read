@@ -4,24 +4,26 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import UTC, datetime
 import json
 import hashlib
 import logging
 import os
+import re
 from queue import Empty, Queue
 import shutil
 import subprocess
 import sys
 import threading
+import time
 import traceback
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
 from mcp_ebook_read.errors import AppError, ErrorCode, to_error_payload
-from mcp_ebook_read.index.vector import QdrantVectorIndex
 from mcp_ebook_read.outline import (
     find_outline_node,
     matches_outline_node,
@@ -34,8 +36,12 @@ from mcp_ebook_read.outline import (
 from mcp_ebook_read.parsers.epub_ebooklib import EbooklibEpubParser
 from mcp_ebook_read.parsers.pdf_docling import DoclingPdfParser
 from mcp_ebook_read.parsers.pdf_grobid import GrobidClient
+from mcp_ebook_read.parsers.pdf_pypdfium2 import Pypdfium2PdfParser
 from mcp_ebook_read.render.pdf_images import PdfImageExtractor
-from mcp_ebook_read.render.pdf_visuals import DoclingPdfVisualExtractor
+from mcp_ebook_read.render.pdf_visuals import (
+    DoclingPdfVisualExtractor,
+    PdfVisualExtractionResult,
+)
 from mcp_ebook_read.render.pdf_render import render_pdf_page, render_pdf_region
 from mcp_ebook_read.schema.models import (
     ChunkRecord,
@@ -66,7 +72,8 @@ _PIPELINE_SCHEMA_VERSION = 1
 _CHUNKER_VERSION = "chunker-v2-outline-aware"
 _SEARCH_TEXT_VERSION = "search-text-v2-fts5"
 _PDF_FORMULA_PIPELINE_VERSION = "docling-formula-enrichment-pix2text-v1"
-_PDF_VISUAL_PIPELINE_VERSION = "docling-visuals-on-demand-v1"
+_PDF_VISUAL_PIPELINE_VERSION = "docling-visuals-eager-v2"
+_PDF_DIAGNOSTIC_PIPELINE_VERSION = "pymupdf-diagnostic-lane-v1"
 _EPUB_IMAGE_PIPELINE_VERSION = "ebooklib-image-extraction-v1"
 
 
@@ -84,32 +91,39 @@ class AppService:
         self,
         *,
         sidecar_dir_name: str,
-        vector_index: QdrantVectorIndex,
         pdf_parser: DoclingPdfParser,
         pdf_image_extractor: PdfImageExtractor | None = None,
         pdf_visual_extractor: DoclingPdfVisualExtractor | None = None,
         grobid_client: GrobidClient,
         epub_parser: EbooklibEpubParser,
+        pdf_parse_timeout_seconds: int = 1800,
+        ingest_worker_count: int = 1,
     ) -> None:
         self.sidecar_dir_name = sidecar_dir_name
-        self.vector_index = vector_index
         self.pdf_parser = pdf_parser
         self.pdf_image_extractor = pdf_image_extractor
         self.pdf_visual_extractor = pdf_visual_extractor
         self.grobid_client = grobid_client
         self.epub_parser = epub_parser
+        self.pdf_parse_timeout_seconds = pdf_parse_timeout_seconds
+        self.ingest_worker_count = max(1, ingest_worker_count)
         self._catalogs: dict[str, CatalogStore] = {}
         self._doc_catalog_index: dict[str, str] = {}
         self._known_roots: set[str] = set()
         self._ingest_queue: Queue[_IngestQueueItem] = Queue()
         self._ingest_lock = threading.Lock()
+        self._active_pdf_parse_lock = threading.Lock()
+        self._active_pdf_parses = 0
         self._closed = False
-        self._ingest_worker = threading.Thread(
-            target=self._ingest_worker_loop,
-            name="mcp-ebook-read-ingest-worker",
-            daemon=True,
-        )
-        self._ingest_worker.start()
+        self._ingest_workers: list[threading.Thread] = []
+        for worker_index in range(self.ingest_worker_count):
+            worker = threading.Thread(
+                target=self._ingest_worker_loop,
+                name=f"mcp-ebook-read-ingest-worker-{worker_index + 1}",
+                daemon=True,
+            )
+            self._ingest_workers.append(worker)
+            worker.start()
 
     _INGEST_STAGE_TOTAL = 6
     _INGEST_STAGE_DONE: dict[IngestStage, int] = {
@@ -174,6 +188,60 @@ class AppService:
         return max(1, min(cpu_limit, memory_limit))
 
     @classmethod
+    def _auto_ingest_worker_count(cls) -> int:
+        cpu_count = max(1, os.cpu_count() or 1)
+        memory_bytes = cls._detect_total_memory_bytes()
+        cpu_limit = max(1, min(4, cpu_count // 4))
+        if memory_bytes is None:
+            memory_limit = 2 if cpu_count >= 8 else 1
+        else:
+            memory_gib = memory_bytes / (1024**3)
+            memory_limit = max(1, min(4, int(memory_gib // 8)))
+        return max(1, min(cpu_limit, memory_limit))
+
+    @classmethod
+    def _auto_docling_performance_config(cls) -> PdfParserPerformanceConfig:
+        cpu_count = max(1, os.cpu_count() or 1)
+        memory_bytes = cls._detect_total_memory_bytes()
+        num_threads = max(1, min(cpu_count, 16))
+        if memory_bytes is None:
+            batch_size = max(4, min(num_threads, 8))
+        else:
+            memory_gib = memory_bytes / (1024**3)
+            memory_limit = max(1, int(memory_gib // 2))
+            batch_size = max(2, min(num_threads, memory_limit, 16))
+        return PdfParserPerformanceConfig(
+            num_threads=num_threads,
+            device="auto",
+            ocr_batch_size=batch_size,
+            layout_batch_size=batch_size,
+            table_batch_size=batch_size,
+        )
+
+    @staticmethod
+    def _scale_pdf_performance_for_active_parses(
+        config: PdfParserPerformanceConfig,
+        *,
+        active_pdf_parses: int,
+    ) -> PdfParserPerformanceConfig:
+        if active_pdf_parses <= 1:
+            return config
+        return PdfParserPerformanceConfig(
+            num_threads=max(1, config.num_threads // active_pdf_parses),
+            device=config.device,
+            ocr_batch_size=max(1, config.ocr_batch_size // active_pdf_parses),
+            layout_batch_size=max(1, config.layout_batch_size // active_pdf_parses),
+            table_batch_size=max(1, config.table_batch_size // active_pdf_parses),
+        )
+
+    @staticmethod
+    def _docling_performance_env_overridden() -> bool:
+        return bool(
+            os.environ.get("PDF_DOCLING_NUM_THREADS")
+            or os.environ.get("PDF_DOCLING_BATCH_SIZE")
+        )
+
+    @classmethod
     def _resolve_formula_batch_size(cls) -> int:
         raw_value = os.environ.get("PDF_FORMULA_BATCH_SIZE")
         if raw_value is None or not raw_value.strip():
@@ -187,14 +255,14 @@ class AppService:
             batch_size = int(raw_value)
         except ValueError as exc:
             raise AppError(
-                ErrorCode.STARTUP_DEPENDENCY_NOT_READY,
+                ErrorCode.STARTUP_CONFIG_INVALID,
                 "PDF_FORMULA_BATCH_SIZE must be a positive integer or 'auto'.",
                 details={"env": "PDF_FORMULA_BATCH_SIZE", "value": raw_value},
             ) from exc
 
         if batch_size < 1:
             raise AppError(
-                ErrorCode.STARTUP_DEPENDENCY_NOT_READY,
+                ErrorCode.STARTUP_CONFIG_INVALID,
                 "PDF_FORMULA_BATCH_SIZE must be >= 1.",
                 details={"env": "PDF_FORMULA_BATCH_SIZE", "value": raw_value},
             )
@@ -259,15 +327,38 @@ class AppService:
             value = int(raw_value)
         except ValueError as exc:
             raise AppError(
-                ErrorCode.STARTUP_DEPENDENCY_NOT_READY,
+                ErrorCode.STARTUP_CONFIG_INVALID,
                 f"{env_name} must be a positive integer.",
                 details={"env": env_name, "value": raw_value},
             ) from exc
         if value < 1:
             raise AppError(
-                ErrorCode.STARTUP_DEPENDENCY_NOT_READY,
+                ErrorCode.STARTUP_CONFIG_INVALID,
                 f"{env_name} must be >= 1.",
                 details={"env": env_name, "value": raw_value},
+            )
+        return value
+
+    @classmethod
+    def _resolve_ingest_worker_count(cls) -> int:
+        raw_value = os.environ.get("MCP_EBOOK_INGEST_WORKERS")
+        if raw_value is None or not raw_value.strip():
+            raw_value = "auto"
+        if raw_value.strip().lower() == "auto":
+            return cls._auto_ingest_worker_count()
+        try:
+            value = int(raw_value)
+        except ValueError as exc:
+            raise AppError(
+                ErrorCode.STARTUP_CONFIG_INVALID,
+                "MCP_EBOOK_INGEST_WORKERS must be a positive integer or 'auto'.",
+                details={"env": "MCP_EBOOK_INGEST_WORKERS", "value": raw_value},
+            ) from exc
+        if value < 1:
+            raise AppError(
+                ErrorCode.STARTUP_CONFIG_INVALID,
+                "MCP_EBOOK_INGEST_WORKERS must be >= 1.",
+                details={"env": "MCP_EBOOK_INGEST_WORKERS", "value": raw_value},
             )
         return value
 
@@ -277,7 +368,7 @@ class AppService:
         base = (
             tuned_profile.selected_config
             if tuned_profile is not None
-            else PdfParserPerformanceConfig()
+            else cls._auto_docling_performance_config()
         )
         batch_size = cls._resolve_positive_int_env(
             env_name="PDF_DOCLING_BATCH_SIZE",
@@ -307,55 +398,20 @@ class AppService:
                 return default
             return value.strip().lower() in {"1", "true", "yes", "on"}
 
-        qdrant_url = os.environ.get("QDRANT_URL")
-        vector_index: QdrantVectorIndex | None = None
-        if not qdrant_url:
-            preflight_errors.append(
-                {
-                    "component": "qdrant",
-                    "code": ErrorCode.SEARCH_INDEX_NOT_READY,
-                    "message": "QDRANT_URL is not configured.",
-                    "details": {"required_env": "QDRANT_URL"},
-                }
-            )
-        else:
-            try:
-                vector_index = QdrantVectorIndex.from_env(check_backend_ready=False)
-            except AppError as exc:
-                preflight_errors.append(
-                    {
-                        "component": "qdrant",
-                        "code": exc.code,
-                        "message": exc.message,
-                        "details": exc.details or None,
-                    }
-                )
-
         grobid_client = GrobidClient.from_env()
-        if vector_index is not None:
-            try:
-                vector_index.assert_ready()
-            except AppError as exc:
-                preflight_errors.append(
-                    {
-                        "component": "qdrant",
-                        "code": exc.code,
-                        "message": exc.message,
-                        "details": exc.details or None,
-                    }
-                )
 
         try:
-            grobid_client.assert_available()
+            ingest_worker_count = cls._resolve_ingest_worker_count()
         except AppError as exc:
             preflight_errors.append(
                 {
-                    "component": "grobid",
+                    "component": "config",
                     "code": exc.code,
                     "message": exc.message,
                     "details": exc.details or None,
                 }
             )
+            ingest_worker_count = 1
 
         try:
             formula_batch_size = cls._resolve_formula_batch_size()
@@ -383,29 +439,43 @@ class AppService:
             )
             docling_performance_config = PdfParserPerformanceConfig()
 
+        try:
+            pdf_parse_timeout_seconds = cls._resolve_positive_int_env(
+                env_name="PDF_PARSE_TIMEOUT_SECONDS",
+                default=1800,
+            )
+        except AppError as exc:
+            preflight_errors.append(
+                {
+                    "component": "config",
+                    "code": exc.code,
+                    "message": exc.message,
+                    "details": exc.details or None,
+                }
+            )
+            pdf_parse_timeout_seconds = 1800
+
         if preflight_errors:
             raise AppError(
-                ErrorCode.STARTUP_DEPENDENCY_NOT_READY,
-                "Startup dependency preflight failed. Configure and start required components before running mcp-ebook-read.",
+                ErrorCode.STARTUP_CONFIG_INVALID,
+                "Startup configuration is invalid. Fix the listed environment values before running mcp-ebook-read.",
                 details={
-                    "failed_components": preflight_errors,
-                    "required_env": {
-                        "QDRANT_URL": "http://127.0.0.1:6333",
+                    "invalid_config": preflight_errors,
+                    "required_env": {},
+                    "optional_env": {
                         "GROBID_URL": "http://127.0.0.1:8070",
                         "GROBID_TIMEOUT_SECONDS": "120",
+                        "MCP_EBOOK_INGEST_WORKERS": "auto",
+                        "PDF_DOCLING_NUM_THREADS": "auto-derived",
+                        "PDF_DOCLING_BATCH_SIZE": "auto-derived",
+                        "PDF_FORMULA_BATCH_SIZE": "auto",
                     },
-                    "quick_start": {
-                        "qdrant": "docker rm -f qdrant 2>/dev/null || true && docker run -d --name qdrant -p 6333:6333 -p 6334:6334 qdrant/qdrant:v1.18.1",
-                        "grobid": "docker rm -f grobid 2>/dev/null || true && docker run -d --name grobid --init --ulimit core=0 -p 8070:8070 grobid/grobid:0.9.0-crf",
-                    },
-                    "setup_reference": "See README.md: One-Command Docker Setup and Run MCP Server",
+                    "setup_reference": "See README.md: Optional GROBID Paper Enrichment",
                 },
             )
 
-        assert vector_index is not None
         return cls(
             sidecar_dir_name=".mcp-ebook-read",
-            vector_index=vector_index,
             pdf_parser=DoclingPdfParser(
                 enable_docling_formula_enrichment=env_bool(
                     "DOCLING_FORMULA_ENRICHMENT", True
@@ -420,6 +490,8 @@ class AppService:
             ),
             grobid_client=grobid_client,
             epub_parser=EbooklibEpubParser(),
+            pdf_parse_timeout_seconds=pdf_parse_timeout_seconds,
+            ingest_worker_count=ingest_worker_count,
         )
 
     def _catalog_key(self, catalog: CatalogStore) -> str:
@@ -537,8 +609,16 @@ class AppService:
         self, doc_id: str | None, path: str | None
     ) -> tuple[DocumentRecord, CatalogStore]:
         if path:
-            catalog = self._catalog_for_document_path(path)
-            doc = catalog.get_document_by_path(path)
+            resolved_path = Path(path).expanduser().resolve()
+            if not resolved_path.exists() or not resolved_path.is_file():
+                raise AppError(
+                    ErrorCode.INGEST_DOC_NOT_FOUND,
+                    f"Document not found: {path}",
+                    details={"doc_id": doc_id, "path": str(resolved_path)},
+                )
+            doc_type = self._doc_type_from_path(resolved_path)
+            catalog = self._catalog_for_document_path(resolved_path)
+            doc = catalog.get_document_by_path(str(resolved_path))
             if doc:
                 self._bind_doc_catalog(doc.doc_id, catalog)
                 if doc_id and doc.doc_id != doc_id:
@@ -548,10 +628,33 @@ class AppService:
                         details={
                             "doc_id": doc_id,
                             "resolved_doc_id": doc.doc_id,
-                            "path": str(Path(path).expanduser().resolve()),
+                            "path": str(resolved_path),
                         },
                     )
                 return doc, catalog
+
+            sha256 = self._compute_sha256(resolved_path)
+            resolved_doc_id = sha256[:16]
+            if doc_id and doc_id != resolved_doc_id:
+                raise AppError(
+                    ErrorCode.INGEST_DOC_NOT_FOUND,
+                    "doc_id does not match the document at path",
+                    details={
+                        "doc_id": doc_id,
+                        "resolved_doc_id": resolved_doc_id,
+                        "path": str(resolved_path),
+                    },
+                )
+            doc = DocumentRecord(
+                doc_id=resolved_doc_id,
+                path=str(resolved_path),
+                type=doc_type,
+                sha256=sha256,
+                mtime=resolved_path.stat().st_mtime,
+            )
+            catalog.upsert_scanned_document(doc)
+            self._bind_doc_catalog(doc.doc_id, catalog)
+            return doc, catalog
 
         if doc_id:
             return self._require_doc(
@@ -564,8 +667,12 @@ class AppService:
             ErrorCode.INGEST_DOC_NOT_FOUND, "Document not found by doc_id or path"
         )
 
-    def _resolve_pdf_path_for_autotune(
-        self, doc_id: str | None, path: str | None
+    def _resolve_pdf_path_for_operation(
+        self,
+        doc_id: str | None,
+        path: str | None,
+        *,
+        operation_name: str,
     ) -> tuple[Path, str | None]:
         if path:
             resolved = Path(path).expanduser().resolve()
@@ -577,7 +684,7 @@ class AppService:
             if resolved.suffix.lower() != ".pdf":
                 raise AppError(
                     ErrorCode.INGEST_UNSUPPORTED_TYPE,
-                    "document_autotune_pdf_parser only supports PDF documents",
+                    f"{operation_name} only supports PDF documents",
                     details={"path": str(resolved)},
                 )
             if doc_id is not None:
@@ -585,7 +692,7 @@ class AppService:
                 if resolved_doc.type != DocumentType.PDF:
                     raise AppError(
                         ErrorCode.INGEST_UNSUPPORTED_TYPE,
-                        "document_autotune_pdf_parser only supports PDF documents",
+                        f"{operation_name} only supports PDF documents",
                         details={
                             "doc_id": resolved_doc.doc_id,
                             "type": resolved_doc.type,
@@ -608,10 +715,19 @@ class AppService:
         if doc.type != DocumentType.PDF:
             raise AppError(
                 ErrorCode.INGEST_UNSUPPORTED_TYPE,
-                "document_autotune_pdf_parser only supports PDF documents",
+                f"{operation_name} only supports PDF documents",
                 details={"doc_id": doc.doc_id, "type": doc.type},
             )
         return Path(doc.path).expanduser().resolve(), doc.doc_id
+
+    def _resolve_pdf_path_for_autotune(
+        self, doc_id: str | None, path: str | None
+    ) -> tuple[Path, str | None]:
+        return self._resolve_pdf_path_for_operation(
+            doc_id,
+            path,
+            operation_name="document_autotune_pdf_parser",
+        )
 
     def _doc_type_from_path(self, path: Path) -> DocumentType:
         suffix = path.suffix.lower()
@@ -631,6 +747,33 @@ class AppService:
                 h.update(chunk)
         return h.hexdigest()
 
+    def _scan_worker_count(self, document_count: int) -> int:
+        if document_count <= 1:
+            return 1
+        cpu_count = max(1, os.cpu_count() or 1)
+        return max(
+            1,
+            min(
+                document_count,
+                cpu_count,
+                max(2, self.ingest_worker_count * 2),
+                8,
+            ),
+        )
+
+    def _scan_document_file(self, path: Path) -> dict[str, Any]:
+        abs_path = str(path.resolve())
+        file_type = self._doc_type_from_path(path)
+        sha256 = self._compute_sha256(path)
+        return {
+            "doc_id": sha256[:16],
+            "path": abs_path,
+            "path_obj": path,
+            "type": file_type,
+            "sha256": sha256,
+            "mtime": path.stat().st_mtime,
+        }
+
     def _now_iso(self) -> str:
         return datetime.now(UTC).isoformat()
 
@@ -638,6 +781,7 @@ class AppService:
         self, doc: DocumentRecord, catalog: CatalogStore
     ) -> dict[str, Any]:
         chunks = catalog.list_chunks(doc.doc_id)
+        pdf_parser_lanes = doc.metadata.get("pdf_parser_lanes")
         return {
             "doc_id": doc.doc_id,
             "profile": doc.profile,
@@ -645,9 +789,16 @@ class AppService:
             "chunks_count": len(chunks),
             "formulas_count": len(catalog.list_formulas(doc.doc_id)),
             "images_count": len(catalog.list_images(doc.doc_id)),
+            "pdf_tables_count": len(catalog.list_pdf_tables(doc.doc_id)),
+            "pdf_figures_count": len(catalog.list_pdf_figures(doc.doc_id)),
             "outline_depth": max((node.level for node in doc.outline), default=0),
             "overall_confidence": doc.overall_confidence,
             "pipeline_status": self._document_pipeline_status(doc),
+            **(
+                {"pdf_parser_lanes": pdf_parser_lanes}
+                if isinstance(pdf_parser_lanes, dict)
+                else {}
+            ),
         }
 
     def _stable_digest(self, payload: dict[str, Any]) -> str:
@@ -685,6 +836,10 @@ class AppService:
                     getattr(self.pdf_parser, "performance_config", None)
                 ),
             },
+            "ingest": {
+                "mode": "eager_full_parse",
+                "worker_count": self.ingest_worker_count,
+            },
             "epub_parser": {"class": type(self.epub_parser).__name__},
             "pdf_image_extractor": {
                 "class": type(self.pdf_image_extractor).__name__
@@ -718,6 +873,9 @@ class AppService:
             "pdf_visuals": _PDF_VISUAL_PIPELINE_VERSION
             if doc_type == DocumentType.PDF
             else None,
+            "pdf_diagnostic": _PDF_DIAGNOSTIC_PIPELINE_VERSION
+            if doc_type == DocumentType.PDF
+            else None,
             "epub_images": _EPUB_IMAGE_PIPELINE_VERSION
             if doc_type == DocumentType.EPUB
             else None,
@@ -747,6 +905,37 @@ class AppService:
                 if isinstance(stored, dict)
                 else None,
             }
+        source_path = Path(doc.path)
+        if not source_path.exists():
+            return {
+                "is_stale": True,
+                "reason": "source_path_missing",
+                "freshness": "source_missing",
+                "current_digest": current["digest"],
+                "stored_digest": stored.get("digest")
+                if isinstance(stored, dict)
+                else None,
+                "path": doc.path,
+                "hint": "The source file no longer exists. Restore it or run storage_cleanup_sidecars(root=...) to prune stale records.",
+            }
+        current_mtime = source_path.stat().st_mtime
+        if abs(float(current_mtime) - float(doc.mtime)) > 1e-6:
+            current_sha256 = self._compute_sha256(source_path)
+            if current_sha256 != doc.sha256:
+                return {
+                    "is_stale": True,
+                    "reason": "source_file_changed",
+                    "freshness": "needs_reingest",
+                    "stored_sha256": doc.sha256,
+                    "current_sha256": current_sha256,
+                    "stored_mtime": doc.mtime,
+                    "current_mtime": current_mtime,
+                    "current_digest": current["digest"],
+                    "stored_digest": stored.get("digest")
+                    if isinstance(stored, dict)
+                    else None,
+                    "hint": self._reingest_hint(doc),
+                }
         if not isinstance(stored, dict):
             return {
                 "is_stale": True,
@@ -1167,30 +1356,6 @@ class AppService:
             "details": details or {},
         }
 
-    def _qdrant_doc_point_count(self, doc_id: str) -> tuple[int | None, str | None]:
-        client = getattr(self.vector_index, "client", None)
-        collection = getattr(self.vector_index, "collection", None)
-        if client is None or collection is None:
-            return None, "qdrant_client_not_available"
-        try:
-            from qdrant_client.http import models as qdrant_models
-
-            response = client.count(
-                collection_name=collection,
-                count_filter=qdrant_models.Filter(
-                    must=[
-                        qdrant_models.FieldCondition(
-                            key="doc_id",
-                            match=qdrant_models.MatchValue(value=doc_id),
-                        )
-                    ]
-                ),
-                exact=True,
-            )
-            return int(response.count), None
-        except Exception as exc:  # noqa: BLE001
-            return None, str(exc)
-
     def _artifact_findings_for_doc(
         self,
         *,
@@ -1271,67 +1436,46 @@ class AppService:
         components: list[dict[str, Any]] = []
         findings: list[dict[str, Any]] = []
 
-        vector_assert_ready = getattr(self.vector_index, "assert_ready", None)
-        if callable(vector_assert_ready):
+        components.append(
+            self._doctor_component(
+                name="local_sqlite_index",
+                status="ok",
+                details={
+                    "backend": "sqlite_fts5",
+                    "scope": "per-document-folder sidecar",
+                },
+            )
+        )
+
+        if self.grobid_client.base_url:
             try:
-                vector_assert_ready()
+                self.grobid_client.assert_available()
                 components.append(
                     self._doctor_component(
-                        name="qdrant",
+                        name="grobid_optional",
                         status="ok",
-                        details={
-                            "url": getattr(self.vector_index, "url", None),
-                            "collection": getattr(
-                                self.vector_index, "collection", None
-                            ),
-                        },
+                        details={"base_url": self.grobid_client.base_url},
                     )
                 )
             except Exception as exc:  # noqa: BLE001
                 components.append(
                     self._doctor_component(
-                        name="qdrant",
-                        status="error",
+                        name="grobid_optional",
+                        status="warning",
                         details=to_error_payload(exc),
                     )
                 )
         else:
             components.append(
                 self._doctor_component(
-                    name="qdrant",
-                    status="unknown",
-                    details={"reason": "vector_index_assert_ready_not_available"},
+                    name="grobid_optional",
+                    status="skipped",
+                    details={
+                        "reason": "GROBID_URL is not configured.",
+                        "impact": "PDF paper ingest will skip optional metadata/reference enrichment.",
+                    },
                 )
             )
-
-        try:
-            self.grobid_client.assert_available()
-            components.append(
-                self._doctor_component(
-                    name="grobid",
-                    status="ok",
-                    details={"base_url": self.grobid_client.base_url},
-                )
-            )
-        except Exception as exc:  # noqa: BLE001
-            components.append(
-                self._doctor_component(
-                    name="grobid",
-                    status="error",
-                    details=to_error_payload(exc),
-                )
-            )
-
-        cache_dir = getattr(self.vector_index, "fastembed_cache_dir", None)
-        components.append(
-            self._doctor_component(
-                name="fastembed_cache",
-                status="ok"
-                if isinstance(cache_dir, Path) and cache_dir.exists()
-                else "warning",
-                details={"path": str(cache_dir) if cache_dir is not None else None},
-            )
-        )
         components.append(
             self._doctor_component(
                 name="parsers",
@@ -1365,9 +1509,6 @@ class AppService:
                 for doc in docs:
                     chunks_count = len(catalog.list_chunks(doc.doc_id))
                     pipeline_status = self._document_pipeline_status(doc)
-                    vector_count, vector_error = self._qdrant_doc_point_count(
-                        doc.doc_id
-                    )
                     doc_report = {
                         "doc_id": doc.doc_id,
                         "type": doc.type,
@@ -1376,8 +1517,7 @@ class AppService:
                         "chunks_count": chunks_count,
                         "path_exists": Path(doc.path).exists(),
                         "pipeline_status": pipeline_status,
-                        "vector_points_count": vector_count,
-                        "vector_count_error": vector_error,
+                        "local_index_backend": "sqlite_fts5",
                     }
                     artifact_findings = self._artifact_findings_for_doc(
                         catalog=catalog,
@@ -1411,17 +1551,6 @@ class AppService:
                                 "code": "DOCUMENT_PIPELINE_STALE",
                                 "doc_id": doc.doc_id,
                                 "hint": pipeline_status.get("hint"),
-                            }
-                        )
-                    if vector_count is not None and vector_count != chunks_count:
-                        findings.append(
-                            {
-                                "severity": "warning",
-                                "code": "VECTOR_CHUNK_COUNT_MISMATCH",
-                                "doc_id": doc.doc_id,
-                                "chunks_count": chunks_count,
-                                "vector_points_count": vector_count,
-                                "hint": self._reingest_hint(doc),
                             }
                         )
                 docs_dir = catalog.db_path.parent / "docs"
@@ -1587,6 +1716,8 @@ class AppService:
             try:
                 item = self._ingest_queue.get(timeout=0.5)
             except Empty:
+                if self._closed:
+                    return
                 continue
             try:
                 self._run_ingest_job(item=item)
@@ -1729,6 +1860,7 @@ class AppService:
         )
 
     def library_scan(self, root: str, patterns: list[str]) -> dict[str, Any]:
+        scan_started = time.perf_counter()
         root_path = Path(root).expanduser().resolve()
         if not root_path.exists() or not root_path.is_dir():
             raise AppError(
@@ -1742,6 +1874,7 @@ class AppService:
         added: list[dict[str, Any]] = []
         updated: list[dict[str, Any]] = []
         unchanged_count = 0
+        candidate_paths: list[Path] = []
         for existing_catalog in self._discover_sidecar_catalogs(str(root_path)):
             found_paths_by_catalog.setdefault(
                 self._catalog_key(existing_catalog),
@@ -1749,7 +1882,7 @@ class AppService:
             )
 
         for pattern in patterns:
-            for path in root_path.glob(pattern):
+            for path in sorted(root_path.glob(pattern)):
                 if not path.is_file():
                     continue
                 if self.sidecar_dir_name in path.parts:
@@ -1761,34 +1894,57 @@ class AppService:
                 if abs_path in found_paths:
                     continue
                 found_paths.add(abs_path)
-                catalog = self._catalog_for_document_path(path)
-                found_paths_by_catalog[self._catalog_key(catalog)].add(abs_path)
+                candidate_paths.append(path)
 
-                file_type = self._doc_type_from_path(path)
-                sha256 = self._compute_sha256(path)
-                doc_id = sha256[:16]
-                doc = DocumentRecord(
-                    doc_id=doc_id,
-                    path=abs_path,
-                    type=file_type,
-                    sha256=sha256,
-                    mtime=path.stat().st_mtime,
-                )
-                state = catalog.upsert_scanned_document(doc)
-                self._bind_doc_catalog(doc_id, catalog)
-                payload = {
-                    "doc_id": doc_id,
-                    "path": abs_path,
-                    "sha256": sha256,
-                    "mtime": doc.mtime,
-                    "type": file_type,
-                }
-                if state == "added":
-                    added.append(payload)
-                elif state == "updated":
-                    updated.append(payload)
-                else:
-                    unchanged_count += 1
+        hash_started = time.perf_counter()
+        scan_worker_count = self._scan_worker_count(len(candidate_paths))
+        scanned_documents: list[dict[str, Any]] = []
+        if scan_worker_count <= 1:
+            scanned_documents = [
+                self._scan_document_file(path) for path in candidate_paths
+            ]
+        else:
+            with ThreadPoolExecutor(
+                max_workers=scan_worker_count,
+                thread_name_prefix="mcp-ebook-read-scan",
+            ) as executor:
+                futures = [
+                    executor.submit(self._scan_document_file, path)
+                    for path in candidate_paths
+                ]
+                for future in as_completed(futures):
+                    scanned_documents.append(future.result())
+            scanned_documents.sort(key=lambda item: str(item["path"]))
+        hash_seconds = time.perf_counter() - hash_started
+
+        for scanned in scanned_documents:
+            path_obj = scanned["path_obj"]
+            abs_path = str(scanned["path"])
+            catalog = self._catalog_for_document_path(path_obj)
+            found_paths_by_catalog[self._catalog_key(catalog)].add(abs_path)
+
+            doc = DocumentRecord(
+                doc_id=str(scanned["doc_id"]),
+                path=abs_path,
+                type=scanned["type"],
+                sha256=str(scanned["sha256"]),
+                mtime=float(scanned["mtime"]),
+            )
+            state = catalog.upsert_scanned_document(doc)
+            self._bind_doc_catalog(doc.doc_id, catalog)
+            payload = {
+                "doc_id": doc.doc_id,
+                "path": abs_path,
+                "sha256": doc.sha256,
+                "mtime": doc.mtime,
+                "type": doc.type,
+            }
+            if state == "added":
+                added.append(payload)
+            elif state == "updated":
+                updated.append(payload)
+            else:
+                unchanged_count += 1
 
         removed: list[str] = []
         removed_deleted_count = 0
@@ -1801,7 +1957,6 @@ class AppService:
                 for removed_path in removed_paths:
                     removed_doc = catalog.get_document_by_path(removed_path)
                     if removed_doc is not None:
-                        self.vector_index.delete_document(removed_doc.doc_id)
                         self._doc_catalog_index.pop(removed_doc.doc_id, None)
                         shutil.rmtree(
                             catalog.db_path.parent / "docs" / removed_doc.doc_id,
@@ -1818,18 +1973,21 @@ class AppService:
                 }
             )
 
-        storage_maintenance = {
-            "auto_compaction_enabled": False,
-            "catalogs": maintenance_rows,
-        }
-
         return {
             "added": added,
             "updated": updated,
             "unchanged_count": unchanged_count,
             "removed": sorted(set(removed)),
             "removed_deleted_count": removed_deleted_count,
-            "storage_maintenance": storage_maintenance,
+            "storage_maintenance": {
+                "catalogs": maintenance_rows,
+            },
+            "scan_performance": {
+                "candidate_documents": len(candidate_paths),
+                "hash_workers": scan_worker_count,
+                "hash_seconds": round(hash_seconds, 6),
+                "total_seconds": round(time.perf_counter() - scan_started, 6),
+            },
         }
 
     def _write_reading_artifact(
@@ -1838,6 +1996,51 @@ class AppService:
         target = workspace_dir / "reading" / "reading.md"
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(parsed.reading_markdown, encoding="utf-8")
+
+    def _persist_raw_artifacts(
+        self,
+        *,
+        workspace_dir: Path,
+        parsed: ParsedDocument,
+    ) -> list[dict[str, Any]]:
+        target_dir = workspace_dir / "raw"
+        if target_dir.exists():
+            shutil.rmtree(target_dir)
+        if not parsed.raw_artifacts:
+            return []
+        target_dir.mkdir(parents=True, exist_ok=True)
+
+        records: list[dict[str, Any]] = []
+        for index, (name, content) in enumerate(sorted(parsed.raw_artifacts.items())):
+            safe_name = "".join(
+                char if char.isalnum() or char in {"-", "_", "."} else "_"
+                for char in name.strip()
+            ).strip("._")
+            if not safe_name:
+                safe_name = f"raw-{index}"
+            suffix = Path(safe_name).suffix.lower()
+            if suffix not in {
+                ".html",
+                ".htm",
+                ".xhtml",
+                ".xml",
+                ".json",
+                ".md",
+                ".txt",
+            }:
+                safe_name = f"{safe_name}.txt"
+            target = target_dir / safe_name
+            target.write_text(str(content), encoding="utf-8")
+            records.append(
+                {
+                    "name": name,
+                    "artifact_id": f"raw-{index}",
+                    "file_path": str(target),
+                    "media_type": "text/plain",
+                    "bytes": target.stat().st_size,
+                }
+            )
+        return records
 
     def _persist_extracted_images(
         self,
@@ -1878,6 +2081,830 @@ class AppService:
             )
         return records
 
+    @staticmethod
+    def _remap_staged_path(
+        value: str,
+        *,
+        staging_workspace_dir: Path,
+        workspace_dir: Path,
+    ) -> str:
+        path = Path(value)
+        try:
+            relative = path.relative_to(staging_workspace_dir)
+        except ValueError:
+            return value
+        return str(workspace_dir / relative)
+
+    def _remap_raw_artifact_records(
+        self,
+        records: list[dict[str, Any]],
+        *,
+        staging_workspace_dir: Path,
+        workspace_dir: Path,
+    ) -> list[dict[str, Any]]:
+        remapped: list[dict[str, Any]] = []
+        for record in records:
+            file_path = record.get("file_path")
+            if isinstance(file_path, str):
+                record = {
+                    **record,
+                    "file_path": self._remap_staged_path(
+                        file_path,
+                        staging_workspace_dir=staging_workspace_dir,
+                        workspace_dir=workspace_dir,
+                    ),
+                }
+            remapped.append(record)
+        return remapped
+
+    def _remap_image_record_paths(
+        self,
+        records: list[ImageRecord],
+        *,
+        staging_workspace_dir: Path,
+        workspace_dir: Path,
+    ) -> list[ImageRecord]:
+        remapped: list[ImageRecord] = []
+        for record in records:
+            remapped.append(
+                record.model_copy(
+                    update={
+                        "file_path": self._remap_staged_path(
+                            record.file_path,
+                            staging_workspace_dir=staging_workspace_dir,
+                            workspace_dir=workspace_dir,
+                        )
+                    }
+                )
+            )
+        return remapped
+
+    def _remap_pdf_table_record_paths(
+        self,
+        records: list[PdfTableRecord],
+        *,
+        staging_workspace_dir: Path,
+        workspace_dir: Path,
+    ) -> list[PdfTableRecord]:
+        remapped: list[PdfTableRecord] = []
+        for record in records:
+            remapped_segments = [
+                segment.model_copy(
+                    update={
+                        "file_path": self._remap_staged_path(
+                            segment.file_path,
+                            staging_workspace_dir=staging_workspace_dir,
+                            workspace_dir=workspace_dir,
+                        )
+                    }
+                )
+                for segment in record.segments
+            ]
+            remapped.append(
+                record.model_copy(
+                    update={
+                        "file_path": self._remap_staged_path(
+                            record.file_path,
+                            staging_workspace_dir=staging_workspace_dir,
+                            workspace_dir=workspace_dir,
+                        ),
+                        "segments": remapped_segments,
+                    }
+                )
+            )
+        return remapped
+
+    def _remap_pdf_figure_record_paths(
+        self,
+        records: list[PdfFigureRecord],
+        *,
+        staging_workspace_dir: Path,
+        workspace_dir: Path,
+    ) -> list[PdfFigureRecord]:
+        remapped: list[PdfFigureRecord] = []
+        for record in records:
+            remapped.append(
+                record.model_copy(
+                    update={
+                        "file_path": self._remap_staged_path(
+                            record.file_path,
+                            staging_workspace_dir=staging_workspace_dir,
+                            workspace_dir=workspace_dir,
+                        )
+                    }
+                )
+            )
+        return remapped
+
+    @staticmethod
+    def _replace_workspace_with_staging(
+        *,
+        staging_workspace_dir: Path,
+        workspace_dir: Path,
+    ) -> Path | None:
+        backup_dir: Path | None = None
+        workspace_dir.parent.mkdir(parents=True, exist_ok=True)
+        if workspace_dir.exists():
+            backup_dir = workspace_dir.with_name(
+                f".{workspace_dir.name}.previous-{uuid4().hex}"
+            )
+            workspace_dir.rename(backup_dir)
+        staging_workspace_dir.rename(workspace_dir)
+        return backup_dir
+
+    @staticmethod
+    def _rollback_workspace_swap(
+        *,
+        backup_dir: Path | None,
+        workspace_dir: Path,
+    ) -> None:
+        if workspace_dir.exists():
+            shutil.rmtree(workspace_dir, ignore_errors=True)
+        if backup_dir is not None and backup_dir.exists():
+            backup_dir.rename(workspace_dir)
+
+    @staticmethod
+    def _cleanup_staging_artifacts(
+        *,
+        staging_workspace_dir: Path,
+        backup_dir: Path | None = None,
+    ) -> None:
+        shutil.rmtree(staging_workspace_dir, ignore_errors=True)
+        if backup_dir is not None:
+            shutil.rmtree(backup_dir, ignore_errors=True)
+
+    def _persist_parse_output_to_catalog(
+        self,
+        *,
+        catalog: CatalogStore,
+        doc: DocumentRecord,
+        profile: Profile,
+        parsed: ParsedDocument,
+        image_records: list[ImageRecord],
+        pdf_table_records: list[PdfTableRecord],
+        pdf_figure_records: list[PdfFigureRecord],
+        current_sha256: str,
+        current_mtime: float,
+    ) -> None:
+        catalog.replace_chunks(doc.doc_id, parsed.chunks, rebuild_graph=False)
+        catalog.replace_formulas(doc.doc_id, parsed.formulas, rebuild_graph=False)
+        if doc.type == DocumentType.PDF:
+            catalog.replace_pdf_tables(
+                doc.doc_id,
+                pdf_table_records,
+                rebuild_graph=False,
+            )
+            catalog.replace_pdf_figures(
+                doc.doc_id,
+                pdf_figure_records,
+                rebuild_graph=False,
+            )
+        catalog.replace_images(doc.doc_id, image_records, rebuild_graph=False)
+        catalog.update_document_source_metadata(
+            doc_id=doc.doc_id,
+            sha256=current_sha256,
+            mtime=current_mtime,
+        )
+        catalog.save_document_parse_output(
+            doc_id=doc.doc_id,
+            title=parsed.title,
+            parser_chain=parsed.parser_chain,
+            metadata=parsed.metadata,
+            outline=parsed.outline,
+            overall_confidence=parsed.overall_confidence,
+            status=DocumentStatus.READY,
+        )
+        validation_issues = catalog.validate_document_graph(doc.doc_id)
+        validation_errors = [
+            issue for issue in validation_issues if issue.get("severity") == "error"
+        ]
+        if validation_errors:
+            raise AppError(
+                ErrorCode.INGEST_GRAPH_VALIDATION_FAILED,
+                "Document graph validation failed before ingest finalization.",
+                details={
+                    "doc_id": doc.doc_id,
+                    "profile": profile,
+                    "errors": validation_errors,
+                    "warnings": [
+                        issue
+                        for issue in validation_issues
+                        if issue.get("severity") != "error"
+                    ],
+                },
+            )
+
+    def _pdf_parse_worker_config(
+        self,
+        *,
+        active_pdf_parses: int,
+        visual_tables_dir: Path | None = None,
+        visual_figures_dir: Path | None = None,
+    ) -> dict[str, Any]:
+        formula_extractor = getattr(self.pdf_parser, "formula_extractor", None)
+        formula_batch_size = getattr(formula_extractor, "batch_size", 1)
+        performance_config = getattr(
+            self.pdf_parser,
+            "performance_config",
+            self._auto_docling_performance_config(),
+        )
+        if not isinstance(performance_config, PdfParserPerformanceConfig):
+            performance_config = self._auto_docling_performance_config()
+        if not self._docling_performance_env_overridden():
+            performance_config = self._scale_pdf_performance_for_active_parses(
+                performance_config,
+                active_pdf_parses=active_pdf_parses,
+            )
+        if (
+            not os.environ.get("PDF_FORMULA_BATCH_SIZE")
+            or os.environ.get("PDF_FORMULA_BATCH_SIZE", "").strip().lower() == "auto"
+        ):
+            formula_batch_size = max(
+                1,
+                int(formula_batch_size or 1) // max(1, active_pdf_parses),
+            )
+        config = {
+            "enable_docling_formula_enrichment": bool(
+                getattr(self.pdf_parser, "enable_docling_formula_enrichment", True)
+            ),
+            "require_formula_engine": bool(
+                getattr(self.pdf_parser, "require_formula_engine", True)
+            ),
+            "formula_batch_size": int(formula_batch_size or 1),
+            "performance_config": performance_config.model_dump(mode="json"),
+            "resource_plan": {
+                "active_pdf_parses": active_pdf_parses,
+                "ingest_worker_count": self.ingest_worker_count,
+                "docling_performance_env_overridden": (
+                    self._docling_performance_env_overridden()
+                ),
+            },
+        }
+        if (
+            isinstance(self.pdf_visual_extractor, DoclingPdfVisualExtractor)
+            and visual_tables_dir is not None
+            and visual_figures_dir is not None
+        ):
+            config["visual_extraction"] = {
+                "tables_dir": str(visual_tables_dir),
+                "figures_dir": str(visual_figures_dir),
+                "images_scale": self.pdf_visual_extractor.images_scale,
+            }
+            config["resource_plan"]["docling_visuals_in_parse_worker"] = True
+        else:
+            config["resource_plan"]["docling_visuals_in_parse_worker"] = False
+        return config
+
+    @staticmethod
+    def _parsed_text_summary(parsed: ParsedDocument) -> dict[str, Any]:
+        text = "\n".join(chunk.text for chunk in parsed.chunks)
+        normalized = re.sub(r"\s+", " ", text).strip()
+        return {
+            "normalized_text_chars": len(normalized),
+            "wordish_tokens": len(re.findall(r"[0-9A-Za-z_]+|[\u4e00-\u9fff]+", text)),
+            "chunks": len(parsed.chunks),
+            "outline_nodes": len(parsed.outline),
+            "formulas": len(parsed.formulas),
+            "images": len(parsed.images),
+        }
+
+    @staticmethod
+    def _ratio_or_none(
+        numerator: int | float, denominator: int | float
+    ) -> float | None:
+        if denominator <= 0:
+            return None
+        return numerator / denominator
+
+    def _pdf_fast_preflight(self, path: str, doc_id: str) -> dict[str, Any]:
+        started = time.perf_counter()
+        parser = Pypdfium2PdfParser()
+        try:
+            parsed = parser.parse(path, doc_id)
+            metadata = dict(parsed.metadata or {})
+            return {
+                "status": "ok",
+                "parser": parser.method,
+                "seconds": round(time.perf_counter() - started, 6),
+                "pages": metadata.get("pages"),
+                "phase_seconds": metadata.get("pdf_parse_phase_seconds"),
+                **self._parsed_text_summary(parsed),
+                "fidelity_warning": (
+                    "Fast preflight is text/outline oriented. Docling remains the "
+                    "canonical lane for formulas, tables, figures, and layout-aware evidence."
+                ),
+            }
+        except Exception as exc:  # noqa: BLE001
+            return {
+                "status": "error",
+                "parser": parser.method,
+                "seconds": round(time.perf_counter() - started, 6),
+                "error": to_error_payload(exc),
+                "impact": (
+                    "High-fidelity Docling ingest will still run; only fast parser "
+                    "diagnostics are unavailable for this PDF."
+                ),
+            }
+
+    def _pdf_diagnostic_preflight(self, path: str, doc_id: str) -> dict[str, Any]:
+        started = time.perf_counter()
+        parser_name = "pymupdf"
+        try:
+            import fitz
+
+            images_total = 0
+            text_blocks_total = 0
+            page_samples: list[dict[str, Any]] = []
+            pdf_doc = fitz.open(path)
+            try:
+                for page_index, page in enumerate(pdf_doc):
+                    images_count = len(page.get_images(full=True) or [])
+                    try:
+                        blocks = page.get_text("blocks") or []
+                    except Exception:  # noqa: BLE001
+                        blocks = []
+                    block_count = len(blocks)
+                    images_total += images_count
+                    text_blocks_total += block_count
+                    if page_index < 5:
+                        page_samples.append(
+                            {
+                                "page": page_index + 1,
+                                "images": images_count,
+                                "text_blocks": block_count,
+                            }
+                        )
+                metadata = getattr(pdf_doc, "metadata", None) or {}
+                outline = pdf_doc.get_toc() or []
+                page_count = int(getattr(pdf_doc, "page_count", 0) or 0)
+            finally:
+                close = getattr(pdf_doc, "close", None)
+                if callable(close):
+                    close()
+            return {
+                "status": "ok",
+                "parser": parser_name,
+                "seconds": round(time.perf_counter() - started, 6),
+                "pages": page_count,
+                "outline_nodes": len(outline),
+                "images": images_total,
+                "text_blocks": text_blocks_total,
+                "page_samples": page_samples,
+                "metadata": {
+                    key: str(value)
+                    for key, value in dict(metadata).items()
+                    if value is not None
+                },
+                "role": (
+                    "Diagnostic lane for image/block inventory and page-level "
+                    "rendering evidence. Docling remains canonical for persisted "
+                    "text, formula, table, and figure structure."
+                ),
+            }
+        except Exception as exc:  # noqa: BLE001
+            return {
+                "status": "error",
+                "parser": parser_name,
+                "seconds": round(time.perf_counter() - started, 6),
+                "error": to_error_payload(exc),
+                "impact": (
+                    "High-fidelity Docling ingest will still run; only PyMuPDF "
+                    "diagnostic inventory is unavailable for this PDF."
+                ),
+                "details": {"doc_id": doc_id, "path": path},
+            }
+
+    def _run_pdf_preflights(
+        self, path: str, doc_id: str
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        started = time.perf_counter()
+        with ThreadPoolExecutor(
+            max_workers=2,
+            thread_name_prefix="mcp-ebook-read-pdf-preflight",
+        ) as executor:
+            fast_future = executor.submit(self._pdf_fast_preflight, path, doc_id)
+            diagnostic_future = executor.submit(
+                self._pdf_diagnostic_preflight,
+                path,
+                doc_id,
+            )
+            fast_preflight = fast_future.result()
+            diagnostic_preflight = diagnostic_future.result()
+
+        execution = {
+            "mode": "parallel",
+            "lanes": ["pypdfium2_fast", "pymupdf_diagnostic"],
+            "seconds": round(time.perf_counter() - started, 6),
+        }
+        fast_preflight["preflight_execution"] = execution
+        diagnostic_preflight["preflight_execution"] = execution
+        return fast_preflight, diagnostic_preflight
+
+    def _attach_pdf_parser_lane_metadata(
+        self,
+        parsed: ParsedDocument,
+        *,
+        fast_preflight: dict[str, Any] | None,
+        diagnostic_preflight: dict[str, Any] | None,
+    ) -> None:
+        if fast_preflight is None and diagnostic_preflight is None:
+            return
+        canonical_summary = {
+            "parser_chain": parsed.parser_chain,
+            **self._parsed_text_summary(parsed),
+            "pages": parsed.metadata.get("pages"),
+            "formula_markers_total": parsed.metadata.get("formula_markers_total"),
+            "formula_unresolved": parsed.metadata.get("formula_unresolved"),
+            "tables": parsed.metadata.get("pdf_tables_count"),
+            "figures": parsed.metadata.get("pdf_figures_count"),
+        }
+        fast_text_chars = int(fast_preflight.get("normalized_text_chars") or 0)
+        canonical_text_chars = int(canonical_summary.get("normalized_text_chars") or 0)
+        parsed.metadata = {
+            **parsed.metadata,
+            "pdf_parser_lanes": {
+                "strategy": {
+                    "fast_lane": "pypdfium2_pdf",
+                    "canonical_fidelity_lane": "docling",
+                    "diagnostic_lane": "pymupdf",
+                    "canonical_content_source": "docling",
+                    "rationale": (
+                        "pypdfium2 is used as a fast preflight text/outline lane; "
+                        "PyMuPDF is used as a diagnostic image/block/rendering lane; "
+                        "Docling output remains canonical for persisted chunks and "
+                        "high-fidelity reading evidence."
+                    ),
+                },
+                "fast_preflight": fast_preflight,
+                "diagnostic_preflight": diagnostic_preflight,
+                "canonical_fidelity": canonical_summary,
+                "fast_text_ratio_to_fidelity": self._ratio_or_none(
+                    fast_text_chars,
+                    canonical_text_chars,
+                ),
+            },
+        }
+
+    def _parse_pdf_document(
+        self,
+        path: str,
+        doc_id: str,
+        *,
+        visual_tables_dir: Path | None = None,
+        visual_figures_dir: Path | None = None,
+    ) -> ParsedDocument:
+        if not isinstance(self.pdf_parser, DoclingPdfParser):
+            return self.pdf_parser.parse(path, doc_id)
+
+        with self._active_pdf_parse_lock:
+            self._active_pdf_parses += 1
+            active_pdf_parses = self._active_pdf_parses
+        worker_config = self._pdf_parse_worker_config(
+            active_pdf_parses=active_pdf_parses,
+            visual_tables_dir=visual_tables_dir,
+            visual_figures_dir=visual_figures_dir,
+        )
+        command = [
+            sys.executable,
+            "-m",
+            "mcp_ebook_read.workers.pdf_parse",
+            "--pdf-path",
+            path,
+            "--doc-id",
+            doc_id,
+        ]
+        timeout = self.pdf_parse_timeout_seconds
+        try:
+            try:
+                completed = subprocess.run(
+                    command,
+                    input=json.dumps(worker_config, ensure_ascii=True),
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                    check=False,
+                )
+            except subprocess.TimeoutExpired as exc:
+                raise AppError(
+                    ErrorCode.INGEST_PDF_DOCLING_TIMEOUT,
+                    "Docling PDF parse timed out in the isolated worker process.",
+                    details={
+                        "doc_id": doc_id,
+                        "path": path,
+                        "timeout_seconds": timeout,
+                        "resource_plan": worker_config.get("resource_plan"),
+                        "hint": (
+                            "Increase PDF_PARSE_TIMEOUT_SECONDS for very large PDFs, "
+                            "or inspect the source PDF for pathological pages."
+                        ),
+                    },
+                ) from exc
+
+            try:
+                payload = json.loads(completed.stdout or "{}")
+            except json.JSONDecodeError as exc:
+                raise AppError(
+                    ErrorCode.INGEST_PDF_DOCLING_FAILED,
+                    "Docling PDF worker returned non-JSON output.",
+                    details={
+                        "doc_id": doc_id,
+                        "path": path,
+                        "returncode": completed.returncode,
+                        "stderr_tail": completed.stderr[-4000:],
+                        "stdout_tail": completed.stdout[-4000:],
+                        "resource_plan": worker_config.get("resource_plan"),
+                    },
+                ) from exc
+
+            if completed.returncode != 0 or not payload.get("ok"):
+                error = payload.get("error") if isinstance(payload, dict) else None
+                details = error.get("details") if isinstance(error, dict) else None
+                if not isinstance(details, dict):
+                    details = {}
+                error_code = ErrorCode.INGEST_PDF_DOCLING_FAILED
+                if isinstance(error, dict) and error.get("code"):
+                    try:
+                        error_code = ErrorCode(str(error.get("code")))
+                    except ValueError:
+                        error_code = ErrorCode.INGEST_PDF_DOCLING_FAILED
+                raise AppError(
+                    error_code,
+                    str(error.get("message"))
+                    if isinstance(error, dict) and error.get("message")
+                    else "Docling PDF worker failed.",
+                    details={
+                        **details,
+                        "doc_id": doc_id,
+                        "path": path,
+                        "returncode": completed.returncode,
+                        "stderr_tail": completed.stderr[-4000:],
+                        "worker_traceback": payload.get("traceback"),
+                        "resource_plan": worker_config.get("resource_plan"),
+                    },
+                )
+
+            parsed = ParsedDocument.model_validate(payload["data"])
+            parsed.metadata = {
+                **parsed.metadata,
+                "pdf_parse_resource_plan": {
+                    "performance_config": worker_config["performance_config"],
+                    "formula_batch_size": worker_config["formula_batch_size"],
+                    **worker_config["resource_plan"],
+                },
+            }
+            return parsed
+        finally:
+            with self._active_pdf_parse_lock:
+                self._active_pdf_parses = max(0, self._active_pdf_parses - 1)
+
+    def _local_paper_metadata_fallback(
+        self,
+        parsed: ParsedDocument,
+    ) -> dict[str, Any]:
+        title = parsed.title.strip()
+        abstract_text = ""
+        abstract_source_chunk_id = None
+        reference_evidence: list[dict[str, Any]] = []
+
+        for chunk in parsed.chunks:
+            section_label = CatalogStore._normalize_search_label(
+                " ".join(chunk.section_path)
+            )
+            section_tokens = set(section_label.split())
+            text = chunk.text.strip()
+            text_label = CatalogStore._normalize_search_label(text[:120])
+            is_abstract_section = bool(section_tokens & {"abstract", "摘要"})
+            starts_with_abstract = text_label.startswith("abstract ")
+            if not abstract_text and (is_abstract_section or starts_with_abstract):
+                abstract_text = re.sub(
+                    r"^\s*abstract\s*[:.\-]?\s*",
+                    "",
+                    text,
+                    flags=re.IGNORECASE,
+                ).strip()
+                abstract_source_chunk_id = chunk.chunk_id
+
+            is_reference_section = bool(
+                section_tokens & {"references", "bibliography", "参考文献"}
+            )
+            if is_reference_section:
+                reference_evidence.append(
+                    {
+                        "chunk_id": chunk.chunk_id,
+                        "section_path": chunk.section_path,
+                        "excerpt": text[:600],
+                    }
+                )
+
+        fields: dict[str, Any] = {}
+        if title:
+            fields["paper_title"] = {
+                "value": title,
+                "source": "docling_title",
+                "confidence": 0.65,
+            }
+        if abstract_text:
+            fields["abstract"] = {
+                "value": abstract_text[:4000],
+                "source": "docling_section",
+                "source_chunk_id": abstract_source_chunk_id,
+                "confidence": 0.7,
+            }
+        if reference_evidence:
+            fields["references_text_evidence"] = {
+                "value": reference_evidence[:5],
+                "source": "docling_reference_section",
+                "confidence": 0.55,
+                "truncated": len(reference_evidence) > 5,
+            }
+
+        fallback = {
+            "local_paper_metadata_fallback": {
+                "status": "used",
+                "source": "docling_local_fallback",
+                "fields": sorted(fields),
+                "limitations": [
+                    "Authors, DOI, citation graph, and bibliography entries are not reconstructed without GROBID.",
+                    "Abstract and reference evidence are section heuristics and may need human verification.",
+                ],
+            }
+        }
+        for key, payload in fields.items():
+            fallback[key] = payload["value"]
+        return fallback
+
+    def _pdf_visual_worker_config(self, chunks: list[ChunkRecord]) -> dict[str, Any]:
+        if isinstance(self.pdf_visual_extractor, DoclingPdfVisualExtractor):
+            performance_config = self.pdf_visual_extractor.performance_config
+            images_scale = self.pdf_visual_extractor.images_scale
+        else:
+            performance_config = PdfParserPerformanceConfig()
+            images_scale = 2.0
+        return {
+            "performance_config": performance_config.model_dump(mode="json"),
+            "images_scale": images_scale,
+            "chunks": [chunk.model_dump(mode="json") for chunk in chunks],
+        }
+
+    def _pop_embedded_pdf_visuals(
+        self,
+        parsed: ParsedDocument,
+    ) -> tuple[list[PdfTableRecord], list[PdfFigureRecord], dict[str, Any] | None]:
+        payload = parsed.metadata.pop("_pdf_visuals_from_docling_document", None)
+        if not isinstance(payload, dict):
+            return [], [], None
+        tables = [
+            PdfTableRecord.model_validate(table)
+            for table in payload.get("tables", [])
+            if isinstance(table, dict)
+        ]
+        figures = [
+            PdfFigureRecord.model_validate(figure)
+            for figure in payload.get("figures", [])
+            if isinstance(figure, dict)
+        ]
+        diagnostics = payload.get("diagnostics")
+        if not isinstance(diagnostics, dict):
+            diagnostics = self._default_pdf_visuals_diagnostics(
+                tables=tables,
+                figures=figures,
+            )
+        execution = payload.get("execution")
+        if isinstance(execution, dict):
+            diagnostics = {
+                **diagnostics,
+                "execution": execution,
+            }
+        return tables, figures, diagnostics
+
+    def _extract_pdf_visuals(
+        self,
+        *,
+        pdf_path: str,
+        doc_id: str,
+        chunks: list[ChunkRecord],
+        tables_dir: Path,
+        figures_dir: Path,
+    ) -> PdfVisualExtractionResult:
+        if self.pdf_visual_extractor is None:
+            return PdfVisualExtractionResult(tables=[], figures=[], diagnostics={})
+        if not isinstance(self.pdf_visual_extractor, DoclingPdfVisualExtractor):
+            return self.pdf_visual_extractor.extract(
+                pdf_path=pdf_path,
+                doc_id=doc_id,
+                chunks=chunks,
+                tables_dir=tables_dir,
+                figures_dir=figures_dir,
+            )
+
+        command = [
+            sys.executable,
+            "-m",
+            "mcp_ebook_read.workers.pdf_visuals",
+            "--pdf-path",
+            pdf_path,
+            "--doc-id",
+            doc_id,
+            "--tables-dir",
+            str(tables_dir),
+            "--figures-dir",
+            str(figures_dir),
+        ]
+        timeout = self.pdf_parse_timeout_seconds
+        try:
+            completed = subprocess.run(
+                command,
+                input=json.dumps(
+                    self._pdf_visual_worker_config(chunks),
+                    ensure_ascii=True,
+                ),
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise AppError(
+                ErrorCode.INGEST_PDF_DOCLING_TIMEOUT,
+                "Docling PDF visual extraction timed out in the isolated worker process.",
+                details={
+                    "doc_id": doc_id,
+                    "path": pdf_path,
+                    "timeout_seconds": timeout,
+                    "component": "pdf_visuals",
+                    "hint": (
+                        "Increase PDF_PARSE_TIMEOUT_SECONDS for very large PDFs, "
+                        "or inspect the source PDF for pathological visual pages."
+                    ),
+                },
+            ) from exc
+
+        try:
+            payload = json.loads(completed.stdout or "{}")
+        except json.JSONDecodeError as exc:
+            raise AppError(
+                ErrorCode.INGEST_PDF_DOCLING_FAILED,
+                "Docling PDF visual worker returned non-JSON output.",
+                details={
+                    "doc_id": doc_id,
+                    "path": pdf_path,
+                    "returncode": completed.returncode,
+                    "stderr_tail": completed.stderr[-4000:],
+                    "stdout_tail": completed.stdout[-4000:],
+                },
+            ) from exc
+
+        if completed.returncode != 0 or not payload.get("ok"):
+            error = payload.get("error") if isinstance(payload, dict) else None
+            details = error.get("details") if isinstance(error, dict) else None
+            if not isinstance(details, dict):
+                details = {}
+            error_code = ErrorCode.INGEST_PDF_DOCLING_FAILED
+            if isinstance(error, dict) and error.get("code"):
+                try:
+                    error_code = ErrorCode(str(error.get("code")))
+                except ValueError:
+                    error_code = ErrorCode.INGEST_PDF_DOCLING_FAILED
+            raise AppError(
+                error_code,
+                str(error.get("message"))
+                if isinstance(error, dict) and error.get("message")
+                else "Docling PDF visual worker failed.",
+                details={
+                    **details,
+                    "doc_id": doc_id,
+                    "path": pdf_path,
+                    "returncode": completed.returncode,
+                    "stderr_tail": completed.stderr[-4000:],
+                    "worker_traceback": payload.get("traceback"),
+                },
+            )
+
+        data = payload.get("data")
+        if not isinstance(data, dict):
+            raise AppError(
+                ErrorCode.INGEST_PDF_DOCLING_FAILED,
+                "Docling PDF visual worker returned an invalid payload.",
+                details={
+                    "doc_id": doc_id,
+                    "path": pdf_path,
+                    "returncode": completed.returncode,
+                },
+            )
+        return PdfVisualExtractionResult(
+            tables=[
+                PdfTableRecord.model_validate(table)
+                for table in data.get("tables", [])
+                if isinstance(table, dict)
+            ],
+            figures=[
+                PdfFigureRecord.model_validate(figure)
+                for figure in data.get("figures", [])
+                if isinstance(figure, dict)
+            ],
+            diagnostics=data.get("diagnostics") or {},
+        )
+
     def _document_ingest(
         self,
         *,
@@ -1904,6 +2931,8 @@ class AppService:
                 ),
                 "formulas_count": len(catalog.list_formulas(doc.doc_id)),
                 "images_count": len(catalog.list_images(doc.doc_id)),
+                "pdf_tables_count": len(catalog.list_pdf_tables(doc.doc_id)),
+                "pdf_figures_count": len(catalog.list_pdf_figures(doc.doc_id)),
                 "outline_depth": max((node.level for node in doc.outline), default=0),
                 "overall_confidence": doc.overall_confidence,
                 "pipeline_status": self._document_pipeline_status(doc),
@@ -1911,6 +2940,9 @@ class AppService:
 
         self._bind_doc_catalog(doc.doc_id, catalog)
         workspace_dir = self._doc_workspace_dir(doc, catalog)
+        staging_workspace_dir = workspace_dir.with_name(
+            f".{workspace_dir.name}.staging-{uuid4().hex}"
+        )
         catalog.set_document_status(
             doc.doc_id, DocumentStatus.INGESTING, profile=profile
         )
@@ -1926,15 +2958,46 @@ class AppService:
                         "supported_doc_types": [expected_doc_type],
                     },
                 )
+            source_path = Path(doc.path)
+            if not source_path.exists() or not source_path.is_file():
+                raise AppError(
+                    ErrorCode.INGEST_DOC_NOT_FOUND,
+                    f"Document not found: {doc.path}",
+                    details={"doc_id": doc.doc_id, "path": doc.path},
+                )
+            current_sha256 = self._compute_sha256(source_path)
+            current_mtime = source_path.stat().st_mtime
 
             if profile == Profile.BOOK:
                 if doc.type == DocumentType.PDF:
                     if stage_callback is not None:
                         stage_callback(
                             IngestStage.PARSE,
+                            "Running PDF fast/diagnostic preflights.",
+                        )
+                    (
+                        pdf_fast_preflight,
+                        pdf_diagnostic_preflight,
+                    ) = self._run_pdf_preflights(
+                        doc.path,
+                        doc.doc_id,
+                    )
+                    if stage_callback is not None:
+                        stage_callback(
+                            IngestStage.PARSE,
                             "Parsing PDF book with Docling.",
                         )
-                    parsed = self.pdf_parser.parse(doc.path, doc.doc_id)
+                    parsed = self._parse_pdf_document(
+                        doc.path,
+                        doc.doc_id,
+                        visual_tables_dir=self._pdf_tables_dir(staging_workspace_dir),
+                        visual_figures_dir=self._pdf_figures_dir(staging_workspace_dir),
+                    )
+                    self._attach_pdf_parser_lane_metadata(
+                        parsed,
+                        fast_preflight=pdf_fast_preflight,
+                        diagnostic_preflight=pdf_diagnostic_preflight,
+                    )
                 elif doc.type == DocumentType.EPUB:
                     if stage_callback is not None:
                         stage_callback(
@@ -1958,23 +3021,64 @@ class AppService:
                             "supported_doc_types": [DocumentType.PDF],
                         },
                     )
+                grobid_metadata: dict[str, Any] = {}
+                if self.grobid_client.base_url:
+                    if stage_callback is not None:
+                        stage_callback(
+                            IngestStage.GROBID,
+                            "Parsing optional PDF paper metadata with GROBID.",
+                        )
+                    grobid_result = self.grobid_client.parse_fulltext(doc.path)
+                    grobid_metadata = dict(grobid_result.metadata)
+                else:
+                    grobid_metadata = {
+                        "grobid_enrichment": {
+                            "status": "skipped",
+                            "reason": "GROBID_URL is not configured.",
+                            "impact": (
+                                "Paper title, abstract, DOI, bibliography count, and "
+                                "reference enrichment may be unavailable or lower-confidence."
+                            ),
+                        }
+                    }
                 if stage_callback is not None:
                     stage_callback(
-                        IngestStage.GROBID,
-                        "Parsing PDF paper metadata with GROBID.",
+                        IngestStage.PARSE,
+                        "Running PDF fast/diagnostic preflights.",
                     )
-                grobid_result = self.grobid_client.parse_fulltext(doc.path)
+                (
+                    pdf_fast_preflight,
+                    pdf_diagnostic_preflight,
+                ) = self._run_pdf_preflights(
+                    doc.path,
+                    doc.doc_id,
+                )
                 if stage_callback is not None:
                     stage_callback(
                         IngestStage.PARSE,
                         "Parsing PDF paper structure with Docling.",
                     )
-                parsed = self.pdf_parser.parse(doc.path, doc.doc_id)
-                parsed.parser_chain.append("grobid")
-                parsed.metadata = {**parsed.metadata, **grobid_result.metadata}
-                paper_title = str(
-                    grobid_result.metadata.get("paper_title") or ""
-                ).strip()
+                parsed = self._parse_pdf_document(
+                    doc.path,
+                    doc.doc_id,
+                    visual_tables_dir=self._pdf_tables_dir(staging_workspace_dir),
+                    visual_figures_dir=self._pdf_figures_dir(staging_workspace_dir),
+                )
+                self._attach_pdf_parser_lane_metadata(
+                    parsed,
+                    fast_preflight=pdf_fast_preflight,
+                    diagnostic_preflight=pdf_diagnostic_preflight,
+                )
+                if self.grobid_client.base_url:
+                    parsed.parser_chain.append("grobid")
+                    paper_metadata = grobid_metadata
+                else:
+                    paper_metadata = {
+                        **self._local_paper_metadata_fallback(parsed),
+                        **grobid_metadata,
+                    }
+                parsed.metadata = {**parsed.metadata, **paper_metadata}
+                paper_title = str(paper_metadata.get("paper_title") or "").strip()
                 if paper_title:
                     parsed.title = paper_title
             else:
@@ -1988,29 +3092,189 @@ class AppService:
                     IngestStage.PERSIST,
                     "Persisting reading artifacts and relational records.",
                 )
-            self._write_reading_artifact(workspace_dir, parsed)
-            catalog.replace_chunks(doc.doc_id, parsed.chunks)
-            catalog.replace_formulas(doc.doc_id, parsed.formulas)
+            self._write_reading_artifact(staging_workspace_dir, parsed)
+            raw_artifact_records = self._persist_raw_artifacts(
+                workspace_dir=staging_workspace_dir,
+                parsed=parsed,
+            )
             image_records: list[ImageRecord] = []
+            pdf_table_records: list[PdfTableRecord] = []
+            pdf_figure_records: list[PdfFigureRecord] = []
             if doc.type == DocumentType.EPUB:
                 image_records = self._persist_extracted_images(
                     doc_id=doc.doc_id,
                     images=parsed.images,
-                    target_dir=workspace_dir / "assets" / "epub-images",
+                    target_dir=staging_workspace_dir / "assets" / "epub-images",
                 )
             elif doc.type == DocumentType.PDF:
-                self._clear_pdf_visual_artifacts(doc=doc, catalog=catalog)
+                (
+                    embedded_pdf_tables,
+                    embedded_pdf_figures,
+                    embedded_pdf_visual_diagnostics,
+                ) = self._pop_embedded_pdf_visuals(parsed)
+                if embedded_pdf_visual_diagnostics is not None:
+                    pdf_table_records = embedded_pdf_tables
+                    pdf_figure_records = embedded_pdf_figures
+                image_future = None
+                visual_future = None
+                if self.pdf_image_extractor is not None:
+                    images_dir = self._pdf_images_dir(staging_workspace_dir)
+                else:
+                    images_dir = None
+                if (
+                    self.pdf_visual_extractor is not None
+                    and embedded_pdf_visual_diagnostics is None
+                ):
+                    tables_dir = self._pdf_tables_dir(staging_workspace_dir)
+                    figures_dir = self._pdf_figures_dir(staging_workspace_dir)
+                else:
+                    tables_dir = None
+                    figures_dir = None
+
+                if self.pdf_image_extractor is not None or (
+                    self.pdf_visual_extractor is not None
+                    and embedded_pdf_visual_diagnostics is None
+                ):
+                    with ThreadPoolExecutor(
+                        max_workers=2,
+                        thread_name_prefix="mcp-ebook-read-pdf-visual",
+                    ) as executor:
+                        if (
+                            self.pdf_image_extractor is not None
+                            and images_dir is not None
+                        ):
+                            image_future = executor.submit(
+                                self.pdf_image_extractor.extract,
+                                pdf_path=doc.path,
+                                doc_id=doc.doc_id,
+                                chunks=parsed.chunks,
+                                out_dir=images_dir,
+                            )
+                        if tables_dir is not None and figures_dir is not None:
+                            visual_future = executor.submit(
+                                self._extract_pdf_visuals,
+                                pdf_path=doc.path,
+                                doc_id=doc.doc_id,
+                                chunks=parsed.chunks,
+                                tables_dir=tables_dir,
+                                figures_dir=figures_dir,
+                            )
+
+                        if image_future is not None:
+                            image_records = image_future.result()
+                        if visual_future is not None:
+                            extracted_visuals = visual_future.result()
+                            pdf_table_records = extracted_visuals.tables
+                            pdf_figure_records = extracted_visuals.figures
+
+                visual_execution_lanes = [
+                    lane
+                    for lane, future in (
+                        ("pdf_images", image_future),
+                        ("docling_tables_figures", visual_future),
+                    )
+                    if future is not None
+                ]
+                image_execution = {
+                    "mode": "parallel" if len(visual_execution_lanes) > 1 else "single",
+                    "lanes": visual_execution_lanes,
+                }
+                visual_execution = (
+                    embedded_pdf_visual_diagnostics.get("execution")
+                    if isinstance(embedded_pdf_visual_diagnostics, dict)
+                    and isinstance(
+                        embedded_pdf_visual_diagnostics.get("execution"), dict
+                    )
+                    else image_execution
+                )
+
+                if self.pdf_image_extractor is not None:
+                    images_manifest_path = self._pdf_images_manifest_path(
+                        staging_workspace_dir
+                    )
+                    images_manifest_path.parent.mkdir(parents=True, exist_ok=True)
+                    images_manifest_path.write_text(
+                        json.dumps(
+                            {
+                                "doc_id": doc.doc_id,
+                                "images_count": len(image_records),
+                                "mode": "eager",
+                                "execution": image_execution,
+                            },
+                            ensure_ascii=True,
+                        ),
+                        encoding="utf-8",
+                    )
+                pdf_visual_diagnostics = self._default_pdf_visuals_diagnostics(
+                    tables=[],
+                    figures=[],
+                )
+                if embedded_pdf_visual_diagnostics is not None:
+                    pdf_visual_diagnostics = embedded_pdf_visual_diagnostics
+                elif (
+                    self.pdf_visual_extractor is not None and visual_future is not None
+                ):
+                    diagnostics = getattr(extracted_visuals, "diagnostics", None)
+                    pdf_visual_diagnostics = (
+                        diagnostics
+                        if isinstance(diagnostics, dict)
+                        else self._default_pdf_visuals_diagnostics(
+                            tables=pdf_table_records,
+                            figures=pdf_figure_records,
+                        )
+                    )
+                visuals_manifest_path = self._pdf_visuals_manifest_path(
+                    staging_workspace_dir
+                )
+                visuals_manifest_path.parent.mkdir(parents=True, exist_ok=True)
+                visuals_manifest_path.write_text(
+                    json.dumps(
+                        {
+                            "doc_id": doc.doc_id,
+                            "tables_count": len(pdf_table_records),
+                            "figures_count": len(pdf_figure_records),
+                            "mode": "eager",
+                            "execution": visual_execution,
+                            "diagnostics": pdf_visual_diagnostics,
+                        },
+                        ensure_ascii=True,
+                    ),
+                    encoding="utf-8",
+                )
                 parsed.metadata = {
                     **parsed.metadata,
-                    "pdf_images_extraction_mode": "on_demand",
-                    "pdf_tables_extraction_mode": "on_demand",
-                    "pdf_figures_extraction_mode": "on_demand",
+                    "pdf_images_extraction_mode": "eager",
+                    "pdf_tables_extraction_mode": "eager",
+                    "pdf_figures_extraction_mode": "eager",
+                    "pdf_visuals_diagnostics": {
+                        "summary": pdf_visual_diagnostics.get("summary") or {},
+                        "issues_count": len(pdf_visual_diagnostics.get("issues") or []),
+                        "last_extracted_at": self._now_iso(),
+                    },
                 }
-                catalog.replace_pdf_tables(doc.doc_id, [])
-                catalog.replace_pdf_figures(doc.doc_id, [])
-            catalog.replace_images(doc.doc_id, image_records)
+            raw_artifact_records = self._remap_raw_artifact_records(
+                raw_artifact_records,
+                staging_workspace_dir=staging_workspace_dir,
+                workspace_dir=workspace_dir,
+            )
+            image_records = self._remap_image_record_paths(
+                image_records,
+                staging_workspace_dir=staging_workspace_dir,
+                workspace_dir=workspace_dir,
+            )
+            pdf_table_records = self._remap_pdf_table_record_paths(
+                pdf_table_records,
+                staging_workspace_dir=staging_workspace_dir,
+                workspace_dir=workspace_dir,
+            )
+            pdf_figure_records = self._remap_pdf_figure_record_paths(
+                pdf_figure_records,
+                staging_workspace_dir=staging_workspace_dir,
+                workspace_dir=workspace_dir,
+            )
             parsed.metadata = {
                 **parsed.metadata,
+                "raw_artifacts": raw_artifact_records,
                 _PIPELINE_METADATA_KEY: self._pipeline_metadata(
                     doc_type=doc.type,
                     profile=profile,
@@ -2019,23 +3283,49 @@ class AppService:
             if stage_callback is not None:
                 stage_callback(
                     IngestStage.INDEX,
-                    "Rebuilding vector index for document chunks.",
+                    "Rebuilding local SQLite FTS index for document graph nodes.",
                 )
-            self.vector_index.rebuild_document(doc.doc_id, parsed.title, parsed.chunks)
             if stage_callback is not None:
                 stage_callback(
                     IngestStage.FINALIZE,
                     "Saving final document metadata and marking document ready.",
                 )
-            catalog.save_document_parse_output(
-                doc_id=doc.doc_id,
-                title=parsed.title,
-                parser_chain=parsed.parser_chain,
-                metadata=parsed.metadata,
-                outline=parsed.outline,
-                overall_confidence=parsed.overall_confidence,
-                status=DocumentStatus.READY,
-            )
+            staged_catalog: CatalogStore | None = None
+            backup_workspace_dir: Path | None = None
+            with self._ingest_lock:
+                staged_catalog = catalog.create_staging_copy(
+                    suffix=f"{doc.doc_id}-{uuid4().hex}"
+                )
+                try:
+                    self._persist_parse_output_to_catalog(
+                        catalog=staged_catalog,
+                        doc=doc,
+                        profile=profile,
+                        parsed=parsed,
+                        image_records=image_records,
+                        pdf_table_records=pdf_table_records,
+                        pdf_figure_records=pdf_figure_records,
+                        current_sha256=current_sha256,
+                        current_mtime=current_mtime,
+                    )
+                    backup_workspace_dir = self._replace_workspace_with_staging(
+                        staging_workspace_dir=staging_workspace_dir,
+                        workspace_dir=workspace_dir,
+                    )
+                    catalog.replace_with_staging_copy(staged_catalog)
+                    self._cleanup_staging_artifacts(
+                        staging_workspace_dir=staging_workspace_dir,
+                        backup_dir=backup_workspace_dir,
+                    )
+                except Exception:
+                    if backup_workspace_dir is not None:
+                        self._rollback_workspace_swap(
+                            backup_dir=backup_workspace_dir,
+                            workspace_dir=workspace_dir,
+                        )
+                    if staged_catalog is not None and staged_catalog.db_path.exists():
+                        staged_catalog.db_path.unlink(missing_ok=True)
+                    raise
             return {
                 "doc_id": doc.doc_id,
                 "profile": profile,
@@ -2043,6 +3333,8 @@ class AppService:
                 "chunks_count": len(parsed.chunks),
                 "formulas_count": len(parsed.formulas),
                 "images_count": len(image_records),
+                "pdf_tables_count": len(pdf_table_records),
+                "pdf_figures_count": len(pdf_figure_records),
                 "outline_depth": max(
                     (node.level for node in parsed.outline), default=0
                 ),
@@ -2052,8 +3344,8 @@ class AppService:
                         doc_id=doc.doc_id,
                         path=doc.path,
                         type=doc.type,
-                        sha256=doc.sha256,
-                        mtime=doc.mtime,
+                        sha256=current_sha256,
+                        mtime=current_mtime,
                         title=parsed.title,
                         status=DocumentStatus.READY,
                         profile=profile,
@@ -2063,8 +3355,14 @@ class AppService:
                         overall_confidence=parsed.overall_confidence,
                     )
                 ),
+                **(
+                    {"pdf_parser_lanes": parsed.metadata["pdf_parser_lanes"]}
+                    if isinstance(parsed.metadata.get("pdf_parser_lanes"), dict)
+                    else {}
+                ),
             }
         except Exception:
+            shutil.rmtree(staging_workspace_dir, ignore_errors=True)
             catalog.set_document_status(
                 doc.doc_id, DocumentStatus.FAILED, profile=profile
             )
@@ -2102,6 +3400,135 @@ class AppService:
             "sample_pages": profile.sample_pages,
             "cpu_count": profile.cpu_count,
             "total_memory_bytes": profile.total_memory_bytes,
+        }
+
+    def _pdf_parser_lane_interpretation(
+        self, benchmark: dict[str, Any]
+    ) -> dict[str, Any]:
+        documents = list(benchmark.get("documents") or [])
+        document = documents[0] if documents else {}
+        rows = {
+            str(row.get("engine")): row
+            for row in document.get("engines", [])
+            if isinstance(row, dict)
+        }
+
+        def row_summary(engine: str) -> dict[str, Any]:
+            row = rows.get(engine) or {}
+            metrics = (
+                row.get("metrics", {}) if isinstance(row.get("metrics"), dict) else {}
+            )
+            return {
+                "status": row.get("status", "not_run"),
+                "seconds": row.get("seconds"),
+                "normalized_text_chars": metrics.get("normalized_text_chars"),
+                "query_hit_rate": (metrics.get("query_replay") or {}).get("hit_rate")
+                if isinstance(metrics.get("query_replay"), dict)
+                else None,
+                "formula_markers_total": metrics.get("formula_markers_total"),
+                "tables": metrics.get("tables"),
+                "figures": metrics.get("figures"),
+                "images": metrics.get("images"),
+                "stderr_chars": (row.get("engine_output") or {}).get("stderr_chars", 0)
+                if isinstance(row.get("engine_output"), dict)
+                else 0,
+            }
+
+        pypdfium2 = row_summary("pypdfium2_pdf")
+        docling = row_summary("docling_raw_pdf_no_formula")
+        pymupdf = row_summary("pymupdf_pdf")
+        pdf_oxide = row_summary("pdf_oxide_pdf")
+
+        fidelity_signals = {
+            "formula_markers_total": docling.get("formula_markers_total") or 0,
+            "tables": docling.get("tables") or 0,
+            "figures": docling.get("figures") or 0,
+            "images": docling.get("images") or 0,
+        }
+        high_fidelity_available = docling["status"] == "ok" and any(
+            int(value or 0) > 0 for value in fidelity_signals.values()
+        )
+        fast_text_available = pypdfium2["status"] == "ok"
+        warnings: list[str] = []
+        if pdf_oxide["stderr_chars"]:
+            warnings.append(
+                "pdf_oxide emitted stderr warnings; do not promote it to default "
+                "without inspecting warning semantics."
+            )
+        if docling["status"] in {"timeout", "error"}:
+            warnings.append(
+                "Docling fidelity probe did not complete; keep high-fidelity parsing "
+                "isolated and tune timeout/resources before long ingest runs."
+            )
+
+        return {
+            "recommended_scheme": {
+                "fast_lane": "pypdfium2_pdf" if fast_text_available else None,
+                "fidelity_lane": "docling_raw_pdf_no_formula"
+                if high_fidelity_available or docling["status"] == "ok"
+                else None,
+                "diagnostic_lane": "pymupdf_pdf" if pymupdf["status"] == "ok" else None,
+                "candidate_lane": "pdf_oxide_pdf"
+                if pdf_oxide["status"] == "ok"
+                else None,
+            },
+            "lane_summaries": {
+                "pypdfium2_pdf": pypdfium2,
+                "docling_raw_pdf_no_formula": docling,
+                "pymupdf_pdf": pymupdf,
+                "pdf_oxide_pdf": pdf_oxide,
+            },
+            "fidelity_signals": fidelity_signals,
+            "judgment": (
+                "Use pypdfium2 for fast PDF discovery/preview/local search and "
+                "Docling for formulas, tables, figures, images, and layout-aware "
+                "high-fidelity reading evidence."
+            ),
+            "warnings": warnings,
+        }
+
+    def pdf_diagnose_parser_lanes(
+        self,
+        *,
+        doc_id: str | None,
+        path: str | None,
+        include_fidelity: bool = True,
+        include_pymupdf: bool = True,
+        include_pdf_oxide: bool = False,
+        timeout_seconds: int = 240,
+        queries: list[str] | None = None,
+    ) -> dict[str, Any]:
+        resolved_path, resolved_doc_id = self._resolve_pdf_path_for_operation(
+            doc_id,
+            path,
+            operation_name="pdf_diagnose_parser_lanes",
+        )
+        engines = ["pypdfium2_pdf"]
+        if include_pymupdf:
+            engines.append("pymupdf_pdf")
+        if include_fidelity:
+            engines.append("docling_raw_pdf_no_formula")
+        if include_pdf_oxide:
+            engines.append("pdf_oxide_pdf")
+
+        from mcp_ebook_read.benchmark.parser_engines import (
+            DEFAULT_READING_QUERIES,
+            run_parser_engine_benchmark,
+        )
+
+        benchmark = run_parser_engine_benchmark(
+            document_paths=[resolved_path],
+            engines=engines,
+            queries=list(DEFAULT_READING_QUERIES if queries is None else queries),
+            timeout_seconds=max(1, int(timeout_seconds)),
+        )
+        return {
+            "doc_id": resolved_doc_id,
+            "path": str(resolved_path),
+            "engines": engines,
+            "diagnostic_scope": "parser_lane_probe_no_sidecar_write",
+            "benchmark": benchmark,
+            "interpretation": self._pdf_parser_lane_interpretation(benchmark),
         }
 
     def document_ingest_pdf_book(
@@ -2316,78 +3743,639 @@ class AppService:
         hits.sort(key=lambda item: item.get("local_score", 0), reverse=True)
         return hits[:top_k]
 
-    def _search_hybrid(
+    def _search_local_index(
         self, query: str, doc_ids: list[str] | None, top_k: int
     ) -> dict[str, Any]:
-        vector_hits = self.vector_index.search(
-            query=query, top_k=top_k, doc_ids=doc_ids
-        )
         local_hits = self._local_search(query=query, doc_ids=doc_ids, top_k=top_k)
-        hits = self._fuse_search_hits(vector_hits=vector_hits, local_hits=local_hits)
         return {
-            "hits": hits[:top_k],
+            "hits": local_hits[:top_k],
             "retrieval": {
-                "mode": "hybrid_rrf",
-                "vector_backend": "qdrant",
+                "mode": "sqlite_fts5",
                 "local_backend": "sqlite_fts5",
-                "vector_hits_count": len(vector_hits),
                 "local_hits_count": len(local_hits),
+                "external_vector_backend": None,
             },
         }
-
-    def _fuse_search_hits(
-        self,
-        *,
-        vector_hits: list[dict[str, Any]],
-        local_hits: list[dict[str, Any]],
-    ) -> list[dict[str, Any]]:
-        rrf_k = 60
-        fused: dict[tuple[str, str, str], dict[str, Any]] = {}
-
-        def hit_key(hit: dict[str, Any]) -> tuple[str, str, str]:
-            source_type = hit.get("source_type") or "chunk"
-            source_id = hit.get("source_id") or hit.get("chunk_id") or ""
-            return (str(hit.get("doc_id") or ""), str(source_type), str(source_id))
-
-        def add_hit(hit: dict[str, Any], source: str, rank: int) -> None:
-            key = hit_key(hit)
-            if key not in fused:
-                fused[key] = dict(hit)
-                fused[key]["_rrf_score"] = 0.0
-                fused[key]["_retrieval_sources"] = []
-            else:
-                for field in (
-                    "locator",
-                    "source_type",
-                    "source_id",
-                    "section_path",
-                    "snippet",
-                    "read_hint",
-                ):
-                    if field not in fused[key] and field in hit:
-                        fused[key][field] = hit[field]
-            fused[key]["_rrf_score"] += 1 / (rrf_k + rank)
-            fused[key]["_retrieval_sources"].append({"source": source, "rank": rank})
-
-        for rank, hit in enumerate(vector_hits, start=1):
-            add_hit(hit, "qdrant", rank)
-        for rank, hit in enumerate(local_hits, start=1):
-            add_hit(hit, "sqlite_fts5", rank)
-
-        results = sorted(
-            fused.values(),
-            key=lambda item: item["_rrf_score"],
-            reverse=True,
-        )
-        for item in results:
-            item["hybrid_score"] = item.pop("_rrf_score")
-            item["retrieval_sources"] = item.pop("_retrieval_sources")
-        return results
 
     def search(
         self, query: str, doc_ids: list[str] | None, top_k: int
     ) -> dict[str, Any]:
-        return self._search_hybrid(query=query, doc_ids=doc_ids, top_k=top_k)
+        return self._search_local_index(query=query, doc_ids=doc_ids, top_k=top_k)
+
+    @staticmethod
+    def _hit_to_graph_lookup(hit: dict[str, Any]) -> str:
+        source_type = str(hit.get("source_type") or "chunk")
+        source_id = str(hit.get("source_id") or hit.get("chunk_id") or "")
+        if source_type == "pdf_table":
+            return source_id
+        if source_type == "pdf_figure":
+            return source_id
+        return source_id
+
+    def _require_document_mode(
+        self,
+        *,
+        doc_id: str,
+        expected_type: DocumentType,
+        expected_profile: Profile,
+        operation_name: str,
+    ) -> tuple[DocumentRecord, CatalogStore]:
+        doc, catalog = self._require_doc(
+            doc_id,
+            error_code=ErrorCode.INGEST_DOC_NOT_FOUND,
+            message=f"Document not found for {operation_name}.",
+        )
+        if doc.type != expected_type or doc.profile != expected_profile:
+            raise AppError(
+                ErrorCode.INGEST_UNSUPPORTED_TYPE,
+                f"{operation_name} requires a {expected_type.value} {expected_profile.value}.",
+                details={
+                    "doc_id": doc_id,
+                    "actual_type": doc.type,
+                    "actual_profile": doc.profile,
+                    "expected_type": expected_type,
+                    "expected_profile": expected_profile,
+                },
+            )
+        return doc, catalog
+
+    def _document_explore(
+        self,
+        *,
+        doc_id: str,
+        query: str,
+        top_k: int,
+        operation_name: str,
+    ) -> dict[str, Any]:
+        doc, catalog = self._require_doc(
+            doc_id,
+            error_code=ErrorCode.INGEST_DOC_NOT_FOUND,
+            message=f"Document not found for {operation_name}.",
+        )
+        selected_limit = max(1, min(top_k, 20))
+        search_limit = max(selected_limit * 4, 20)
+        search_result = self._search_local_index(
+            query=query, doc_ids=[doc_id], top_k=search_limit
+        )
+        selected_nodes: list[dict[str, Any]] = []
+        selected_node_ids: set[str] = set()
+        neighbor_rows: list[dict[str, Any]] = []
+        ambiguity_buckets: dict[str, list[dict[str, Any]]] = defaultdict(list)
+
+        for hit in search_result["hits"]:
+            if len(selected_nodes) >= selected_limit:
+                break
+            lookup_id = self._hit_to_graph_lookup(hit)
+            if not lookup_id:
+                continue
+            node = catalog.get_graph_node(doc_id=doc_id, node_id=lookup_id)
+            if node is None or node["node_id"] in selected_node_ids:
+                continue
+            selected_node_ids.add(node["node_id"])
+            ambiguity_key = normalize_section_key(
+                str(node.get("title") or node.get("stable_ref") or "")
+            )
+            if ambiguity_key:
+                ambiguity_buckets[ambiguity_key].append(
+                    {
+                        "node_id": node["node_id"],
+                        "kind": node["kind"],
+                        "title": node.get("title"),
+                        "stable_ref": node.get("stable_ref"),
+                    }
+                )
+            retrieval_sources = hit.get("retrieval_sources") or []
+            primary_source = (
+                retrieval_sources[0].get("source")
+                if retrieval_sources and isinstance(retrieval_sources[0], dict)
+                else hit.get("retrieval_source") or "sqlite_fts5"
+            )
+            why_included = {
+                "source": primary_source,
+                "retrieval_sources": retrieval_sources,
+                "snippet": hit.get("snippet"),
+                "local_rank": hit.get("local_rank"),
+                "source_type": hit.get("source_type"),
+            }
+            if hit.get("why_included"):
+                why_included["structured_reason"] = hit["why_included"]
+            if hit.get("additional_relevance"):
+                why_included["additional_relevance"] = hit["additional_relevance"]
+            selected_nodes.append(
+                {
+                    **node,
+                    "why_included": why_included,
+                }
+            )
+            for neighbor in catalog.list_graph_neighbors(
+                doc_id=doc_id,
+                node_id=node["node_id"],
+                limit=20,
+            ):
+                neighbor_node_id = neighbor["node"]["node_id"]
+                if neighbor_node_id in selected_node_ids:
+                    continue
+                neighbor_rows.append(neighbor)
+
+        graph_stats = catalog.graph_stats(doc_id)
+        pipeline_status = self._document_pipeline_status(doc)
+        persisted_diagnostics = catalog.list_diagnostics(doc_id=doc_id, limit=50)
+        diagnostics = (
+            [
+                {
+                    "severity": "warning",
+                    "code": "DOCUMENT_PIPELINE_STALE",
+                    "message": pipeline_status.get("reason"),
+                    "hint": pipeline_status.get("hint"),
+                }
+            ]
+            if pipeline_status.get("is_stale")
+            else []
+        )
+        diagnostics.extend(persisted_diagnostics)
+        ambiguity_candidates = [
+            {"match_key": key, "candidates": values}
+            for key, values in sorted(ambiguity_buckets.items())
+            if len(values) > 1
+        ]
+        return {
+            "document": {
+                "doc_id": doc.doc_id,
+                "title": doc.title,
+                "type": doc.type,
+                "profile": doc.profile,
+                "status": doc.status,
+                "path": doc.path,
+            },
+            "query": query,
+            "hits": search_result["hits"][:search_limit],
+            "selected_nodes": selected_nodes,
+            "neighbor_nodes": neighbor_rows[: max(selected_limit * 3, 12)],
+            "graph": graph_stats,
+            "retrieval": {
+                **search_result["retrieval"],
+                "mode": "sqlite_fts5_plus_document_graph",
+                "search_limit": search_limit,
+                "selected_limit": selected_limit,
+            },
+            "pipeline_status": pipeline_status,
+            "diagnostics": diagnostics,
+            "ambiguity_candidates": ambiguity_candidates,
+            "truncation": {
+                "selected_nodes_truncated": len(search_result["hits"]) > selected_limit,
+                "neighbor_nodes_truncated": len(neighbor_rows)
+                > max(selected_limit * 3, 12),
+                "next_call": {
+                    "tool": operation_name,
+                    "args": {
+                        "doc_id": doc_id,
+                        "query": query,
+                        "top_k": min(selected_limit * 2, 20),
+                    },
+                }
+                if len(search_result["hits"]) > selected_limit
+                else None,
+            },
+            "suggested_next_calls": [
+                {
+                    "tool": "document_node",
+                    "reason": "Read one selected node precisely with graph neighbors.",
+                    "args": {"doc_id": doc_id, "node_id": "<selected_nodes[].node_id>"},
+                },
+                {
+                    "tool": "read_outline_node",
+                    "reason": "Read a full chapter/section when an outline node is selected.",
+                    "args": {"doc_id": doc_id, "node_id": "<outline node id>"},
+                },
+            ],
+        }
+
+    def document_explore(
+        self, doc_id: str, query: str, top_k: int = 8
+    ) -> dict[str, Any]:
+        return self._document_explore(
+            doc_id=doc_id,
+            query=query,
+            top_k=top_k,
+            operation_name="document_explore",
+        )
+
+    def _library_document_ranking(
+        self,
+        *,
+        query: str,
+        bucket: dict[str, Any],
+    ) -> dict[str, Any]:
+        query_label = CatalogStore._normalize_search_label(query)
+        query_tokens = set(query_label.split())
+        title_label = CatalogStore._normalize_search_label(
+            str(bucket.get("title") or "")
+        )
+        path_label = CatalogStore._normalize_search_label(str(bucket.get("path") or ""))
+        matched_title_tokens = sorted(query_tokens & set(title_label.split()))
+        matched_path_tokens = sorted(query_tokens & set(path_label.split()))
+        hits_count = int(bucket.get("hits_count") or 0)
+        node_kinds = bucket.get("_node_kinds") or set()
+        section_keys = {
+            key for key in (bucket.get("_section_keys") or set()) if str(key).strip()
+        }
+        retrieval_sources = bucket.get("_retrieval_sources") or set()
+        best_local_score = float(bucket.get("best_local_score") or 0)
+        score = best_local_score
+        score += min(hits_count, 12) * 3.0
+        score += min(len(node_kinds), 6) * 4.0
+        score += min(len(section_keys), 8) * 2.0
+        score += min(len(retrieval_sources), 4) * 3.0
+        if matched_title_tokens:
+            score += 24.0 * (len(matched_title_tokens) / max(len(query_tokens), 1))
+        if matched_path_tokens:
+            score += 8.0 * (len(matched_path_tokens) / max(len(query_tokens), 1))
+        if bucket.get("status") == DocumentStatus.READY:
+            score += 5.0
+
+        return {
+            "score": round(score, 4),
+            "signals": {
+                "best_local_score": best_local_score,
+                "hits_count": hits_count,
+                "node_kinds": sorted(str(item) for item in node_kinds),
+                "section_paths_count": len(section_keys),
+                "retrieval_sources": sorted(str(item) for item in retrieval_sources),
+                "matched_title_tokens": matched_title_tokens,
+                "matched_path_tokens": matched_path_tokens,
+                "ready_boost_applied": bucket.get("status") == DocumentStatus.READY,
+            },
+        }
+
+    def _library_document_bucket_payload(
+        self, bucket: dict[str, Any]
+    ) -> dict[str, Any]:
+        return {key: value for key, value in bucket.items() if not key.startswith("_")}
+
+    def library_explore(
+        self, *, root: str, query: str, top_k: int = 12
+    ) -> dict[str, Any]:
+        catalogs = self._discover_sidecar_catalogs(root)
+        selected_limit = max(1, min(top_k, 50))
+        search_limit = max(selected_limit * 4, 40)
+        doc_catalogs: dict[str, tuple[DocumentRecord, CatalogStore]] = {}
+        unready_documents: list[dict[str, Any]] = []
+        searched_documents_count = 0
+        all_hits: list[dict[str, Any]] = []
+
+        for catalog in catalogs:
+            docs = catalog.list_documents()
+            searched_documents_count += len(docs)
+            for doc in docs:
+                doc_catalogs[doc.doc_id] = (doc, catalog)
+                if doc.status != DocumentStatus.READY:
+                    unready_documents.append(
+                        {
+                            "doc_id": doc.doc_id,
+                            "title": doc.title,
+                            "type": doc.type,
+                            "profile": doc.profile,
+                            "status": doc.status,
+                            "path": doc.path,
+                            "suggested_next_call": {
+                                "tool": self._reingest_hint(doc).get("tool"),
+                                "args": self._reingest_hint(doc).get("args"),
+                            },
+                        }
+                    )
+            all_hits.extend(
+                catalog.search_local(query=query, doc_ids=None, top_k=search_limit)
+            )
+
+        document_buckets: dict[str, dict[str, Any]] = {}
+        for hit in all_hits:
+            doc_id = str(hit.get("doc_id") or "")
+            doc_catalog = doc_catalogs.get(doc_id)
+            if doc_catalog is None:
+                continue
+            doc, catalog = doc_catalog
+            bucket = document_buckets.setdefault(
+                doc_id,
+                {
+                    "doc_id": doc.doc_id,
+                    "title": doc.title,
+                    "type": doc.type,
+                    "profile": doc.profile,
+                    "status": doc.status,
+                    "path": doc.path,
+                    "hits_count": 0,
+                    "best_local_score": hit.get("local_score"),
+                    "sidecar_path": str(catalog.db_path.parent),
+                    "_node_kinds": set(),
+                    "_section_keys": set(),
+                    "_retrieval_sources": set(),
+                },
+            )
+            bucket["hits_count"] += 1
+            bucket["best_local_score"] = max(
+                bucket.get("best_local_score") or 0,
+                hit.get("local_score") or 0,
+            )
+            source_type = str(hit.get("source_type") or "")
+            if source_type:
+                bucket["_node_kinds"].add(source_type)
+            section_path = hit.get("section_path") or []
+            if isinstance(section_path, list):
+                bucket["_section_keys"].add(
+                    " / ".join(str(item) for item in section_path)
+                )
+            for source in hit.get("retrieval_sources") or []:
+                if isinstance(source, dict) and source.get("source"):
+                    bucket["_retrieval_sources"].add(str(source["source"]))
+
+        for bucket in document_buckets.values():
+            ranking = self._library_document_ranking(query=query, bucket=bucket)
+            bucket["document_score"] = ranking["score"]
+            bucket["ranking_signals"] = ranking["signals"]
+
+        for hit in all_hits:
+            bucket = document_buckets.get(str(hit.get("doc_id") or ""))
+            if bucket is None:
+                continue
+            local_score = float(hit.get("local_score") or 0)
+            document_score = float(bucket.get("document_score") or 0)
+            hit["library_document_score"] = document_score
+            hit["library_score"] = local_score + min(document_score, 200.0) * 0.08
+
+        all_hits.sort(
+            key=lambda item: (
+                float(item.get("library_score") or item.get("local_score") or 0),
+                float(item.get("local_score") or 0),
+            ),
+            reverse=True,
+        )
+        hits = [
+            hit for hit in all_hits if str(hit.get("doc_id") or "") in doc_catalogs
+        ][:search_limit]
+        selected_results: list[dict[str, Any]] = []
+        selected_keys: set[tuple[str, str]] = set()
+        diagnostics: list[dict[str, Any]] = []
+
+        for hit in hits:
+            doc_id = str(hit.get("doc_id") or "")
+            doc_catalog = doc_catalogs.get(doc_id)
+            if doc_catalog is None:
+                continue
+            doc, catalog = doc_catalog
+            if len(selected_results) >= selected_limit:
+                continue
+            lookup_id = self._hit_to_graph_lookup(hit)
+            if not lookup_id:
+                continue
+            node = catalog.get_graph_node(doc_id=doc_id, node_id=lookup_id)
+            if node is None:
+                continue
+            selected_key = (doc_id, node["node_id"])
+            if selected_key in selected_keys:
+                continue
+            selected_keys.add(selected_key)
+            pipeline_status = self._document_pipeline_status(doc)
+            if pipeline_status.get("is_stale"):
+                diagnostics.append(
+                    {
+                        "severity": "warning",
+                        "code": "DOCUMENT_PIPELINE_STALE",
+                        "doc_id": doc_id,
+                        "message": pipeline_status.get("reason"),
+                        "hint": pipeline_status.get("hint"),
+                    }
+                )
+            retrieval_sources = hit.get("retrieval_sources") or []
+            selected_results.append(
+                {
+                    "document": {
+                        "doc_id": doc.doc_id,
+                        "title": doc.title,
+                        "type": doc.type,
+                        "profile": doc.profile,
+                        "status": doc.status,
+                        "path": doc.path,
+                    },
+                    "node": node,
+                    "hit": hit,
+                    "why_included": {
+                        "source": hit.get("retrieval_source") or "sqlite_fts5",
+                        "retrieval_sources": retrieval_sources,
+                        "snippet": hit.get("snippet"),
+                        "local_rank": hit.get("local_rank"),
+                        "library_score": hit.get("library_score"),
+                        "library_document_score": hit.get("library_document_score"),
+                        "source_type": hit.get("source_type"),
+                    },
+                    "pipeline_status": pipeline_status,
+                    "suggested_next_calls": [
+                        {
+                            "tool": "document_explore",
+                            "reason": "Narrow follow-up exploration inside this document.",
+                            "args": {
+                                "doc_id": doc_id,
+                                "query": query,
+                                "top_k": min(top_k, 12),
+                            },
+                        },
+                        {
+                            "tool": "document_node",
+                            "reason": "Read this selected graph node precisely.",
+                            "args": {
+                                "doc_id": doc_id,
+                                "node_id": node["node_id"],
+                            },
+                        },
+                    ],
+                }
+            )
+
+        if unready_documents:
+            diagnostics.append(
+                {
+                    "severity": "info",
+                    "code": "DOCUMENTS_NOT_READY",
+                    "message": "Some scanned documents under this root are not ready for library_explore search.",
+                    "documents": unready_documents[:20],
+                }
+            )
+
+        return {
+            "root": str(Path(root).expanduser().resolve()),
+            "query": query,
+            "documents": sorted(
+                [
+                    self._library_document_bucket_payload(bucket)
+                    for bucket in document_buckets.values()
+                ],
+                key=lambda item: item.get("document_score") or 0,
+                reverse=True,
+            ),
+            "selected_results": selected_results,
+            "hits": hits,
+            "retrieval": {
+                "mode": "cross_sidecar_sqlite_fts5_plus_document_graph",
+                "sidecars_count": len(catalogs),
+                "searched_documents_count": searched_documents_count,
+                "hits_count": len(all_hits),
+                "search_limit": search_limit,
+                "selected_limit": selected_limit,
+                "external_vector_backend": None,
+            },
+            "diagnostics": diagnostics,
+            "truncation": {
+                "selected_results_truncated": len(hits) > selected_limit,
+                "next_call": {
+                    "tool": "library_explore",
+                    "args": {
+                        "root": str(Path(root).expanduser().resolve()),
+                        "query": query,
+                        "top_k": min(selected_limit * 2, 50),
+                    },
+                }
+                if len(hits) > selected_limit
+                else None,
+            },
+            "suggested_next_calls": [
+                {
+                    "tool": "document_explore",
+                    "reason": "Explore one selected document in detail.",
+                    "args": {
+                        "doc_id": "<selected_results[].document.doc_id>",
+                        "query": query,
+                        "top_k": 8,
+                    },
+                },
+                {
+                    "tool": "document_node",
+                    "reason": "Read a precise selected graph node.",
+                    "args": {
+                        "doc_id": "<selected_results[].document.doc_id>",
+                        "node_id": "<selected_results[].node.node_id>",
+                    },
+                },
+            ],
+        }
+
+    def _document_node(
+        self,
+        *,
+        doc_id: str,
+        node_id: str,
+        operation_name: str,
+    ) -> dict[str, Any]:
+        doc, catalog = self._require_doc(
+            doc_id,
+            error_code=ErrorCode.INGEST_DOC_NOT_FOUND,
+            message=f"Document not found for {operation_name}.",
+        )
+        node = catalog.get_graph_node(doc_id=doc_id, node_id=node_id)
+        if node is None:
+            raise AppError(
+                ErrorCode.READ_LOCATOR_NOT_FOUND,
+                f"Document graph node not found: {node_id}",
+                details={"doc_id": doc_id, "node_id": node_id},
+            )
+
+        read_result: dict[str, Any] | None = None
+        locator = node["locator"]
+        if node["kind"] == "chunk":
+            read_result = self.read(
+                locator=locator, before=1, after=1, out_format="markdown"
+            )
+        elif node["kind"] == "outline_node":
+            outline_node_id = locator.get("node_id")
+            if outline_node_id:
+                read_result = self.read_outline_node(
+                    doc_id=doc_id,
+                    node_id=outline_node_id,
+                    out_format="markdown",
+                    max_chunks=80,
+                )
+        elif node["kind"] == "formula":
+            formula_id = locator.get("formula_id")
+            if formula_id:
+                if doc.profile == Profile.PAPER:
+                    read_result = self.pdf_paper_read_formula(
+                        doc_id=doc_id,
+                        formula_id=formula_id,
+                    )
+                else:
+                    read_result = self.pdf_book_read_formula(
+                        doc_id=doc_id,
+                        formula_id=formula_id,
+                    )
+        elif node["kind"] == "image":
+            image_id = locator.get("image_id")
+            if image_id:
+                if doc.type == DocumentType.EPUB:
+                    read_result = self.epub_read_image(doc_id=doc_id, image_id=image_id)
+                else:
+                    read_result = self.pdf_read_image(doc_id=doc_id, image_id=image_id)
+        elif node["kind"] == "table":
+            table_id = locator.get("table_id")
+            if table_id:
+                read_result = self.pdf_read_table(doc_id=doc_id, table_id=table_id)
+        elif node["kind"] == "figure":
+            figure_id = locator.get("figure_id")
+            if figure_id:
+                read_result = self.pdf_read_figure(doc_id=doc_id, figure_id=figure_id)
+        elif node["kind"] == "page":
+            page = locator.get("page")
+            if isinstance(page, int) and doc.type == DocumentType.PDF:
+                read_result = {
+                    "page": page,
+                    "rendered_page": self.render_pdf_page(
+                        doc_id=doc_id,
+                        page=page,
+                        dpi=160,
+                    ),
+                    "hint": "Use neighboring chunk/formula/figure/table nodes for semantic reading context.",
+                }
+        elif node["kind"] == "artifact":
+            metadata = node.get("metadata") or {}
+            read_result = {
+                "artifact_id": locator.get("artifact_id"),
+                "file_path": metadata.get("file_path"),
+                "media_type": metadata.get("media_type"),
+                "width": metadata.get("width"),
+                "height": metadata.get("height"),
+                "source_ref": metadata.get("source_ref"),
+                "hint": "Pass file_path to a multimodal LLM when visual inspection is needed.",
+            }
+        elif node["kind"] in {"reference", "citation"}:
+            read_result = {
+                "kind": node["kind"],
+                "title": node.get("title"),
+                "text": node.get("text"),
+                "locator": locator,
+                "metadata": node.get("metadata") or {},
+            }
+
+        return {
+            "document": {
+                "doc_id": doc.doc_id,
+                "title": doc.title,
+                "type": doc.type,
+                "profile": doc.profile,
+                "status": doc.status,
+            },
+            "node": node,
+            "neighbors": catalog.list_graph_neighbors(
+                doc_id=doc_id,
+                node_id=node["node_id"],
+                limit=80,
+            ),
+            "read_result": read_result,
+            "pipeline_status": self._document_pipeline_status(doc),
+        }
+
+    def document_node(self, doc_id: str, node_id: str) -> dict[str, Any]:
+        return self._document_node(
+            doc_id=doc_id,
+            node_id=node_id,
+            operation_name="document_node",
+        )
 
     def search_in_outline_node(
         self,
@@ -2399,7 +4387,7 @@ class AppService:
     ) -> dict[str, Any]:
         _, node, node_path, _ = self._resolve_outline_node(doc_id, node_id)
         expanded_top_k = max(top_k * 5, top_k)
-        search_result = self._search_hybrid(
+        search_result = self._search_local_index(
             query=query,
             doc_ids=[doc_id],
             top_k=expanded_top_k,
@@ -2596,6 +4584,42 @@ class AppService:
             },
         }
 
+    def _caption_evidence_payload(
+        self,
+        *,
+        caption: str | None,
+        default_source: str,
+        observation: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        caption_observation = (
+            observation.get("caption")
+            if isinstance(observation, dict)
+            and isinstance(observation.get("caption"), dict)
+            else None
+        )
+        if caption_observation is not None:
+            needs_review = bool(caption_observation.get("needs_review"))
+            return {
+                "status": "needs_review"
+                if needs_review
+                else "resolved"
+                if caption_observation.get("text")
+                else "missing",
+                "text": caption_observation.get("text"),
+                "source": caption_observation.get("source") or default_source,
+                "confidence": caption_observation.get("confidence"),
+                "needs_review": needs_review,
+                "candidates": caption_observation.get("candidates") or [],
+            }
+        return {
+            "status": "resolved" if caption else "missing",
+            "text": caption,
+            "source": default_source if caption else None,
+            "confidence": None,
+            "needs_review": not bool(caption),
+            "candidates": [],
+        }
+
     def _image_payload(
         self,
         image: ImageRecord,
@@ -2612,6 +4636,12 @@ class AppService:
             "anchor": image.anchor,
             "alt": image.alt,
             "caption": image.caption,
+            "caption_evidence": self._caption_evidence_payload(
+                caption=image.caption,
+                default_source="epub_figcaption"
+                if image.source in {"ebooklib", "epub"}
+                else "pdf_image_caption_nearby_text",
+            ),
             "media_type": image.media_type,
             "image_path": image.file_path,
             "width": image.width,
@@ -2636,6 +4666,11 @@ class AppService:
             "page_range": table.page_range,
             "bbox": table.bbox,
             "caption": table.caption,
+            "caption_evidence": self._caption_evidence_payload(
+                caption=table.caption,
+                default_source="pdf_table_extractor",
+                observation=observation,
+            ),
             "headers": table.headers,
             "row_count": len(table.rows),
             "column_count": len(table.headers),
@@ -2673,6 +4708,11 @@ class AppService:
             "page": figure.page,
             "bbox": figure.bbox,
             "caption": figure.caption,
+            "caption_evidence": self._caption_evidence_payload(
+                caption=figure.caption,
+                default_source="pdf_figure_extractor",
+                observation=observation,
+            ),
             "kind": figure.kind,
             "image_path": figure.file_path,
             "width": figure.width,
@@ -2791,172 +4831,31 @@ class AppService:
         observation = figures.get(figure_id)
         return observation if isinstance(observation, dict) else {"issues": []}
 
-    def _clear_pdf_visual_artifacts(
+    def _load_pdf_images_evidence(
         self,
         *,
         doc: DocumentRecord,
         catalog: CatalogStore,
-    ) -> None:
-        workspace_dir = self._doc_workspace_dir(doc, catalog)
-        for target_dir in (
-            self._pdf_images_dir(workspace_dir),
-            self._pdf_tables_dir(workspace_dir),
-            self._pdf_figures_dir(workspace_dir),
-        ):
-            if target_dir.exists():
-                shutil.rmtree(target_dir)
-        manifest_path = self._pdf_visuals_manifest_path(workspace_dir)
-        if manifest_path.exists():
-            manifest_path.unlink()
-
-    def _ensure_pdf_images_extracted(
-        self,
-        *,
-        doc: DocumentRecord,
-        catalog: CatalogStore,
-        force: bool = False,
     ) -> list[ImageRecord]:
-        workspace_dir = self._doc_workspace_dir(doc, catalog)
-        images_dir = workspace_dir / "assets" / "pdf-images"
-        manifest_path = self._pdf_images_manifest_path(workspace_dir)
+        return catalog.list_images(doc.doc_id)
 
-        if force:
-            if images_dir.exists():
-                shutil.rmtree(images_dir)
-            catalog.replace_images(doc.doc_id, [])
-
-        existing_images = catalog.list_images(doc.doc_id)
-        if existing_images and not force:
-            return existing_images
-        if manifest_path.exists() and not force:
-            return existing_images
-        if self.pdf_image_extractor is None:
-            return existing_images
-
-        chunks = catalog.list_chunks(doc.doc_id)
-        if not chunks:
-            raise AppError(
-                ErrorCode.READ_IMAGE_NOT_FOUND,
-                "PDF images are unavailable because the document has no parsed chunks.",
-                details={
-                    "doc_id": doc.doc_id,
-                    "hint": "Run document_ingest_pdf_book or document_ingest_pdf_paper first.",
-                },
-            )
-
-        if images_dir.exists():
-            shutil.rmtree(images_dir)
-
-        extracted_images = self.pdf_image_extractor.extract(
-            pdf_path=doc.path,
-            doc_id=doc.doc_id,
-            chunks=chunks,
-            out_dir=images_dir,
-        )
-        catalog.replace_images(doc.doc_id, extracted_images)
-        manifest_path.parent.mkdir(parents=True, exist_ok=True)
-        manifest_path.write_text(
-            json.dumps(
-                {
-                    "doc_id": doc.doc_id,
-                    "images_count": len(extracted_images),
-                },
-                ensure_ascii=True,
-            ),
-            encoding="utf-8",
-        )
-        return extracted_images
-
-    def _ensure_pdf_visuals_extracted(
+    def _load_pdf_visuals_evidence(
         self,
         *,
         doc: DocumentRecord,
         catalog: CatalogStore,
-        missing_chunks_error_code: ErrorCode,
-        force: bool = False,
     ) -> tuple[list[PdfTableRecord], list[PdfFigureRecord], dict[str, Any]]:
         workspace_dir = self._doc_workspace_dir(doc, catalog)
-        tables_dir = self._pdf_tables_dir(workspace_dir)
-        figures_dir = self._pdf_figures_dir(workspace_dir)
         manifest_path = self._pdf_visuals_manifest_path(workspace_dir)
-
-        if force:
-            for target_dir in (tables_dir, figures_dir):
-                if target_dir.exists():
-                    shutil.rmtree(target_dir)
-            if manifest_path.exists():
-                manifest_path.unlink()
-            catalog.replace_pdf_tables(doc.doc_id, [])
-            catalog.replace_pdf_figures(doc.doc_id, [])
 
         existing_tables = catalog.list_pdf_tables(doc.doc_id)
         existing_figures = catalog.list_pdf_figures(doc.doc_id)
-        if (existing_tables or existing_figures) and not force:
-            diagnostics = self._load_pdf_visuals_manifest(
-                manifest_path,
-                tables=existing_tables,
-                figures=existing_figures,
-            )
-            return existing_tables, existing_figures, diagnostics
-        if manifest_path.exists() and not force:
-            diagnostics = self._load_pdf_visuals_manifest(
-                manifest_path,
-                tables=existing_tables,
-                figures=existing_figures,
-            )
-            return existing_tables, existing_figures, diagnostics
-        if self.pdf_visual_extractor is None:
-            diagnostics = self._default_pdf_visuals_diagnostics(
-                tables=existing_tables,
-                figures=existing_figures,
-            )
-            return existing_tables, existing_figures, diagnostics
-
-        chunks = catalog.list_chunks(doc.doc_id)
-        if not chunks:
-            raise AppError(
-                missing_chunks_error_code,
-                "PDF visuals are unavailable because the document has no parsed chunks.",
-                details={
-                    "doc_id": doc.doc_id,
-                    "hint": "Run document_ingest_pdf_book or document_ingest_pdf_paper first.",
-                },
-            )
-
-        extracted = self.pdf_visual_extractor.extract(
-            pdf_path=doc.path,
-            doc_id=doc.doc_id,
-            chunks=chunks,
-            tables_dir=tables_dir,
-            figures_dir=figures_dir,
+        diagnostics = self._load_pdf_visuals_manifest(
+            manifest_path,
+            tables=existing_tables,
+            figures=existing_figures,
         )
-        diagnostics = getattr(extracted, "diagnostics", None)
-        if not isinstance(diagnostics, dict):
-            diagnostics = self._default_pdf_visuals_diagnostics(
-                tables=extracted.tables,
-                figures=extracted.figures,
-            )
-        catalog.replace_pdf_tables(doc.doc_id, extracted.tables)
-        catalog.replace_pdf_figures(doc.doc_id, extracted.figures)
-        manifest_path.parent.mkdir(parents=True, exist_ok=True)
-        manifest_path.write_text(
-            json.dumps(
-                {
-                    "doc_id": doc.doc_id,
-                    "tables_count": len(extracted.tables),
-                    "figures_count": len(extracted.figures),
-                    "diagnostics": diagnostics,
-                },
-                ensure_ascii=True,
-            ),
-            encoding="utf-8",
-        )
-        self._persist_pdf_visuals_diagnostics_summary(
-            doc=doc,
-            catalog=catalog,
-            diagnostics=diagnostics,
-        )
-        return extracted.tables, extracted.figures, diagnostics
+        return existing_tables, existing_figures, diagnostics
 
     def epub_list_images(
         self,
@@ -3070,8 +4969,7 @@ class AppService:
         limit: int,
     ) -> dict[str, Any]:
         doc, catalog = self._ensure_pdf_doc(doc_id)
-        self._ensure_pdf_images_extracted(doc=doc, catalog=catalog)
-        images = catalog.list_images(doc_id)
+        images = self._load_pdf_images_evidence(doc=doc, catalog=catalog)
 
         node_payload: dict[str, Any] | None = None
         if node_id:
@@ -3106,7 +5004,6 @@ class AppService:
 
     def pdf_read_image(self, *, doc_id: str, image_id: str) -> dict[str, Any]:
         doc, catalog = self._ensure_pdf_doc(doc_id)
-        self._ensure_pdf_images_extracted(doc=doc, catalog=catalog)
         image = catalog.get_image(image_id)
         if image is None or image.doc_id != doc_id:
             raise AppError(
@@ -3121,21 +5018,20 @@ class AppService:
 
         image_path = Path(image.file_path)
         if not image_path.exists():
-            self._ensure_pdf_images_extracted(doc=doc, catalog=catalog, force=True)
-            image = catalog.get_image(image_id)
-            if image is None or image.doc_id != doc_id:
-                raise AppError(
-                    ErrorCode.READ_IMAGE_NOT_FOUND,
-                    f"Unknown image_id: {image_id}",
-                    details={"doc_id": doc_id, "image_id": image_id},
-                )
-            image_path = Path(image.file_path)
-            if not image_path.exists():
-                raise AppError(
-                    ErrorCode.READ_IMAGE_NOT_FOUND,
-                    f"Image file does not exist: {image.file_path}",
-                    details={"doc_id": doc_id, "image_id": image_id},
-                )
+            raise AppError(
+                ErrorCode.READ_IMAGE_NOT_FOUND,
+                f"Image evidence file does not exist: {image.file_path}",
+                details={
+                    "doc_id": doc_id,
+                    "image_id": image_id,
+                    "path": image.file_path,
+                    "hint": (
+                        "PDF image extraction is eager and read-only at read time. "
+                        "Re-run document_ingest_pdf_book or document_ingest_pdf_paper "
+                        "with force=true to regenerate sidecar evidence."
+                    ),
+                },
+            )
 
         chunks = catalog.list_chunks(doc_id)
         matched_chunk: ChunkRecord | None = None
@@ -3222,10 +5118,8 @@ class AppService:
         limit: int,
     ) -> dict[str, Any]:
         doc, catalog = self._ensure_pdf_doc(doc_id)
-        tables, _, diagnostics = self._ensure_pdf_visuals_extracted(
-            doc=doc,
-            catalog=catalog,
-            missing_chunks_error_code=ErrorCode.READ_TABLE_NOT_FOUND,
+        tables, _, diagnostics = self._load_pdf_visuals_evidence(
+            doc=doc, catalog=catalog
         )
 
         node_payload: dict[str, Any] | None = None
@@ -3264,11 +5158,7 @@ class AppService:
 
     def pdf_read_table(self, *, doc_id: str, table_id: str) -> dict[str, Any]:
         doc, catalog = self._ensure_pdf_doc(doc_id)
-        _, _, diagnostics = self._ensure_pdf_visuals_extracted(
-            doc=doc,
-            catalog=catalog,
-            missing_chunks_error_code=ErrorCode.READ_TABLE_NOT_FOUND,
-        )
+        _, _, diagnostics = self._load_pdf_visuals_evidence(doc=doc, catalog=catalog)
         table = catalog.get_pdf_table(table_id)
         if table is None or table.doc_id != doc_id:
             raise AppError(
@@ -3283,26 +5173,20 @@ class AppService:
 
         image_path = Path(table.file_path)
         if not image_path.exists():
-            _, _, diagnostics = self._ensure_pdf_visuals_extracted(
-                doc=doc,
-                catalog=catalog,
-                missing_chunks_error_code=ErrorCode.READ_TABLE_NOT_FOUND,
-                force=True,
+            raise AppError(
+                ErrorCode.READ_TABLE_NOT_FOUND,
+                f"Table evidence file does not exist: {table.file_path}",
+                details={
+                    "doc_id": doc_id,
+                    "table_id": table_id,
+                    "path": table.file_path,
+                    "hint": (
+                        "PDF table extraction is eager and read-only at read time. "
+                        "Re-run document_ingest_pdf_book or document_ingest_pdf_paper "
+                        "with force=true to regenerate sidecar evidence."
+                    ),
+                },
             )
-            table = catalog.get_pdf_table(table_id)
-            if table is None or table.doc_id != doc_id:
-                raise AppError(
-                    ErrorCode.READ_TABLE_NOT_FOUND,
-                    f"Unknown table_id: {table_id}",
-                    details={"doc_id": doc_id, "table_id": table_id},
-                )
-            image_path = Path(table.file_path)
-            if not image_path.exists():
-                raise AppError(
-                    ErrorCode.READ_TABLE_NOT_FOUND,
-                    f"Table image file does not exist: {table.file_path}",
-                    details={"doc_id": doc_id, "table_id": table_id},
-                )
 
         matched_chunk = self._find_table_context_chunk(
             catalog=catalog,
@@ -3365,10 +5249,8 @@ class AppService:
         limit: int,
     ) -> dict[str, Any]:
         doc, catalog = self._ensure_pdf_doc(doc_id)
-        _, figures, diagnostics = self._ensure_pdf_visuals_extracted(
-            doc=doc,
-            catalog=catalog,
-            missing_chunks_error_code=ErrorCode.READ_FIGURE_NOT_FOUND,
+        _, figures, diagnostics = self._load_pdf_visuals_evidence(
+            doc=doc, catalog=catalog
         )
 
         node_payload: dict[str, Any] | None = None
@@ -3411,11 +5293,7 @@ class AppService:
 
     def pdf_read_figure(self, *, doc_id: str, figure_id: str) -> dict[str, Any]:
         doc, catalog = self._ensure_pdf_doc(doc_id)
-        _, _, diagnostics = self._ensure_pdf_visuals_extracted(
-            doc=doc,
-            catalog=catalog,
-            missing_chunks_error_code=ErrorCode.READ_FIGURE_NOT_FOUND,
-        )
+        _, _, diagnostics = self._load_pdf_visuals_evidence(doc=doc, catalog=catalog)
         figure = catalog.get_pdf_figure(figure_id)
         if figure is None or figure.doc_id != doc_id:
             raise AppError(
@@ -3430,26 +5308,20 @@ class AppService:
 
         image_path = Path(figure.file_path)
         if not image_path.exists():
-            _, _, diagnostics = self._ensure_pdf_visuals_extracted(
-                doc=doc,
-                catalog=catalog,
-                missing_chunks_error_code=ErrorCode.READ_FIGURE_NOT_FOUND,
-                force=True,
+            raise AppError(
+                ErrorCode.READ_FIGURE_NOT_FOUND,
+                f"Figure evidence file does not exist: {figure.file_path}",
+                details={
+                    "doc_id": doc_id,
+                    "figure_id": figure_id,
+                    "path": figure.file_path,
+                    "hint": (
+                        "PDF figure extraction is eager and read-only at read time. "
+                        "Re-run document_ingest_pdf_book or document_ingest_pdf_paper "
+                        "with force=true to regenerate sidecar evidence."
+                    ),
+                },
             )
-            figure = catalog.get_pdf_figure(figure_id)
-            if figure is None or figure.doc_id != doc_id:
-                raise AppError(
-                    ErrorCode.READ_FIGURE_NOT_FOUND,
-                    f"Unknown figure_id: {figure_id}",
-                    details={"doc_id": doc_id, "figure_id": figure_id},
-                )
-            image_path = Path(figure.file_path)
-            if not image_path.exists():
-                raise AppError(
-                    ErrorCode.READ_FIGURE_NOT_FOUND,
-                    f"Figure image file does not exist: {figure.file_path}",
-                    details={"doc_id": doc_id, "figure_id": figure_id},
-                )
 
         matched_chunk = self._find_figure_context_chunk(
             catalog=catalog,
@@ -3663,6 +5535,20 @@ class AppService:
                     "bbox": None,
                 }
 
+        if evidence is not None and evidence_path.exists():
+            artifact_node_id = catalog.upsert_formula_evidence_artifact(
+                doc_id=doc_id,
+                formula=formula,
+                file_path=str(evidence_path),
+                evidence_type=str(evidence["type"]),
+                width=evidence.get("width"),
+                height=evidence.get("height"),
+                page=evidence.get("page"),
+                bbox=evidence.get("bbox"),
+            )
+            if artifact_node_id is not None:
+                evidence["artifact_node_id"] = artifact_node_id
+
         return {
             "doc_title": doc.title,
             "profile": expected_profile,
@@ -3791,6 +5677,7 @@ class AppService:
         total_docs = 0
         for catalog in catalogs:
             docs = catalog.list_documents()
+            sidecar_summary = catalog.sidecar_summary()
             total_docs += len(docs)
             for doc in docs:
                 self._bind_doc_catalog(doc.doc_id, catalog)
@@ -3799,8 +5686,13 @@ class AppService:
                 {
                     "sidecar_path": str(catalog.db_path.parent),
                     "catalog_path": str(catalog.db_path),
-                    "db_size_bytes": catalog.db_size_bytes(),
+                    "db_size_bytes": sidecar_summary["db_size_bytes"],
+                    "total_bytes": sidecar_summary["total_bytes"],
                     "documents_count": len(docs),
+                    "artifact_count": sidecar_summary["artifacts_count"],
+                    "node_count": sidecar_summary["nodes_count"],
+                    "edge_count": sidecar_summary["edges_count"],
+                    "diagnostics_count": sidecar_summary["diagnostics_count"],
                     "documents": [
                         {
                             "doc_id": doc.doc_id,
@@ -3808,6 +5700,8 @@ class AppService:
                             "type": doc.type,
                             "status": doc.status,
                             "profile": doc.profile,
+                            "graph": catalog.graph_stats(doc.doc_id),
+                            "pipeline_status": self._document_pipeline_status(doc),
                             "latest_ingest_job": (
                                 self._serialize_ingest_job(latest_job)
                                 if (latest_job := catalog.get_ingest_job(doc.doc_id))
@@ -3836,7 +5730,6 @@ class AppService:
     ) -> dict[str, Any]:
         doc, catalog = self._resolve_doc(doc_id, path)
         deleted_records = catalog.delete_documents_by_paths([doc.path])
-        self.vector_index.delete_document(doc.doc_id)
         self._doc_catalog_index.pop(doc.doc_id, None)
         workspace_dir = catalog.db_path.parent / "docs" / doc.doc_id
         artifacts_removed = False
@@ -3847,7 +5740,6 @@ class AppService:
             "doc_id": doc.doc_id,
             "path": doc.path,
             "deleted_records": deleted_records,
-            "vector_deleted": True,
             "artifacts_removed": artifacts_removed if remove_artifacts else False,
         }
 
@@ -3884,7 +5776,6 @@ class AppService:
             if removed_paths:
                 removed_deleted_count = catalog.delete_documents_by_paths(removed_paths)
                 for doc_id_item in removed_doc_ids:
-                    self.vector_index.delete_document(doc_id_item)
                     self._doc_catalog_index.pop(doc_id_item, None)
                     shutil.rmtree(
                         sidecar_root / "docs" / doc_id_item,

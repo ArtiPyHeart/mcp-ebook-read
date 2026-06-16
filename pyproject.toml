@@ -1,6 +1,6 @@
 [project]
 name = "mcp-ebook-read"
-version = "0.2.5"
+version = "0.3.0"
 description = "MCP server for reading and searching EPUB/PDF documents"
 readme = "README.md"
 requires-python = ">=3.13"
@@ -13,20 +13,21 @@ dependencies = [
   "ebooklib>=0.19",
   "lxml>=6.1.1",
   "pymupdf>=1.27.2.3",
-  "qdrant-client[fastembed]>=1.18.0",
-  "fastembed>=0.8.0",
+  "pypdfium2>=4.30.1",
 ]
 
 [project.scripts]
 mcp-ebook-read = "mcp_ebook_read.server:cli_entry"
 mcp-ebook-formula-benchmark = "mcp_ebook_read.benchmark.pdf_formula:main"
+mcp-ebook-parser-engine-benchmark = "mcp_ebook_read.benchmark.parser_engines:main"
 mcp-ebook-reading-benchmark = "mcp_ebook_read.benchmark.reading:main"
+mcp-ebook-concurrency-benchmark = "mcp_ebook_read.benchmark.concurrency:main"
 
 [dependency-groups]
 dev = [
-  "ruff>=0.15.15",
-  "pytest>=9.0.3",
-  "pytest-cov>=7.1.0",
+  "ruff>=0.15.0",
+  "pytest>=8.4.1",
+  "pytest-cov>=7.0.0",
 ]
 
 [build-system]

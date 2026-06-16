@@ -1,6 +1,7 @@
 # Suggested commands
 - Install/sync env: `uv sync`
-- Run MCP server: `QDRANT_URL=http://127.0.0.1:6333 GROBID_URL=http://127.0.0.1:8070 GROBID_TIMEOUT_SECONDS=120 uv run mcp-ebook-read`
+- Run MCP server: `uv run mcp-ebook-read`
+- Run MCP server with optional GROBID enrichment: `GROBID_URL=http://127.0.0.1:8070 GROBID_TIMEOUT_SECONDS=120 uv run mcp-ebook-read`
 - Format: `uv run ruff format .`
 - Lint: `uv run ruff check .`
 - Unit/integration tests: `uv run pytest`

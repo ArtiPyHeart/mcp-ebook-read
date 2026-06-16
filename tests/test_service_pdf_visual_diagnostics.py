@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -15,16 +16,6 @@ from mcp_ebook_read.schema.models import (
     TableSegmentRecord,
 )
 from mcp_ebook_read.service import AppService
-
-
-class _DummyVectorIndex:
-    def rebuild_document(
-        self, doc_id: str, title: str, chunks: list[ChunkRecord]
-    ) -> None:  # noqa: ARG002
-        return None
-
-    def search(self, query: str, top_k: int = 20, doc_ids: list[str] | None = None):  # noqa: ARG002
-        return []
 
 
 class _DummyParser:
@@ -51,6 +42,7 @@ class _ObservabilityVisualExtractor:
         self.tables = tables
         self.figures = figures
         self.diagnostics = diagnostics
+        self.calls = 0
 
     def extract(
         self,
@@ -61,6 +53,7 @@ class _ObservabilityVisualExtractor:
         tables_dir: Path,
         figures_dir: Path,
     ):
+        self.calls += 1
         tables_dir.mkdir(parents=True, exist_ok=True)
         figures_dir.mkdir(parents=True, exist_ok=True)
         generated_tables: list[PdfTableRecord] = []
@@ -103,7 +96,6 @@ def _build_service(
 ) -> AppService:
     return AppService(
         sidecar_dir_name=".mcp-ebook-read",
-        vector_index=_DummyVectorIndex(),
         pdf_parser=_DummyParser(),
         pdf_visual_extractor=visual_extractor,
         grobid_client=_DummyGrobid(),
@@ -155,6 +147,42 @@ def _register_ready_pdf(service: AppService, doc_id: str, pdf_path: Path) -> Non
                 method="docling",
             )
         ],
+    )
+
+
+def _persist_eager_visuals(service: AppService, doc_id: str, pdf_path: Path) -> None:
+    catalog = service._catalog_for_document_path(pdf_path)
+    doc = catalog.get_document_by_id(doc_id)
+    assert doc is not None
+    workspace_dir = catalog.db_path.parent / "docs" / doc_id
+    extracted = service._extract_pdf_visuals(
+        pdf_path=str(pdf_path),
+        doc_id=doc_id,
+        chunks=catalog.list_chunks(doc_id),
+        tables_dir=service._pdf_tables_dir(workspace_dir),
+        figures_dir=service._pdf_figures_dir(workspace_dir),
+    )
+    catalog.replace_pdf_tables(doc_id, extracted.tables)
+    catalog.replace_pdf_figures(doc_id, extracted.figures)
+    manifest_path = service._pdf_visuals_manifest_path(workspace_dir)
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "doc_id": doc_id,
+                "tables_count": len(extracted.tables),
+                "figures_count": len(extracted.figures),
+                "mode": "eager",
+                "diagnostics": extracted.diagnostics,
+            },
+            ensure_ascii=True,
+        ),
+        encoding="utf-8",
+    )
+    service._persist_pdf_visuals_diagnostics_summary(
+        doc=doc,
+        catalog=catalog,
+        diagnostics=extracted.diagnostics,
     )
 
 
@@ -242,18 +270,19 @@ def test_pdf_table_tools_surface_diagnostics_and_persist_summary(
         },
         "figures": {},
     }
-    service = _build_service(
-        tmp_path,
-        _ObservabilityVisualExtractor(
-            tables=[table], figures=[], diagnostics=diagnostics
-        ),
+    visual_extractor = _ObservabilityVisualExtractor(
+        tables=[table], figures=[], diagnostics=diagnostics
     )
+    service = _build_service(tmp_path, visual_extractor)
     _register_ready_pdf(service, doc_id, pdf_path)
+    _persist_eager_visuals(service, doc_id, pdf_path)
+    assert visual_extractor.calls == 1
 
     listed = service.pdf_list_tables(doc_id=doc_id, node_id=None, limit=20)
     assert listed["diagnostics"]["summary"]["issues_count"] == 1
     assert listed["tables"][0]["issues"][0]["code"] == "PDF_TABLE_CAPTION_MISSING"
     assert listed["tables"][0]["merge_diagnostics"]["decision"] == "merged"
+    assert visual_extractor.calls == 1
 
     read = service.pdf_read_table(doc_id=doc_id, table_id="table-1")
     assert (
@@ -261,6 +290,7 @@ def test_pdf_table_tools_surface_diagnostics_and_persist_summary(
         == "PDF_TABLE_CAPTION_MISSING"
     )
     assert read["diagnostics"]["table"]["merge"]["decision"] == "merged"
+    assert visual_extractor.calls == 1
 
     catalog = service._catalog_for_document_path(pdf_path)
     loaded = catalog.get_document_by_id(doc_id)
@@ -321,20 +351,22 @@ def test_pdf_figure_tools_surface_item_issues(tmp_path: Path) -> None:
             }
         },
     }
-    service = _build_service(
-        tmp_path,
-        _ObservabilityVisualExtractor(
-            tables=[], figures=[figure], diagnostics=diagnostics
-        ),
+    visual_extractor = _ObservabilityVisualExtractor(
+        tables=[], figures=[figure], diagnostics=diagnostics
     )
+    service = _build_service(tmp_path, visual_extractor)
     _register_ready_pdf(service, doc_id, pdf_path)
+    _persist_eager_visuals(service, doc_id, pdf_path)
+    assert visual_extractor.calls == 1
 
     listed = service.pdf_list_figures(doc_id=doc_id, node_id=None, limit=20)
     assert listed["diagnostics"]["summary"]["issues_count"] == 1
     assert listed["figures"][0]["issues"][0]["code"] == "PDF_FIGURE_CAPTION_MISSING"
+    assert visual_extractor.calls == 1
 
     read = service.pdf_read_figure(doc_id=doc_id, figure_id="figure-1")
     assert (
         read["diagnostics"]["figure"]["issues"][0]["code"]
         == "PDF_FIGURE_CAPTION_MISSING"
     )
+    assert visual_extractor.calls == 1

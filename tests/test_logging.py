@@ -10,19 +10,19 @@ def test_json_formatter_includes_extra_fields() -> None:
     formatter = JsonFormatter()
     record = logging.makeLogRecord(
         {
-            "name": "mcp_ebook_read.index.vector",
+            "name": "mcp_ebook_read.store.catalog",
             "levelno": logging.WARNING,
             "levelname": "WARNING",
-            "msg": "fastembed_init_failed",
+            "msg": "local_index_rebuild_delayed",
             "attempt": 2,
             "retrying": True,
-            "cache_dir": "/tmp/fastembed",
+            "sidecar_dir": "/tmp/.mcp-ebook-read",
         }
     )
 
     payload = json.loads(formatter.format(record))
 
-    assert payload["message"] == "fastembed_init_failed"
+    assert payload["message"] == "local_index_rebuild_delayed"
     assert payload["attempt"] == 2
     assert payload["retrying"] is True
-    assert payload["cache_dir"] == "/tmp/fastembed"
+    assert payload["sidecar_dir"] == "/tmp/.mcp-ebook-read"

@@ -1293,6 +1293,23 @@ class DoclingPdfVisualExtractor:
                 f"Docling visual extraction failed for {pdf_path}",
             ) from exc
 
+        return self.extract_from_document(
+            document=document,
+            doc_id=doc_id,
+            chunks=chunks,
+            tables_dir=tables_dir,
+            figures_dir=figures_dir,
+        )
+
+    def extract_from_document(
+        self,
+        *,
+        document: Any,
+        doc_id: str,
+        chunks: list[ChunkRecord],
+        tables_dir: Path,
+        figures_dir: Path,
+    ) -> PdfVisualExtractionResult:
         text_by_ref = self._build_text_by_ref(document)
         page_text_blocks = self._build_page_text_blocks(document)
         table_segments, table_segment_issues = self._extract_table_segments(

@@ -21,7 +21,7 @@ def test_should_not_trust_env_proxy_for_local_targets() -> None:
 
 def test_should_trust_env_proxy_for_remote_targets() -> None:
     remote_targets = [
-        "https://qdrant.example.com",
+        "https://search.example.com",
         "http://grobid.example.org",
         "https://api.openai.com",
     ]

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
+import sqlite3
 
 from mcp_ebook_read.schema.models import (
     ChunkRecord,
@@ -12,6 +14,8 @@ from mcp_ebook_read.schema.models import (
     IngestJobStatus,
     IngestStage,
     Locator,
+    OutlineNode,
+    PdfFigureRecord,
     PdfTableRecord,
     Profile,
     TableSegmentRecord,
@@ -35,6 +39,163 @@ def test_upsert_and_get_document(tmp_path: Path) -> None:
     loaded = store.get_document_by_id(doc.doc_id)
     assert loaded is not None
     assert loaded.path == doc.path
+
+
+def test_catalog_metadata_records_schema_versions(tmp_path: Path) -> None:
+    store = CatalogStore(tmp_path / "catalog.db")
+    metadata = store.catalog_metadata()
+
+    assert metadata["schema_version"] == str(CatalogStore.SCHEMA_VERSION)
+    assert metadata["document_graph_schema_version"] == str(
+        CatalogStore.DOCUMENT_GRAPH_SCHEMA_VERSION
+    )
+
+
+def test_local_search_boosts_multi_token_cooccurrence(tmp_path: Path) -> None:
+    store = CatalogStore(tmp_path / "catalog.db")
+    doc_id = "doc-cooccur"
+    doc_path = (tmp_path / "cooccur.pdf").resolve()
+    doc_path.write_bytes(b"pdf")
+    store.upsert_scanned_document(
+        DocumentRecord(
+            doc_id=doc_id,
+            path=str(doc_path),
+            type=DocumentType.PDF,
+            sha256="a" * 64,
+            mtime=1.0,
+        )
+    )
+    store.save_document_parse_output(
+        doc_id=doc_id,
+        title="Cooccurrence",
+        parser_chain=["docling"],
+        metadata={},
+        outline=[OutlineNode(id="n1", title="Section", level=1)],
+        overall_confidence=0.9,
+        status="ready",
+    )
+    chunks = [
+        ChunkRecord(
+            chunk_id="single-token",
+            doc_id=doc_id,
+            order_index=0,
+            section_path=["Section"],
+            text="alpha alpha alpha alpha alpha",
+            search_text="alpha alpha alpha alpha alpha",
+            locator=Locator(
+                doc_id=doc_id,
+                chunk_id="single-token",
+                section_path=["Section"],
+                page_range=[1, 1],
+                method="docling",
+            ),
+            method="docling",
+        ),
+        ChunkRecord(
+            chunk_id="multi-token",
+            doc_id=doc_id,
+            order_index=1,
+            section_path=["Section"],
+            text="alpha and beta co-occur in this evidence paragraph.",
+            search_text="alpha beta cooccurrence evidence",
+            locator=Locator(
+                doc_id=doc_id,
+                chunk_id="multi-token",
+                section_path=["Section"],
+                page_range=[1, 1],
+                method="docling",
+            ),
+            method="docling",
+        ),
+    ]
+    store.replace_chunks(doc_id, chunks)
+
+    hits = store.search_local(query="alpha beta", doc_ids=[doc_id], top_k=5)
+
+    assert hits[0]["source_id"] == "multi-token"
+    assert hits[0]["why_included"]["token_cooccurrence"]["coverage"] == 1.0
+
+
+def test_staging_copy_replaces_active_catalog_atomically(tmp_path: Path) -> None:
+    store = CatalogStore(tmp_path / "catalog.db")
+    doc_id = "doc-staging-copy"
+    path = (tmp_path / "book.pdf").resolve()
+    path.write_bytes(b"pdf")
+    store.upsert_scanned_document(
+        DocumentRecord(
+            doc_id=doc_id,
+            path=str(path),
+            type=DocumentType.PDF,
+            sha256="a" * 64,
+            mtime=1.0,
+            title="Before",
+        )
+    )
+
+    staged = store.create_staging_copy(suffix="unit-test")
+    staged.save_document_parse_output(
+        doc_id=doc_id,
+        title="After",
+        parser_chain=["docling"],
+        metadata={},
+        outline=[],
+        overall_confidence=0.9,
+        status="ready",
+    )
+
+    assert store.get_document_by_id(doc_id).title == "Before"
+
+    store.replace_with_staging_copy(staged)
+
+    loaded = store.get_document_by_id(doc_id)
+    assert loaded is not None
+    assert loaded.title == "After"
+    assert loaded.status == "ready"
+    assert not staged.db_path.exists()
+
+
+def test_incompatible_catalog_without_metadata_is_replaced(tmp_path: Path) -> None:
+    db_path = tmp_path / "catalog.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("CREATE TABLE legacy_table (id TEXT PRIMARY KEY)")
+        conn.execute("INSERT INTO legacy_table (id) VALUES ('old')")
+
+    store = CatalogStore(db_path)
+
+    assert store.catalog_metadata()["schema_version"] == str(
+        CatalogStore.SCHEMA_VERSION
+    )
+    assert store.list_documents() == []
+    backups = list(
+        tmp_path.glob("catalog.db.incompatible-missing_catalog_metadata-*.bak")
+    )
+    assert len(backups) == 1
+    with sqlite3.connect(backups[0]) as conn:
+        assert conn.execute("SELECT id FROM legacy_table").fetchone()[0] == "old"
+
+
+def test_incompatible_catalog_version_is_replaced(tmp_path: Path) -> None:
+    db_path = tmp_path / "catalog.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "CREATE TABLE catalog_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+        )
+        conn.executemany(
+            "INSERT INTO catalog_metadata (key, value) VALUES (?, ?)",
+            [
+                ("schema_version", "999"),
+                ("document_graph_schema_version", "999"),
+            ],
+        )
+
+    store = CatalogStore(db_path)
+
+    metadata = store.catalog_metadata()
+    assert metadata["schema_version"] == str(CatalogStore.SCHEMA_VERSION)
+    assert metadata["document_graph_schema_version"] == str(
+        CatalogStore.DOCUMENT_GRAPH_SCHEMA_VERSION
+    )
+    assert list(tmp_path.glob("catalog.db.incompatible-schema_version_mismatch-*.bak"))
 
 
 def test_ingest_job_progress_round_trips_and_updates(tmp_path: Path) -> None:
@@ -234,6 +395,421 @@ def test_local_search_indexes_chunks_formulas_and_tables(tmp_path: Path) -> None
     assert any(hit["source_id"] == "table-1" for hit in table_hits)
 
 
+def test_document_graph_rebuilds_from_persisted_evidence(tmp_path: Path) -> None:
+    store = CatalogStore(tmp_path / "catalog.db")
+    doc_id = "graph-doc"
+    doc_path = (tmp_path / "graph.pdf").resolve()
+    doc_path.write_bytes(b"pdf")
+    store.upsert_scanned_document(
+        DocumentRecord(
+            doc_id=doc_id,
+            path=str(doc_path),
+            type=DocumentType.PDF,
+            sha256="a" * 64,
+            mtime=1.0,
+        )
+    )
+    store.save_document_parse_output(
+        doc_id=doc_id,
+        title="Graph PDF",
+        parser_chain=["docling"],
+        metadata={
+            "source": "docling",
+            "references": [
+                {
+                    "reference_id": "b1",
+                    "title": "A reference about graph retrieval",
+                    "raw_text": "Author. A reference about graph retrieval. 2026.",
+                }
+            ],
+            "citations": [
+                {
+                    "citation_id": "cite-1",
+                    "target": "#b1",
+                    "text": "[1]",
+                    "chunk_id": "chunk-1",
+                    "section_path": ["Chapter 1"],
+                }
+            ],
+        },
+        outline=[
+            OutlineNode(
+                id="chapter-1",
+                title="Chapter 1",
+                level=1,
+                page_start=1,
+                page_end=3,
+            )
+        ],
+        overall_confidence=0.9,
+        status="ready",
+    )
+    chunk = ChunkRecord(
+        chunk_id="chunk-1",
+        doc_id=doc_id,
+        order_index=0,
+        section_path=["Chapter 1"],
+        text="Chunk text with formula and visual evidence.",
+        search_text="chunk formula visual",
+        locator=Locator(
+            doc_id=doc_id,
+            chunk_id="chunk-1",
+            section_path=["Chapter 1"],
+            page_range=[1, 1],
+            method="docling",
+        ),
+        method="docling",
+    )
+    store.replace_chunks(doc_id, [chunk])
+    store.replace_formulas(
+        doc_id,
+        [
+            FormulaRecord(
+                formula_id="formula-1",
+                doc_id=doc_id,
+                chunk_id="chunk-1",
+                section_path=["Chapter 1"],
+                page=1,
+                bbox=[1.0, 2.0, 3.0, 4.0],
+                latex="x=y",
+                source="pix2text",
+            )
+        ],
+    )
+    store.replace_images(
+        doc_id,
+        [
+            ImageRecord(
+                image_id="image-1",
+                doc_id=doc_id,
+                order_index=0,
+                section_path=["Chapter 1"],
+                caption="Architecture figure",
+                media_type="image/png",
+                file_path=str(tmp_path / "image.png"),
+            )
+        ],
+    )
+    store.replace_pdf_tables(
+        doc_id,
+        [
+            PdfTableRecord(
+                table_id="table-1",
+                doc_id=doc_id,
+                order_index=0,
+                section_path=["Chapter 1"],
+                page_range=[1, 1],
+                bbox=None,
+                caption="Metrics table",
+                headers=["Metric"],
+                rows=[["Value"]],
+                markdown="| Metric |\n| --- |\n| Value |",
+                html="<table><tr><td>Value</td></tr></table>",
+                file_path=str(tmp_path / "table.png"),
+                width=200,
+                height=100,
+                merged=False,
+                segments=[],
+            )
+        ],
+    )
+    store.replace_pdf_figures(
+        doc_id,
+        [
+            PdfFigureRecord(
+                figure_id="figure-1",
+                doc_id=doc_id,
+                order_index=0,
+                section_path=["Chapter 1"],
+                page=1,
+                caption="Signal chart",
+                kind="chart",
+                file_path=str(tmp_path / "figure.png"),
+            )
+        ],
+    )
+
+    stats = store.graph_stats(doc_id)
+    assert stats["nodes_count"] >= 13
+    assert stats["edges_count"] >= 16
+    assert stats["page_nodes_count"] == 3
+    assert stats["artifact_nodes_count"] == 3
+    assert stats["reference_nodes_count"] == 1
+    assert stats["citation_nodes_count"] == 1
+    assert stats["artifacts_count"] == 3
+    assert stats["diagnostics_count"] == 3
+
+    nodes = store.list_graph_nodes(doc_id=doc_id)
+    kinds = {node["kind"] for node in nodes}
+    assert {
+        "document",
+        "outline_node",
+        "page",
+        "chunk",
+        "formula",
+        "image",
+        "table",
+        "figure",
+        "artifact",
+        "reference",
+        "citation",
+    }.issubset(kinds)
+    formula_node = next(node for node in nodes if node["kind"] == "formula")
+    assert formula_node["text"] == "x=y"
+    assert formula_node["locator"]["chunk_id"] == "chunk-1"
+    page_node = next(node for node in nodes if node["kind"] == "page")
+    assert page_node["locator"]["page"] in {1, 2, 3}
+    reference_node = next(node for node in nodes if node["kind"] == "reference")
+    assert "graph retrieval" in reference_node["text"]
+
+    edges = store.list_graph_edges(doc_id=doc_id)
+    edge_kinds = {edge["kind"] for edge in edges}
+    assert {"contains", "mentions", "near", "cites", "renders_from"}.issubset(
+        edge_kinds
+    )
+
+    summary = store.sidecar_summary()
+    assert summary["documents_count"] == 1
+    assert summary["artifacts_count"] == 3
+    assert summary["nodes_count"] == stats["nodes_count"]
+    assert summary["diagnostics_count"] == 3
+    diagnostics = store.list_diagnostics(doc_id=doc_id)
+    assert {diagnostic["metadata"]["source_ref"] for diagnostic in diagnostics} == {
+        "image-1",
+        "table-1",
+        "figure-1",
+    }
+    assert {diagnostic["code"] for diagnostic in diagnostics} == {
+        "ARTIFACT_FILE_MISSING"
+    }
+    reference_hits = store.search_local(
+        query="graph retrieval", doc_ids=[doc_id], top_k=5
+    )
+    reference_hit = next(
+        hit for hit in reference_hits if hit["source_type"] == "reference"
+    )
+    assert reference_hit["retrieval_sources"][0]["source"] == "sqlite_fts5"
+    diagnostic_hits = store.search_local(
+        query="ARTIFACT_FILE_MISSING", doc_ids=[doc_id], top_k=5
+    )
+    assert any(hit["source_type"] == "diagnostic" for hit in diagnostic_hits)
+
+
+def test_validate_document_graph_reports_structural_errors(tmp_path: Path) -> None:
+    store = CatalogStore(tmp_path / "catalog.db")
+    doc_id = "graph-validate-doc"
+    path = (tmp_path / "validate.pdf").resolve()
+    path.write_bytes(b"pdf")
+    store.upsert_scanned_document(
+        DocumentRecord(
+            doc_id=doc_id,
+            path=str(path),
+            type=DocumentType.PDF,
+            sha256="a" * 64,
+            mtime=1.0,
+        )
+    )
+    store.save_document_parse_output(
+        doc_id=doc_id,
+        title="Validate PDF",
+        parser_chain=["docling"],
+        metadata={},
+        outline=[],
+        overall_confidence=0.9,
+        status="ready",
+    )
+    chunk = ChunkRecord(
+        chunk_id="chunk-validate-1",
+        doc_id=doc_id,
+        order_index=0,
+        section_path=["Section"],
+        text="validate graph chunk",
+        search_text="validate graph chunk",
+        locator=Locator(
+            doc_id=doc_id,
+            chunk_id="chunk-validate-1",
+            section_path=["Section"],
+            method="docling",
+        ),
+        method="docling",
+    )
+    store.replace_chunks(doc_id, [chunk])
+
+    with sqlite3.connect(store.db_path) as conn:
+        conn.execute(
+            "DELETE FROM graph_nodes WHERE doc_id = ? AND kind = 'chunk'",
+            (doc_id,),
+        )
+        conn.execute(
+            "UPDATE chunks SET locator_json = ? WHERE doc_id = ? AND chunk_id = ?",
+            (
+                json.dumps(
+                    {
+                        "doc_id": "other-doc",
+                        "chunk_id": "other-chunk",
+                        "section_path": ["Section"],
+                        "method": "docling",
+                    }
+                ),
+                doc_id,
+                "chunk-validate-1",
+            ),
+        )
+
+    issues = store.validate_document_graph(doc_id)
+
+    assert any(
+        issue["code"] == "CHUNK_NODE_COUNT_MISMATCH" and issue["severity"] == "error"
+        for issue in issues
+    )
+    assert any(
+        issue["code"] == "CHUNK_LOCATOR_MISMATCH" and issue["severity"] == "error"
+        for issue in issues
+    )
+
+
+def test_local_search_indexes_outline_images_and_figures(tmp_path: Path) -> None:
+    store = CatalogStore(tmp_path / "catalog.db")
+    doc_id = "visual-search-doc"
+    path = (tmp_path / "visual.pdf").resolve()
+    path.write_bytes(b"pdf")
+    store.upsert_scanned_document(
+        DocumentRecord(
+            doc_id=doc_id,
+            path=str(path),
+            type=DocumentType.PDF,
+            sha256="a" * 64,
+            mtime=1.0,
+        )
+    )
+    store.save_document_parse_output(
+        doc_id=doc_id,
+        title="Visual Evidence Book",
+        parser_chain=["docling"],
+        metadata={},
+        outline=[OutlineNode(id="figures", title="Figure Gallery", level=1)],
+        overall_confidence=0.9,
+        status="ready",
+    )
+    store.replace_images(
+        doc_id,
+        [
+            ImageRecord(
+                image_id="image-search-1",
+                doc_id=doc_id,
+                order_index=0,
+                section_path=["Figure Gallery"],
+                alt="Network topology diagram",
+                caption="Network topology diagram",
+                media_type="image/png",
+                file_path=str(tmp_path / "image.png"),
+            )
+        ],
+    )
+    store.replace_pdf_figures(
+        doc_id,
+        [
+            PdfFigureRecord(
+                figure_id="figure-search-1",
+                doc_id=doc_id,
+                order_index=0,
+                section_path=["Figure Gallery"],
+                page=2,
+                caption="Latency chart",
+                kind="chart",
+                file_path=str(tmp_path / "figure.png"),
+            )
+        ],
+    )
+
+    outline_hits = store.search_local(query="figure gallery", doc_ids=[doc_id], top_k=5)
+    assert any(hit["source_type"] == "outline_node" for hit in outline_hits)
+
+    image_hits = store.search_local(query="network topology", doc_ids=[doc_id], top_k=5)
+    assert any(hit["source_id"] == "image-search-1" for hit in image_hits)
+
+    figure_hits = store.search_local(query="latency chart", doc_ids=[doc_id], top_k=5)
+    assert any(hit["source_id"] == "figure-search-1" for hit in figure_hits)
+
+
+def test_local_search_supports_fuzzy_title_and_intent_ranking(tmp_path: Path) -> None:
+    store = CatalogStore(tmp_path / "catalog.db")
+    doc_id = "fuzzy-search-doc"
+    path = (tmp_path / "fuzzy.pdf").resolve()
+    path.write_bytes(b"pdf")
+    store.upsert_scanned_document(
+        DocumentRecord(
+            doc_id=doc_id,
+            path=str(path),
+            type=DocumentType.PDF,
+            sha256="a" * 64,
+            mtime=1.0,
+        )
+    )
+    store.save_document_parse_output(
+        doc_id=doc_id,
+        title="Fuzzy PDF",
+        parser_chain=["docling"],
+        metadata={},
+        outline=[
+            OutlineNode(
+                id="crypto",
+                title="Case Study: TDA in Cryptocurrency Trading",
+                level=1,
+            )
+        ],
+        overall_confidence=0.9,
+        status="ready",
+    )
+    store.replace_formulas(
+        doc_id,
+        [
+            FormulaRecord(
+                formula_id="eq-alpha-beta",
+                doc_id=doc_id,
+                section_path=["Case Study: TDA in Cryptocurrency Trading"],
+                page=4,
+                bbox=None,
+                latex=r"\alpha+\beta=\gamma",
+                source="pix2text",
+            )
+        ],
+    )
+    store.replace_pdf_figures(
+        doc_id,
+        [
+            PdfFigureRecord(
+                figure_id="latency-plot",
+                doc_id=doc_id,
+                order_index=0,
+                section_path=["Case Study: TDA in Cryptocurrency Trading"],
+                page=5,
+                caption="Latency chart",
+                kind="chart",
+                file_path=str(tmp_path / "latency.png"),
+            )
+        ],
+    )
+
+    fuzzy_hits = store.search_local(
+        query="TDA cryptocurrency trade case", doc_ids=[doc_id], top_k=5
+    )
+    assert fuzzy_hits[0]["source_type"] == "outline_node"
+    assert "fuzzy" in fuzzy_hits[0]["why_included"]["reason"]
+
+    formula_hits = store.search_local(
+        query="equation alpha beta", doc_ids=[doc_id], top_k=5
+    )
+    assert formula_hits[0]["source_type"] == "formula"
+    assert "query_intent_formula" in formula_hits[0]["why_included"]["reason"]
+
+    figure_hits = store.search_local(
+        query="show chart latency", doc_ids=[doc_id], top_k=5
+    )
+    assert figure_hits[0]["source_type"] == "pdf_figure"
+    assert "query_intent_figure" in figure_hits[0]["why_included"]["reason"]
+
+
 def test_delete_documents_by_paths_cascades_related_rows(tmp_path: Path) -> None:
     store = CatalogStore(tmp_path / "catalog.db")
     doc_id = "doc-delete-1"
@@ -338,7 +914,11 @@ def test_compact_runs_vacuum(tmp_path: Path) -> None:
     store.replace_chunks(doc_id, [chunk])
 
     stats = store.compact()
-    assert stats["before_bytes"] >= stats["after_bytes"]
+    assert stats["before_bytes"] > 0
+    assert stats["after_bytes"] > 0
+    assert stats["reclaimed_bytes"] == max(
+        0, stats["before_bytes"] - stats["after_bytes"]
+    )
 
 
 def test_replace_and_get_images(tmp_path: Path) -> None:

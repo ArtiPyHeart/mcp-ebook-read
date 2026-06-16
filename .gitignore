@@ -202,6 +202,7 @@ coverage.xml
 *.py,cover
 .hypothesis/
 .pytest_cache/
+.tmp/
 cover/
 
 # Translations
@@ -322,3 +323,10 @@ extern/
 
 # Local sample documents for testing
 tests/samples/
+
+# Local CodeGraph index
+.codegraph/
+
+# Temporary CodeGraph reuse plan
+/docs/codegraph-reuse-checklist.md
+/docs/evaluation-plan.md

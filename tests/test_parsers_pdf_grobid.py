@@ -147,12 +147,19 @@ def test_parse_tei_success() -> None:
       <sourceDesc><biblStruct><idno type="DOI">10.1000/xyz</idno></biblStruct></sourceDesc>
       <text>
         <body>
-          <div><head>Intro</head></div>
+          <div><head>Intro</head><p>See <ref type="bibr" target="#b1">[1]</ref>.</p></div>
           <div><head>Method</head></div>
         </body>
         <back>
           <listBibl>
-            <biblStruct />
+            <biblStruct xml:id="b1">
+              <analytic>
+                <title>Reference Title</title>
+                <author><persName><forename>Ada</forename><surname>Lovelace</surname></persName></author>
+              </analytic>
+              <monogr><imprint><date when="1843" /></imprint></monogr>
+              <idno type="DOI">10.1000/ref</idno>
+            </biblStruct>
             <biblStruct />
           </listBibl>
         </back>
@@ -165,6 +172,11 @@ def test_parse_tei_success() -> None:
     assert result.metadata["paper_title"] == "My Paper"
     assert result.metadata["doi"] == "10.1000/xyz"
     assert result.metadata["bibliography_count"] == 2
+    assert result.metadata["references"][0]["reference_id"] == "b1"
+    assert result.metadata["references"][0]["title"] == "Reference Title"
+    assert result.metadata["references"][0]["doi"] == "10.1000/ref"
+    assert result.metadata["citations"][0]["target"] == "#b1"
+    assert result.metadata["citations"][0]["text"] == "[1]"
     assert [node.title for node in result.outline] == ["Intro", "Method"]
 
 

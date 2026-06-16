@@ -41,7 +41,7 @@
 ## Guide Evolution
 - AGENTS.md is a living guide.
 - Record validated best practices and lessons learned during implementation.
-- For service components requiring extra setup (for example Qdrant), document the full setup process in README.md.
+- For optional service components requiring extra setup (for example GROBID), document the full setup process in README.md.
 
 ## Release Flow
 - PyPI publishing is automated via GitHub Actions.
@@ -55,15 +55,27 @@
 ## Lessons Learned
 - Keep MCP protocol output isolated from logs: write logs to stderr only.
 - Stdlib logging `extra` payloads must avoid reserved `LogRecord` keys like `message`; Python 3.13 raises `KeyError` when they are overwritten.
-- Keep retrieval single-path: Qdrant + FastEmbed only; avoid adding BM25 fallback.
-- Qdrant container must publish host port 6333 (or set QDRANT_URL explicitly) before starting the MCP server.
-- Runtime must pass README-documented env vars explicitly; `document_ingest_pdf_paper` always requires `GROBID_URL` (and usually `GROBID_TIMEOUT_SECONDS`).
-- Prefer chapter-oriented tools (`search_in_outline_node`, `read_outline_node`) over free-form global retrieval for book reading tasks.
+- Keep retrieval local-first and single-path by default: SQLite FTS5 + sidecar DocumentGraph. Do not reintroduce required external vector services.
+- Treat page, artifact, reference, and citation nodes as first-class DocumentGraph citizens; avoid hiding them as unstructured metadata only.
+- Source freshness is part of sidecar validity: READY documents must be considered stale when the source path is missing or source mtime/hash changes.
+- Sidecar schema compatibility follows the breaking-change policy: incompatible `catalog.db` files are backed up and replaced with a fresh current-schema catalog instead of carrying legacy migrations.
+- The MCP must start without Qdrant, FastEmbed, GROBID, or any other external retrieval service.
+- GROBID is optional paper metadata/reference enrichment only; PDF paper ingest must still work without `GROBID_URL` and must surface skipped-enrichment diagnostics.
+- Ingest finalization must be staged and validated: write new artifacts into a temporary document workspace, apply DB updates to a staging SQLite copy, validate the DocumentGraph, then atomically replace the active sidecar.
+- Heavy PDF parsing, formula recovery, and Docling table/figure extraction should run in isolated worker processes with a structured timeout (`PDF_PARSE_TIMEOUT_SECONDS`) so hangs become agent-visible errors instead of wedging the MCP server.
+- Prefer `library_explore` for cross-book/paper discovery, `document_explore` for one ingested document, and `document_node` for precise graph-node reads; explore outputs should include `why_included`, diagnostics, truncation notices, and ambiguity candidates.
+- Keep `search_in_outline_node` and `read_outline_node` as focused chapter/section tools after an outline node is known.
 - For PDF formulas, use a dedicated formula path (Docling formula enrichment + Pix2Text) and fail-fast when the formula engine is required but unavailable.
+- Formula read tools should register rendered evidence images as artifact graph nodes so multimodal LLMs can revisit the exact visual evidence by stable node id.
 - Catalog persistence must include cleanup: delete removed docs on scan, and use explicit sidecar cleanup tools for manual compaction when needed.
 - Maintain a no-label PDF formula benchmark on sample papers; gate regressions with unresolved-rate, heuristic LaTeX validity rate, and parse stability rate.
 - EPUB ingest must extract embedded images to local evidence files and expose explicit image tools (`epub_list_images`, `epub_read_image`) for multimodal LLM workflows.
+- Parser-provided raw artifacts should be persisted under the document sidecar and exposed as artifact graph nodes for high-fidelity fallback reads.
 - PDF ingest must extract figure/table images with page+bbox metadata and expose explicit tools (`pdf_list_images`, `pdf_read_image`) for multimodal LLM workflows.
+- Prefer eager full parsing for ingest completeness. Optimize initialization with resource-aware parallelism, batching, and isolated workers instead of lazy extraction paths that can cause agents to miss content.
+- Avoid duplicate high-cost parser passes: when Docling parse already has the source document in memory, reuse it for table/figure visual evidence instead of converting the same PDF again.
+- PDF image/table/figure read tools must be read-only over persisted sidecar evidence. If evidence artifacts are missing, surface an actionable error and require force reingest instead of silently re-extracting during reads.
+- Treat bocpy as an optional performance experiment until corpus benchmarks prove it beats the stdlib scheduler on target machines; do not make it a required runtime dependency without measured evidence. Current real parser stacks use C extensions that fail in CPython sub-interpreters (`lxml.etree`, `_pydantic_core`, PyMuPDF-related modules), so prefer stdlib process isolation for production ingest parallelism.
 - Persistence is per-document-folder sidecar (`<doc_dir>/.mcp-ebook-read`); avoid global hidden data roots that are detached from source files.
 - Expose explicit storage maintenance tools so LLMs can inspect and clean persistence safely (`storage_list_sidecars`, `storage_delete_document`, `storage_cleanup_sidecars`).
 - Runtime diagnostics should be agent-visible and actionable: include enough structured warning/error detail, hints, and degradation metadata in MCP outputs so real reading sessions can reveal parser weaknesses and drive predictable iteration on sample PDFs/EPUBs.

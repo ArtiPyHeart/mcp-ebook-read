@@ -27,13 +27,6 @@ PDF_PAPER_RELATIVE = (
 )
 
 
-def _require_env(name: str) -> str:
-    value = os.environ.get(name)
-    if not value:
-        raise AssertionError(f"RUN_MCP_E2E=1 requires {name}")
-    return value
-
-
 def _wait_for_ingest_job(
     service: AppService,
     *,
@@ -90,22 +83,20 @@ def _bootstrap_e2e_service(
     if os.environ.get("RUN_MCP_E2E") != "1":
         pytest.skip("Set RUN_MCP_E2E=1 to run integration smoke tests")
 
-    qdrant_url = _require_env("QDRANT_URL")
-    grobid_url = _require_env("GROBID_URL")
-
     samples_root = Path("tests/samples").resolve()
     if not samples_root.exists():
         pytest.skip("tests/samples not found")
 
-    monkeypatch.setenv("QDRANT_URL", qdrant_url)
-    monkeypatch.setenv("GROBID_URL", grobid_url)
-    monkeypatch.setenv(
-        "GROBID_TIMEOUT_SECONDS", os.environ.get("GROBID_TIMEOUT_SECONDS", "120")
-    )
-    monkeypatch.setenv(
-        "QDRANT_COLLECTION",
-        f"mcp_ebook_read_e2e_{collection_suffix}_{int(time.time())}",
-    )
+    monkeypatch.delenv("QDRANT_URL", raising=False)
+    monkeypatch.delenv("QDRANT_COLLECTION", raising=False)
+    if os.environ.get("GROBID_URL"):
+        monkeypatch.setenv("GROBID_URL", os.environ["GROBID_URL"])
+        monkeypatch.setenv(
+            "GROBID_TIMEOUT_SECONDS", os.environ.get("GROBID_TIMEOUT_SECONDS", "120")
+        )
+    else:
+        monkeypatch.delenv("GROBID_URL", raising=False)
+        monkeypatch.delenv("GROBID_TIMEOUT_SECONDS", raising=False)
     tuning_profile_path = tmp_path / "runtime" / "docling_tuning.json"
     monkeypatch.setenv("PDF_DOCLING_TUNING_PROFILE_PATH", str(tuning_profile_path))
     return samples_root, tuning_profile_path, AppService.from_env()

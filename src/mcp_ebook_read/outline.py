@@ -92,4 +92,6 @@ def matches_outline_node(
 
     if section_path_prefix_matches(section_path, node_path):
         return True
+    if len(section_path) > 1 and len(node_path) > 1:
+        return False
     return section_path_leaf_matches(section_path, node_path)
