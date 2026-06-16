@@ -259,6 +259,99 @@ def test_ingest_job_progress_round_trips_and_updates(tmp_path: Path) -> None:
     assert updated.progress == index_progress
 
 
+def test_catalog_reopen_preserves_active_ingest_jobs(tmp_path: Path) -> None:
+    db_path = tmp_path / "catalog.db"
+    store = CatalogStore(db_path)
+    doc_id = "active-doc"
+    store.upsert_scanned_document(
+        DocumentRecord(
+            doc_id=doc_id,
+            path=str((tmp_path / "active.pdf").resolve()),
+            type=DocumentType.PDF,
+            sha256="a" * 64,
+            mtime=1.0,
+        )
+    )
+    store.create_ingest_job(
+        IngestJobRecord(
+            job_id="job-active",
+            doc_id=doc_id,
+            path=str((tmp_path / "active.pdf").resolve()),
+            profile=Profile.BOOK,
+            status=IngestJobStatus.QUEUED,
+            stage=IngestStage.QUEUED,
+            created_at="2026-01-01T00:00:00+00:00",
+            updated_at="2026-01-01T00:00:00+00:00",
+        )
+    )
+
+    reopened = CatalogStore(db_path)
+    loaded = reopened.get_ingest_job(doc_id, "job-active")
+
+    assert loaded is not None
+    assert loaded.status == IngestJobStatus.QUEUED
+    assert loaded.stage == IngestStage.QUEUED
+
+
+def test_ingest_job_claim_and_expired_lease(tmp_path: Path) -> None:
+    store = CatalogStore(tmp_path / "catalog.db")
+    doc_id = "claim-doc"
+    store.upsert_scanned_document(
+        DocumentRecord(
+            doc_id=doc_id,
+            path=str((tmp_path / "claim.pdf").resolve()),
+            type=DocumentType.PDF,
+            sha256="a" * 64,
+            mtime=1.0,
+        )
+    )
+    store.create_ingest_job(
+        IngestJobRecord(
+            job_id="job-claim",
+            doc_id=doc_id,
+            path=str((tmp_path / "claim.pdf").resolve()),
+            profile=Profile.BOOK,
+            status=IngestJobStatus.QUEUED,
+            stage=IngestStage.QUEUED,
+            created_at="2026-01-01T00:00:00+00:00",
+            updated_at="2026-01-01T00:00:00+00:00",
+        )
+    )
+
+    claimed = store.claim_ingest_job(
+        "job-claim",
+        owner_id="owner-a",
+        lease_expires_at="2026-01-01T00:10:00+00:00",
+        now="2026-01-01T00:00:01+00:00",
+    )
+
+    assert claimed is not None
+    assert claimed.status == IngestJobStatus.RUNNING
+    assert claimed.stage == IngestStage.PARSE
+    assert claimed.owner_id == "owner-a"
+    assert claimed.claimed_at == "2026-01-01T00:00:01+00:00"
+    assert claimed.heartbeat_at == "2026-01-01T00:00:01+00:00"
+    assert claimed.lease_expires_at == "2026-01-01T00:10:00+00:00"
+    assert (
+        store.claim_ingest_job(
+            "job-claim",
+            owner_id="owner-b",
+            lease_expires_at="2026-01-01T00:20:00+00:00",
+            now="2026-01-01T00:00:02+00:00",
+        )
+        is None
+    )
+
+    expired = store.fail_expired_running_ingest_jobs(now="2026-01-01T00:11:00+00:00")
+    loaded = store.get_ingest_job(doc_id, "job-claim")
+
+    assert expired == 1
+    assert loaded is not None
+    assert loaded.status == IngestJobStatus.FAILED
+    assert loaded.stage == IngestStage.FAILED
+    assert loaded.message == "Ingest job lease expired before completion."
+
+
 def test_replace_chunks_and_window(tmp_path: Path) -> None:
     store = CatalogStore(tmp_path / "catalog.db")
     doc_id = "abcd1234abcd1234"

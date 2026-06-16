@@ -20,6 +20,8 @@ def test_operation_registry_is_unique_and_exposed_by_server() -> None:
     assert "document_ingest_epub_book" not in names
     assert "pdf_book_list_formulas" not in names
     assert "pdf_paper_list_formulas" not in names
+    assert "library_ingest_documents" in names
+    assert "library_ingest_status" in names
     for operation in OPERATIONS:
         assert getattr(server, operation.name) is not None
 
@@ -68,6 +70,8 @@ def test_llm_descriptions_pin_reading_routing_language() -> None:
     descriptions = {operation.name: operation.description for operation in OPERATIONS}
 
     assert "EPUB/PDF document" in descriptions["document_ingest"]
+    assert "whole-library initialization" in descriptions["library_ingest_documents"]
+    assert "whole-library ingest dashboard" in descriptions["library_ingest_status"]
     assert "inferred from document metadata" in descriptions["document_ingest"]
     assert "already-ingested root sidecar" in descriptions["library_explore"]
     assert "infers EPUB/PDF/book/paper mode" in descriptions["document_explore"]

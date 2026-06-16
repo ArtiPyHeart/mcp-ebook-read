@@ -66,6 +66,32 @@ def library_explore(
     return _service().library_explore(root=root, query=query, top_k=top_k)
 
 
+def library_ingest_documents(
+    root: str | None = None,
+    force: bool = False,
+    max_documents: int = 0,
+) -> dict[str, Any]:
+    return _service().library_ingest_documents(
+        root=root,
+        force=force,
+        max_documents=max_documents,
+    )
+
+
+def library_ingest_status(
+    root: str | None = None,
+    limit_running: int = 20,
+    limit_failed: int = 20,
+    limit_queued: int = 20,
+) -> dict[str, Any]:
+    return _service().library_ingest_status(
+        root=root,
+        limit_running=limit_running,
+        limit_failed=limit_failed,
+        limit_queued=limit_queued,
+    )
+
+
 def storage_list_sidecars(root: str | None = None, limit: int = 100) -> dict[str, Any]:
     return _service().storage_list_sidecars(root=root, limit=limit)
 
@@ -250,6 +276,22 @@ OPERATIONS: tuple[ToolOperation, ...] = (
         "read",
         "library",
         "search",
+    ),
+    ToolOperation(
+        "library_ingest_documents",
+        library_ingest_documents,
+        desc.LIBRARY_INGEST_DOCUMENTS,
+        "write",
+        "library",
+        "ingest",
+    ),
+    ToolOperation(
+        "library_ingest_status",
+        library_ingest_status,
+        desc.LIBRARY_INGEST_STATUS,
+        "read",
+        "library",
+        "ingest",
     ),
     ToolOperation(
         "storage_list_sidecars",

@@ -3980,6 +3980,69 @@ def test_storage_cleanup_sidecars_removes_missing_docs_and_orphans(
     assert catalog.get_document_by_id(doc_id) is None
 
 
+def test_library_ingest_dashboard_preserves_running_job_across_service_open(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "library"
+    books_dir = root / "books"
+    books_dir.mkdir(parents=True)
+    pdf_path = books_dir / "running.pdf"
+    pdf_path.write_bytes(b"%PDF fake")
+
+    parser = BlockingParser(_parsed("placeholder", title="PDF", method="docling"))
+    service = _build_service(
+        tmp_path,
+        pdf_parser=parser,
+        epub_parser=RecordingParser(result=_parsed("x", title="X", method="ebooklib")),
+        grobid=RecordingGrobid(),
+    )
+    scan = service.library_scan(str(root), ["**/*.pdf"])
+    doc_id = scan["added"][0]["doc_id"]
+    parser.result = _parsed(doc_id, title="Running PDF", method="docling")
+
+    queued = service.library_ingest_documents(root=str(root), force=True)
+
+    assert queued["documents_total"] == 1
+    assert queued["selected_count"] == 1
+    assert queued["queued_count"] == 1
+    assert queued["jobs"][0]["relative_path"] == "books/running.pdf"
+    assert parser.started.wait(timeout=1.0)
+
+    status = service.library_ingest_status(root=str(root), limit_running=5)
+    assert status["progress"]["running_count"] == 1
+    assert status["running"][0]["doc_id"] == doc_id
+    assert status["running"][0]["owner_id"] == service._ingest_owner_id
+    assert status["running"][0]["relative_path"] == "books/running.pdf"
+
+    second_service = _build_service(
+        tmp_path,
+        pdf_parser=RecordingParser(
+            result=_parsed("x", title="Second", method="docling")
+        ),
+        epub_parser=RecordingParser(result=_parsed("x", title="X", method="ebooklib")),
+        grobid=RecordingGrobid(),
+    )
+    try:
+        second_status = second_service.library_ingest_status(
+            root=str(root),
+            limit_running=5,
+        )
+        assert second_status["progress"]["running_count"] == 1
+        assert second_status["progress"]["failed_latest_count"] == 0
+        assert second_status["running"][0]["owner_id"] == service._ingest_owner_id
+    finally:
+        second_service.close()
+
+    parser.release.set()
+    final = _wait_for_ingest_job(
+        service,
+        doc_id=doc_id,
+        job_id=queued["jobs"][0]["job_id"],
+    )
+    assert final["status"] == IngestJobStatus.SUCCEEDED
+    service.close()
+
+
 def test_doc_id_tools_require_discovery_after_restart(tmp_path: Path) -> None:
     root = tmp_path / "library"
     books_dir = root / "books"

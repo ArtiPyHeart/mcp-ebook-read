@@ -6,7 +6,7 @@ from collections.abc import Callable
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 import json
 import hashlib
 import logging
@@ -14,6 +14,7 @@ import os
 import re
 from queue import Empty, Queue
 import shutil
+import socket
 import subprocess
 import sys
 import threading
@@ -118,6 +119,7 @@ class AppService:
         self._active_pdf_parse_lock = threading.Lock()
         self._active_pdf_parses = 0
         self._closed = False
+        self._ingest_owner_id = f"{socket.gethostname()}:{os.getpid()}:{uuid4().hex}"
         self._ingest_workers: list[threading.Thread] = []
         for worker_index in range(self.ingest_worker_count):
             worker = threading.Thread(
@@ -814,6 +816,10 @@ class AppService:
     def _now_iso(self) -> str:
         return datetime.now(UTC).isoformat()
 
+    def _ingest_lease_expires_at(self) -> str:
+        lease_seconds = max(900, self.pdf_parse_timeout_seconds + 300)
+        return (datetime.now(UTC) + timedelta(seconds=lease_seconds)).isoformat()
+
     def _ingest_result_from_doc(
         self, doc: DocumentRecord, catalog: CatalogStore
     ) -> dict[str, Any]:
@@ -1040,6 +1046,10 @@ class AppService:
             "updated_at": job.updated_at,
             "started_at": job.started_at,
             "finished_at": job.finished_at,
+            "owner_id": job.owner_id,
+            "claimed_at": job.claimed_at,
+            "heartbeat_at": job.heartbeat_at,
+            "lease_expires_at": job.lease_expires_at,
         }
 
     def _serialize_ingest_progress(self, job: IngestJobRecord) -> dict[str, Any]:
@@ -1700,6 +1710,16 @@ class AppService:
     ) -> None:
         if progress is None and stage is not None:
             progress = self._ingest_progress(stage=stage, message=message)
+        is_terminal = status in {
+            IngestJobStatus.SUCCEEDED,
+            IngestJobStatus.FAILED,
+            IngestJobStatus.CANCELED,
+        } or stage in {
+            IngestStage.COMPLETED,
+            IngestStage.FAILED,
+            IngestStage.CANCELED,
+        }
+        heartbeat_at = self._now_iso()
         with self._ingest_lock:
             catalog.update_ingest_job(
                 job_id,
@@ -1711,6 +1731,11 @@ class AppService:
                 error=error,
                 started_at=started_at,
                 finished_at=finished_at,
+                owner_id=self._ingest_owner_id,
+                heartbeat_at=heartbeat_at,
+                lease_expires_at=None
+                if is_terminal
+                else self._ingest_lease_expires_at(),
             )
 
     def _submit_ingest_job(
@@ -1734,6 +1759,7 @@ class AppService:
                 },
             )
         with self._ingest_lock:
+            catalog.fail_expired_running_ingest_jobs()
             active = catalog.get_active_ingest_job(doc.doc_id)
             if active is not None and active.profile == profile:
                 return self._ingest_job_payload(active, deduplicated=True)
@@ -1807,14 +1833,31 @@ class AppService:
         )
         return self._ingest_job_payload(job)
 
+    def _next_persisted_ingest_item(self) -> _IngestQueueItem | None:
+        with self._ingest_lock:
+            catalogs = list(self._catalogs.items())
+        for catalog_key, catalog in catalogs:
+            job = catalog.get_next_queued_ingest_job()
+            if job is not None:
+                return _IngestQueueItem(
+                    catalog_key=catalog_key,
+                    doc_id=job.doc_id,
+                    job_id=job.job_id,
+                )
+        return None
+
     def _ingest_worker_loop(self) -> None:
         while True:
+            task_done_required = False
             try:
                 item = self._ingest_queue.get(timeout=0.5)
+                task_done_required = True
             except Empty:
                 if self._closed:
                     return
-                continue
+                item = self._next_persisted_ingest_item()
+                if item is None:
+                    continue
             try:
                 self._run_ingest_job(item=item)
             except Exception:  # noqa: BLE001
@@ -1827,7 +1870,8 @@ class AppService:
                     },
                 )
             finally:
-                self._ingest_queue.task_done()
+                if task_done_required:
+                    self._ingest_queue.task_done()
 
     def _run_ingest_job(self, *, item: _IngestQueueItem) -> None:
         doc, catalog = self._require_doc_from_catalog(
@@ -1851,12 +1895,21 @@ class AppService:
             return
 
         started_at = self._now_iso()
+        claimed = catalog.claim_ingest_job(
+            item.job_id,
+            owner_id=self._ingest_owner_id,
+            lease_expires_at=self._ingest_lease_expires_at(),
+            now=started_at,
+        )
+        if claimed is None:
+            return
+        job = claimed
         self._set_job_stage(
             catalog=catalog,
             job_id=item.job_id,
             status=IngestJobStatus.RUNNING,
             stage=IngestStage.PARSE,
-            message="Worker started background ingest job.",
+            message="Worker claimed background ingest job.",
             started_at=started_at,
         )
         logger.info(
@@ -2078,6 +2131,285 @@ class AppService:
                 "hash_workers": scan_worker_count,
                 "hash_seconds": round(hash_seconds, 6),
                 "total_seconds": round(time.perf_counter() - scan_started, 6),
+            },
+        }
+
+    def _relative_path_payload(self, *, path: str, root_path: Path) -> str:
+        resolved = Path(path).expanduser().resolve()
+        try:
+            return str(resolved.relative_to(root_path))
+        except ValueError:
+            return str(resolved)
+
+    def _ingest_dashboard_job_payload(
+        self,
+        *,
+        job: IngestJobRecord,
+        doc: DocumentRecord | None,
+        root_path: Path,
+        include_error: bool = False,
+    ) -> dict[str, Any]:
+        payload = {
+            "job_id": job.job_id,
+            "doc_id": job.doc_id,
+            "path": job.path,
+            "relative_path": self._relative_path_payload(
+                path=job.path,
+                root_path=root_path,
+            ),
+            "document_status": doc.status if doc is not None else None,
+            "document_type": doc.type if doc is not None else None,
+            "profile": job.profile,
+            "status": job.status,
+            "stage": job.stage,
+            "force": job.force,
+            "message": job.message,
+            "progress": self._serialize_ingest_progress(job),
+            "created_at": job.created_at,
+            "updated_at": job.updated_at,
+            "started_at": job.started_at,
+            "finished_at": job.finished_at,
+            "owner_id": job.owner_id,
+            "claimed_at": job.claimed_at,
+            "heartbeat_at": job.heartbeat_at,
+            "lease_expires_at": job.lease_expires_at,
+        }
+        if isinstance(job.result, dict):
+            payload["result_summary"] = {
+                key: job.result.get(key)
+                for key in (
+                    "chunks_count",
+                    "formulas_count",
+                    "images_count",
+                    "pdf_tables_count",
+                    "pdf_figures_count",
+                    "overall_confidence",
+                )
+                if key in job.result
+            }
+        if include_error and isinstance(job.error, dict):
+            payload["error"] = {
+                key: job.error.get(key)
+                for key in ("code", "message", "details")
+                if key in job.error
+            }
+        return payload
+
+    def library_ingest_documents(
+        self,
+        *,
+        root: str | None = None,
+        force: bool = False,
+        max_documents: int = 0,
+    ) -> dict[str, Any]:
+        root_path = self._resolve_library_root(root)
+        scan = self.library_scan(str(root_path), ["**/*.pdf", "**/*.epub"])
+        catalog = self._catalog_for_library_root(root_path)
+        catalog.fail_expired_running_ingest_jobs()
+        documents = sorted(catalog.list_documents(), key=lambda item: item.path)
+        max_to_queue = max(0, max_documents)
+
+        queued: list[dict[str, Any]] = []
+        skipped_ready_count = 0
+        unsupported_count = 0
+        limited_count = 0
+        deduplicated_count = 0
+        cached_count = 0
+        selected_count = 0
+
+        for doc in documents:
+            if doc.type == DocumentType.EPUB:
+                profile = Profile.BOOK
+                expected_doc_type = DocumentType.EPUB
+            elif doc.type == DocumentType.PDF:
+                profile = doc.profile
+                expected_doc_type = DocumentType.PDF
+            else:
+                unsupported_count += 1
+                continue
+
+            pipeline_status = self._document_pipeline_status(doc)
+            if (
+                doc.status == DocumentStatus.READY
+                and not force
+                and doc.profile == profile
+                and not pipeline_status["is_stale"]
+            ):
+                skipped_ready_count += 1
+                continue
+
+            if max_to_queue and selected_count >= max_to_queue:
+                limited_count += 1
+                continue
+
+            selected_count += 1
+            job = self._submit_ingest_job(
+                doc=doc,
+                catalog=catalog,
+                profile=profile,
+                expected_doc_type=expected_doc_type,
+                force=force,
+                ingest_mode="library_ingest_documents",
+            )
+            if job.get("deduplicated"):
+                deduplicated_count += 1
+            elif job.get("cached"):
+                cached_count += 1
+            else:
+                queued.append(
+                    {
+                        "job_id": job["job_id"],
+                        "doc_id": doc.doc_id,
+                        "relative_path": self._relative_path_payload(
+                            path=doc.path,
+                            root_path=root_path,
+                        ),
+                        "status": job["status"],
+                        "stage": job["stage"],
+                        "profile": job["profile"],
+                    }
+                )
+
+        return {
+            "root": str(root_path),
+            "catalog_path": str(catalog.db_path),
+            "documents_total": len(documents),
+            "selected_count": selected_count,
+            "queued_count": len(queued),
+            "deduplicated_count": deduplicated_count,
+            "cached_count": cached_count,
+            "skipped_ready_count": skipped_ready_count,
+            "unsupported_count": unsupported_count,
+            "limited_count": limited_count,
+            "scan": {
+                "added_count": len(scan["added"]),
+                "updated_count": len(scan["updated"]),
+                "unchanged_count": scan["unchanged_count"],
+                "removed_count": len(scan["removed"]),
+                "performance": scan["scan_performance"],
+            },
+            "jobs": queued[:100],
+            "jobs_truncated_count": max(0, len(queued) - 100),
+            "next_call": "library_ingest_status",
+        }
+
+    def library_ingest_status(
+        self,
+        *,
+        root: str | None = None,
+        limit_running: int = 20,
+        limit_failed: int = 20,
+        limit_queued: int = 20,
+    ) -> dict[str, Any]:
+        root_path = self._resolve_library_root(root)
+        catalog = self._catalog_for_library_root(root_path)
+        expired_running_recovered_count = catalog.fail_expired_running_ingest_jobs()
+        documents = sorted(catalog.list_documents(), key=lambda item: item.path)
+        doc_by_id = {doc.doc_id: doc for doc in documents}
+        jobs = catalog.list_all_ingest_jobs(limit=10000)
+
+        latest_by_doc: dict[str, IngestJobRecord] = {}
+        for job in sorted(jobs, key=lambda item: item.created_at, reverse=True):
+            latest_by_doc.setdefault(job.doc_id, job)
+        latest_jobs = list(latest_by_doc.values())
+
+        document_status_counts: dict[str, int] = defaultdict(int)
+        document_profile_counts: dict[str, int] = defaultdict(int)
+        document_type_counts: dict[str, int] = defaultdict(int)
+        for doc in documents:
+            document_status_counts[doc.status] += 1
+            document_profile_counts[doc.profile] += 1
+            document_type_counts[doc.type] += 1
+
+        job_status_counts: dict[str, int] = defaultdict(int)
+        job_stage_counts: dict[str, int] = defaultdict(int)
+        for job in latest_jobs:
+            job_status_counts[job.status] += 1
+            job_stage_counts[job.stage] += 1
+
+        running_jobs = [
+            job for job in latest_jobs if job.status == IngestJobStatus.RUNNING
+        ]
+        queued_jobs = [
+            job for job in latest_jobs if job.status == IngestJobStatus.QUEUED
+        ]
+        failed_jobs = [
+            job for job in latest_jobs if job.status == IngestJobStatus.FAILED
+        ]
+        running_jobs.sort(key=lambda item: item.updated_at, reverse=True)
+        queued_jobs.sort(key=lambda item: item.created_at)
+        failed_jobs.sort(key=lambda item: item.updated_at, reverse=True)
+
+        ready_count = document_status_counts[DocumentStatus.READY]
+        documents_total = len(documents)
+        pct_ready = (
+            round(ready_count / documents_total * 100.0, 2)
+            if documents_total
+            else 100.0
+        )
+
+        running_limit = max(0, min(limit_running, 100))
+        failed_limit = max(0, min(limit_failed, 100))
+        queued_limit = max(0, min(limit_queued, 100))
+
+        return {
+            "root": str(root_path),
+            "catalog_path": str(catalog.db_path),
+            "owner_id": self._ingest_owner_id,
+            "local_ingest_workers": self.ingest_worker_count,
+            "documents": {
+                "total": documents_total,
+                "ready": ready_count,
+                "pct_ready": pct_ready,
+                "by_status": dict(sorted(document_status_counts.items())),
+                "by_profile": dict(sorted(document_profile_counts.items())),
+                "by_type": dict(sorted(document_type_counts.items())),
+            },
+            "jobs": {
+                "total_records": len(jobs),
+                "latest_tracked_documents": len(latest_jobs),
+                "documents_without_jobs": documents_total - len(latest_jobs),
+                "by_status": dict(sorted(job_status_counts.items())),
+                "by_stage": dict(sorted(job_stage_counts.items())),
+                "expired_running_recovered_count": expired_running_recovered_count,
+            },
+            "progress": {
+                "completed_documents": ready_count,
+                "total_documents": documents_total,
+                "pct_ready": pct_ready,
+                "running_count": len(running_jobs),
+                "queued_count": len(queued_jobs),
+                "failed_latest_count": len(failed_jobs),
+            },
+            "running": [
+                self._ingest_dashboard_job_payload(
+                    job=job,
+                    doc=doc_by_id.get(job.doc_id),
+                    root_path=root_path,
+                )
+                for job in running_jobs[:running_limit]
+            ],
+            "queued": [
+                self._ingest_dashboard_job_payload(
+                    job=job,
+                    doc=doc_by_id.get(job.doc_id),
+                    root_path=root_path,
+                )
+                for job in queued_jobs[:queued_limit]
+            ],
+            "recent_failed": [
+                self._ingest_dashboard_job_payload(
+                    job=job,
+                    doc=doc_by_id.get(job.doc_id),
+                    root_path=root_path,
+                    include_error=True,
+                )
+                for job in failed_jobs[:failed_limit]
+            ],
+            "truncated": {
+                "running": max(0, len(running_jobs) - running_limit),
+                "queued": max(0, len(queued_jobs) - queued_limit),
+                "recent_failed": max(0, len(failed_jobs) - failed_limit),
             },
         }
 

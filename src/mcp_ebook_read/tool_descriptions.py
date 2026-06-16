@@ -13,6 +13,9 @@ Use the library/document graph tools first:
 - If the user asks across many books/papers, call library_explore(query, root).
 - If the user asks about one known document, call document_explore(doc_id, query).
 - After explore returns candidate nodes, call document_node(doc_id, node_id) for precise evidence.
+- To initialize or refresh a whole library, call library_scan(root), then
+  library_ingest_documents(root), and poll library_ingest_status(root) for
+  aggregate progress instead of issuing many parallel document_ingest calls.
 
 Do not ask the LLM to choose EPUB/PDF/book/paper explore modes after ingest; doc_id metadata determines that automatically.
 Use get_outline and read_outline_node for full chapter/section reading.
@@ -45,6 +48,21 @@ LIBRARY_EXPLORE = (
     "and DocumentGraph ranking. Use this when the user asks which book/paper "
     "contains relevant content. If root is omitted, the MCP process project "
     "root is used. It does not auto-ingest heavy PDFs."
+)
+
+LIBRARY_INGEST_DOCUMENTS = (
+    "Scan the selected root, then queue background ingest for every EPUB/PDF "
+    "document that is not READY or has stale pipeline metadata. Use this for "
+    "whole-library initialization or refresh instead of calling document_ingest "
+    "many times in parallel. max_documents=0 means no cap. Returns queued, "
+    "deduplicated, skipped-ready, and scan counts plus the first queued jobs."
+)
+
+LIBRARY_INGEST_STATUS = (
+    "Return a compact whole-library ingest dashboard: document counts, latest "
+    "job counts by status/stage, running jobs with owner/heartbeat/lease, queued "
+    "samples, recent failures, and recovered expired leases. Use this to monitor "
+    "library_ingest_documents progress."
 )
 
 STORAGE_LIST_SIDECARS = (

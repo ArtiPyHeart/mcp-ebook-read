@@ -127,6 +127,7 @@ class CatalogStore:
         conn.row_factory = sqlite3.Row
         try:
             conn.execute("PRAGMA foreign_keys=ON")
+            conn.execute("PRAGMA busy_timeout=5000")
             yield conn
             conn.commit()
         finally:
@@ -397,11 +398,18 @@ class CatalogStore:
                     updated_at TEXT NOT NULL,
                     started_at TEXT,
                     finished_at TEXT,
+                    owner_id TEXT,
+                    claimed_at TEXT,
+                    heartbeat_at TEXT,
+                    lease_expires_at TEXT,
                     FOREIGN KEY (doc_id) REFERENCES documents(doc_id) ON DELETE CASCADE
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_ingest_jobs_doc_created
                 ON ingest_jobs(doc_id, created_at DESC);
+
+                CREATE INDEX IF NOT EXISTS idx_ingest_jobs_status_updated
+                ON ingest_jobs(status, updated_at DESC);
                 """
             )
             image_columns = {
@@ -421,22 +429,14 @@ class CatalogStore:
                     "ALTER TABLE ingest_jobs "
                     "ADD COLUMN progress_json TEXT NOT NULL DEFAULT '{}'"
                 )
-            conn.execute(
-                """
-                UPDATE ingest_jobs
-                SET status = ?, stage = ?, message = ?, updated_at = ?, finished_at = ?
-                WHERE status IN (?, ?)
-                """,
-                (
-                    IngestJobStatus.FAILED,
-                    IngestStage.FAILED,
-                    "Job was interrupted by a previous server shutdown or restart.",
-                    datetime.now(UTC).isoformat(),
-                    datetime.now(UTC).isoformat(),
-                    IngestJobStatus.QUEUED,
-                    IngestJobStatus.RUNNING,
-                ),
-            )
+            for column in (
+                "owner_id",
+                "claimed_at",
+                "heartbeat_at",
+                "lease_expires_at",
+            ):
+                if column not in ingest_job_columns:
+                    conn.execute(f"ALTER TABLE ingest_jobs ADD COLUMN {column} TEXT")
             now = datetime.now(UTC).isoformat()
             conn.executemany(
                 """
@@ -2257,8 +2257,9 @@ class CatalogStore:
                 INSERT INTO ingest_jobs (
                     job_id, doc_id, path, profile, status, stage, force, message,
                     progress_json, result_json, error_json, created_at, updated_at,
-                    started_at, finished_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    started_at, finished_at, owner_id, claimed_at, heartbeat_at,
+                    lease_expires_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     job.job_id,
@@ -2276,6 +2277,10 @@ class CatalogStore:
                     job.updated_at,
                     job.started_at,
                     job.finished_at,
+                    job.owner_id,
+                    job.claimed_at,
+                    job.heartbeat_at,
+                    job.lease_expires_at,
                 ),
             )
 
@@ -2317,6 +2322,32 @@ class CatalogStore:
             ).fetchall()
             return [self._row_to_ingest_job(row) for row in rows]
 
+    def list_all_ingest_jobs(
+        self,
+        *,
+        statuses: list[IngestJobStatus] | None = None,
+        limit: int = 1000,
+    ) -> list[IngestJobRecord]:
+        capped_limit = max(1, min(limit, 10000))
+        values: list[Any] = []
+        where_clause = ""
+        if statuses:
+            placeholders = ", ".join("?" for _ in statuses)
+            where_clause = f"WHERE status IN ({placeholders})"
+            values.extend(statuses)
+        values.append(capped_limit)
+        with self._conn() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT * FROM ingest_jobs
+                {where_clause}
+                ORDER BY updated_at DESC, created_at DESC
+                LIMIT ?
+                """,
+                values,
+            ).fetchall()
+            return [self._row_to_ingest_job(row) for row in rows]
+
     def get_active_ingest_job(self, doc_id: str) -> IngestJobRecord | None:
         with self._conn() as conn:
             row = conn.execute(
@@ -2334,6 +2365,94 @@ class CatalogStore:
             ).fetchone()
             return self._row_to_ingest_job(row) if row else None
 
+    def get_next_queued_ingest_job(self) -> IngestJobRecord | None:
+        with self._conn() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM ingest_jobs
+                WHERE status = ?
+                ORDER BY created_at ASC
+                LIMIT 1
+                """,
+                (IngestJobStatus.QUEUED,),
+            ).fetchone()
+            return self._row_to_ingest_job(row) if row else None
+
+    def claim_ingest_job(
+        self,
+        job_id: str,
+        *,
+        owner_id: str,
+        lease_expires_at: str,
+        now: str | None = None,
+    ) -> IngestJobRecord | None:
+        claim_time = now or datetime.now(UTC).isoformat()
+        with self._conn() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE ingest_jobs
+                SET status = ?,
+                    stage = ?,
+                    owner_id = ?,
+                    claimed_at = COALESCE(claimed_at, ?),
+                    heartbeat_at = ?,
+                    lease_expires_at = ?,
+                    started_at = COALESCE(started_at, ?),
+                    updated_at = ?
+                WHERE job_id = ? AND status = ?
+                """,
+                (
+                    IngestJobStatus.RUNNING,
+                    IngestStage.PARSE,
+                    owner_id,
+                    claim_time,
+                    claim_time,
+                    lease_expires_at,
+                    claim_time,
+                    claim_time,
+                    job_id,
+                    IngestJobStatus.QUEUED,
+                ),
+            )
+            if cursor.rowcount != 1:
+                return None
+            row = conn.execute(
+                "SELECT * FROM ingest_jobs WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+            return self._row_to_ingest_job(row) if row else None
+
+    def fail_expired_running_ingest_jobs(
+        self,
+        *,
+        now: str | None = None,
+    ) -> int:
+        finished_at = now or datetime.now(UTC).isoformat()
+        with self._conn() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE ingest_jobs
+                SET status = ?,
+                    stage = ?,
+                    message = ?,
+                    updated_at = ?,
+                    finished_at = ?
+                WHERE status = ?
+                  AND lease_expires_at IS NOT NULL
+                  AND lease_expires_at < ?
+                """,
+                (
+                    IngestJobStatus.FAILED,
+                    IngestStage.FAILED,
+                    "Ingest job lease expired before completion.",
+                    finished_at,
+                    finished_at,
+                    IngestJobStatus.RUNNING,
+                    finished_at,
+                ),
+            )
+            return cursor.rowcount
+
     def update_ingest_job(
         self,
         job_id: str,
@@ -2346,6 +2465,9 @@ class CatalogStore:
         error: dict[str, Any] | None = None,
         started_at: str | None = None,
         finished_at: str | None = None,
+        owner_id: str | None = None,
+        heartbeat_at: str | None = None,
+        lease_expires_at: str | None = None,
     ) -> None:
         assignments: list[str] = ["updated_at = ?"]
         values: list[Any] = [datetime.now(UTC).isoformat()]
@@ -2373,6 +2495,15 @@ class CatalogStore:
         if finished_at is not None:
             assignments.append("finished_at = ?")
             values.append(finished_at)
+        if owner_id is not None:
+            assignments.append("owner_id = ?")
+            values.append(owner_id)
+        if heartbeat_at is not None:
+            assignments.append("heartbeat_at = ?")
+            values.append(heartbeat_at)
+        if lease_expires_at is not None:
+            assignments.append("lease_expires_at = ?")
+            values.append(lease_expires_at)
         values.append(job_id)
         with self._conn() as conn:
             conn.execute(
@@ -3575,4 +3706,8 @@ class CatalogStore:
             updated_at=row["updated_at"],
             started_at=row["started_at"],
             finished_at=row["finished_at"],
+            owner_id=row["owner_id"],
+            claimed_at=row["claimed_at"],
+            heartbeat_at=row["heartbeat_at"],
+            lease_expires_at=row["lease_expires_at"],
         )

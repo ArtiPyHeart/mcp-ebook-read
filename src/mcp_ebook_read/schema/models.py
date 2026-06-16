@@ -253,6 +253,10 @@ class IngestJobRecord(BaseModel):
     updated_at: str
     started_at: str | None = None
     finished_at: str | None = None
+    owner_id: str | None = None
+    claimed_at: str | None = None
+    heartbeat_at: str | None = None
+    lease_expires_at: str | None = None
 
 
 class ToolEnvelope(BaseModel):
