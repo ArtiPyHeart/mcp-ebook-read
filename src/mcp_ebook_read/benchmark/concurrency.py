@@ -13,6 +13,8 @@ import time
 import traceback
 from typing import Any, Callable
 
+from mcp_ebook_read.benchmark.paths import DOCUMENT_SUFFIXES, collect_documents
+
 _BACKENDS = {"sequential", "thread", "process", "bocpy"}
 _WORKLOADS = {"auto", "epub_full", "pdf_fast", "pdf_fidelity"}
 _SUFFIXES = {".epub", ".pdf"}
@@ -66,6 +68,7 @@ def _parsed_metrics(parsed: Any, *, elapsed_seconds: float) -> dict[str, Any]:
             for key in (
                 "pages",
                 "formula_markers_total",
+                "formula_replaced_by_docling_text",
                 "formula_unresolved",
                 "pdf_tables_count",
                 "pdf_figures_count",
@@ -381,15 +384,6 @@ def run_concurrency_benchmark(
     }
 
 
-def _collect_documents(samples_dir: Path, *, max_documents: int = 0) -> list[Path]:
-    documents = [
-        path
-        for path in sorted(samples_dir.rglob("*"))
-        if path.is_file() and path.suffix.lower() in _SUFFIXES
-    ]
-    return documents[:max_documents] if max_documents > 0 else documents
-
-
 def _parse_backends(raw: str) -> list[str]:
     return [item.strip() for item in raw.split(",") if item.strip()]
 
@@ -402,7 +396,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "This benchmark does not write sidecars."
         ),
     )
-    parser.add_argument("--samples-dir", required=True, type=Path)
+    parser.add_argument("--samples-dir", type=Path)
+    parser.add_argument(
+        "--manifest",
+        type=Path,
+        help="Newline-delimited EPUB/PDF path manifest. Relative paths resolve from the manifest directory.",
+    )
     parser.add_argument(
         "--workload",
         choices=sorted(_WORKLOADS),
@@ -422,9 +421,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
-    documents = _collect_documents(args.samples_dir, max_documents=args.max_documents)
+    documents = collect_documents(
+        samples_dir=args.samples_dir,
+        manifest=args.manifest,
+        suffixes=DOCUMENT_SUFFIXES,
+        max_documents=args.max_documents,
+    )
     if not documents:
-        raise SystemExit(f"No EPUB/PDF documents found under: {args.samples_dir}")
+        raise SystemExit(
+            "No EPUB/PDF documents found. Pass --samples-dir or --manifest."
+        )
     result = run_concurrency_benchmark(
         documents,
         workload=args.workload,

@@ -27,6 +27,7 @@ class DummyGrobid:
 def build_service(tmp_path: Path) -> AppService:
     return AppService(
         sidecar_dir_name=".mcp-ebook-read",
+        default_library_root=tmp_path,
         pdf_parser=DummyParser(),
         grobid_client=DummyGrobid(),
         epub_parser=DummyParser(),

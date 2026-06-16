@@ -43,6 +43,7 @@ def _parsed(
     fallback: int,
     unresolved: int,
     docling_latex: int = 0,
+    docling_text: int = 0,
 ) -> ParsedDocument:
     return ParsedDocument(
         title="Doc",
@@ -50,6 +51,7 @@ def _parsed(
         metadata={
             "formula_markers_total": markers_total,
             "formula_extracted_by_docling_latex": docling_latex,
+            "formula_replaced_by_docling_text": docling_text,
             "formula_replaced_by_pix2text": replaced,
             "formula_replaced_by_fallback": fallback,
             "formula_unresolved": unresolved,
@@ -109,6 +111,26 @@ def test_summarize_parsed_formula_quality_counts_docling_latex() -> None:
     metrics = summarize_parsed_formula_quality(parsed)
 
     assert metrics["formula_extracted_by_docling_latex"] == 1
+    assert metrics["formula_candidates_total"] == 1
+    assert metrics["formula_recovered_total"] == 1
+    assert metrics["formula_recovered_rate"] == 1.0
+    assert metrics["formula_unresolved_rate"] == 0.0
+
+
+def test_summarize_parsed_formula_quality_counts_docling_formula_text() -> None:
+    parsed = _parsed(
+        "doc-formula-text",
+        chunk_text="$$dS u = \\sigma dW u$$",
+        markers_total=1,
+        replaced=0,
+        fallback=0,
+        unresolved=0,
+        docling_text=1,
+    )
+
+    metrics = summarize_parsed_formula_quality(parsed)
+
+    assert metrics["formula_replaced_by_docling_text"] == 1
     assert metrics["formula_candidates_total"] == 1
     assert metrics["formula_recovered_total"] == 1
     assert metrics["formula_recovered_rate"] == 1.0

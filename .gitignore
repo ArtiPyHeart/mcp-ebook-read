@@ -330,3 +330,4 @@ tests/samples/
 # Temporary CodeGraph reuse plan
 /docs/codegraph-reuse-checklist.md
 /docs/evaluation-plan.md
+/docs/gbrain-reuse-checklist.md

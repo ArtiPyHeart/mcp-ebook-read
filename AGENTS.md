@@ -48,7 +48,7 @@
 - This project does not use `$codex-commit-ai-stats` or any AI-stat commit suffix workflow; use normal git commit messages.
 - Release order is mandatory:
   1. Merge all intended release changes into `main` (including version bump in `pyproject.toml`) and push `main`.
-  2. Create a version tag from that `main` commit (for example `v0.1.2`).
+  2. Create a version tag from that `main` commit (for example `v0.3.0`).
   3. Push the tag to remote.
 - GitHub Actions publishes to PyPI from the pushed tag; bumping version without pushing the matching tag means the release is incomplete.
 
@@ -65,7 +65,7 @@
 - Heavy PDF parsing, formula recovery, and Docling table/figure extraction should run in isolated worker processes with a structured timeout (`PDF_PARSE_TIMEOUT_SECONDS`) so hangs become agent-visible errors instead of wedging the MCP server.
 - Prefer `library_explore` for cross-book/paper discovery, `document_explore` for one ingested document, and `document_node` for precise graph-node reads; explore outputs should include `why_included`, diagnostics, truncation notices, and ambiguity candidates.
 - Keep `search_in_outline_node` and `read_outline_node` as focused chapter/section tools after an outline node is known.
-- For PDF formulas, use a dedicated formula path (Docling formula enrichment + Pix2Text) and fail-fast when the formula engine is required but unavailable.
+- For PDF formulas, default to complete Docling FormulaItem text/provenance recovery instead of blocking ingest on slow CodeFormulaV2/Pix2Text VLM recovery. Keep deep VLM/Pix2Text reconstruction as an explicit opt-in path with diagnostics and fail-fast behavior when required.
 - Formula read tools should register rendered evidence images as artifact graph nodes so multimodal LLMs can revisit the exact visual evidence by stable node id.
 - Catalog persistence must include cleanup: delete removed docs on scan, and use explicit sidecar cleanup tools for manual compaction when needed.
 - Maintain a no-label PDF formula benchmark on sample papers; gate regressions with unresolved-rate, heuristic LaTeX validity rate, and parse stability rate.
@@ -76,6 +76,7 @@
 - Avoid duplicate high-cost parser passes: when Docling parse already has the source document in memory, reuse it for table/figure visual evidence instead of converting the same PDF again.
 - PDF image/table/figure read tools must be read-only over persisted sidecar evidence. If evidence artifacts are missing, surface an actionable error and require force reingest instead of silently re-extracting during reads.
 - Treat bocpy as an optional performance experiment until corpus benchmarks prove it beats the stdlib scheduler on target machines; do not make it a required runtime dependency without measured evidence. Current real parser stacks use C extensions that fail in CPython sub-interpreters (`lxml.etree`, `_pydantic_core`, PyMuPDF-related modules), so prefer stdlib process isolation for production ingest parallelism.
-- Persistence is per-document-folder sidecar (`<doc_dir>/.mcp-ebook-read`); avoid global hidden data roots that are detached from source files.
+- Persistence is unified per library root sidecar (`<library_root>/.mcp-ebook-read`). `library_scan(root=...)` and `document_ingest_*(root=...)` should route nested EPUB/PDF documents into that root sidecar; omitted root uses the MCP process project root.
 - Expose explicit storage maintenance tools so LLMs can inspect and clean persistence safely (`storage_list_sidecars`, `storage_delete_document`, `storage_cleanup_sidecars`).
 - Runtime diagnostics should be agent-visible and actionable: include enough structured warning/error detail, hints, and degradation metadata in MCP outputs so real reading sessions can reveal parser weaknesses and drive predictable iteration on sample PDFs/EPUBs.
+- Performance changes must be evaluated through the real MCP ingest path, not parser microbenchmarks alone. Use manifest-based representative sets and `mcp-ebook-ingest-benchmark` to measure eager ingest latency, sidecar size, progress, result counts, and parser-lane evidence before promoting a new default.

@@ -9,6 +9,7 @@ import re
 from pathlib import Path
 from typing import Any, Protocol
 
+from mcp_ebook_read.benchmark.paths import PDF_SUFFIXES, collect_documents
 from mcp_ebook_read.errors import AppError
 from mcp_ebook_read.parsers.pdf_docling import DoclingPdfParser
 from mcp_ebook_read.schema.models import ParsedDocument
@@ -113,12 +114,18 @@ def summarize_parsed_formula_quality(parsed: ParsedDocument) -> dict[str, Any]:
     extracted_by_docling_latex = _to_int(
         parsed.metadata.get("formula_extracted_by_docling_latex")
     )
+    replaced_by_docling_text = _to_int(
+        parsed.metadata.get("formula_replaced_by_docling_text")
+    )
     replaced_by_engine = _to_int(parsed.metadata.get("formula_replaced_by_pix2text"))
     replaced_by_fallback = _to_int(parsed.metadata.get("formula_replaced_by_fallback"))
     unresolved = _to_int(parsed.metadata.get("formula_unresolved"))
     formula_candidates_total = markers_total + extracted_by_docling_latex
     recovered_total = (
-        extracted_by_docling_latex + replaced_by_engine + replaced_by_fallback
+        extracted_by_docling_latex
+        + replaced_by_docling_text
+        + replaced_by_engine
+        + replaced_by_fallback
     )
 
     latex_blocks: list[str] = []
@@ -132,6 +139,7 @@ def summarize_parsed_formula_quality(parsed: ParsedDocument) -> dict[str, Any]:
         "formula_stats": {
             "markers_total": markers_total,
             "extracted_by_docling_latex": extracted_by_docling_latex,
+            "replaced_by_docling_text": replaced_by_docling_text,
             "replaced_by_engine": replaced_by_engine,
             "replaced_by_fallback": replaced_by_fallback,
             "unresolved": unresolved,
@@ -149,6 +157,7 @@ def summarize_parsed_formula_quality(parsed: ParsedDocument) -> dict[str, Any]:
         "formula_extracted_by_docling_latex": extracted_by_docling_latex,
         "formula_candidates_total": formula_candidates_total,
         "formula_recovered_total": recovered_total,
+        "formula_replaced_by_docling_text": replaced_by_docling_text,
         "formula_replaced_by_pix2text": replaced_by_engine,
         "formula_replaced_by_fallback": replaced_by_fallback,
         "formula_unresolved": unresolved,
@@ -260,6 +269,9 @@ def run_pdf_formula_benchmark(
     extracted_by_docling_latex = sum(
         item["first_pass"]["formula_extracted_by_docling_latex"] for item in ok_docs
     )
+    replaced_by_docling_text = sum(
+        item["first_pass"]["formula_replaced_by_docling_text"] for item in ok_docs
+    )
     formula_candidates_total = sum(
         item["first_pass"]["formula_candidates_total"] for item in ok_docs
     )
@@ -281,6 +293,7 @@ def run_pdf_formula_benchmark(
         "docs_failed": len(documents) - len(ok_docs),
         "formula_markers_total": markers_total,
         "formula_extracted_by_docling_latex": extracted_by_docling_latex,
+        "formula_replaced_by_docling_text": replaced_by_docling_text,
         "formula_candidates_total": formula_candidates_total,
         "formula_recovered_total": recovered_total,
         "formula_unresolved_total": unresolved_total,
@@ -319,12 +332,6 @@ def run_pdf_formula_benchmark(
     }
 
 
-def _discover_pdf_paths(samples_dir: Path) -> list[Path]:
-    if not samples_dir.exists():
-        return []
-    return sorted(path for path in samples_dir.rglob("*.pdf") if path.is_file())
-
-
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="mcp-ebook-formula-benchmark",
@@ -332,8 +339,13 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--samples-dir",
-        default="tests/samples/pdf-papers",
+        default="",
         help="Directory containing non-scanned PDF files.",
+    )
+    parser.add_argument(
+        "--manifest",
+        default="",
+        help="Newline-delimited PDF path manifest. Relative paths resolve from the manifest directory.",
     )
     parser.add_argument(
         "--passes",
@@ -371,9 +383,15 @@ def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
 
-    pdf_paths = _discover_pdf_paths(Path(args.samples_dir).resolve())
+    samples_dir = Path(args.samples_dir).resolve() if args.samples_dir else None
+    manifest = Path(args.manifest).expanduser().resolve() if args.manifest else None
+    pdf_paths = collect_documents(
+        samples_dir=samples_dir,
+        manifest=manifest,
+        suffixes=PDF_SUFFIXES,
+    )
     if not pdf_paths:
-        parser.error(f"No PDF files found under: {args.samples_dir}")
+        parser.error("No PDF files found. Pass --samples-dir or --manifest.")
 
     result = run_pdf_formula_benchmark(
         pdf_paths,

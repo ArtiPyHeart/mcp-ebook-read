@@ -791,19 +791,6 @@ class CatalogStore:
             )
             add_edge(artifact_node_id, source_node_id, "renders_from")
             add_edge(source_node_id, artifact_node_id, "contains")
-            if not Path(file_path).exists():
-                add_diagnostic(
-                    severity="warning",
-                    code="ARTIFACT_FILE_MISSING",
-                    message="A graph artifact points to a file that does not exist.",
-                    node_id=artifact_node_id,
-                    metadata={
-                        "artifact_id": artifact_id,
-                        "kind": kind,
-                        "source_ref": source_ref,
-                        "file_path": file_path,
-                    },
-                )
             return artifact_node_id
 
         def add_diagnostic(
@@ -1065,7 +1052,7 @@ class CatalogStore:
             if outline_node_id is not None:
                 add_edge(outline_node_id, node_id, "contains")
             add_page_edges(target_node_id=node_id, page=formula.page)
-            if formula.status != "resolved":
+            if formula.status == "unresolved":
                 add_diagnostic(
                     severity="warning",
                     code="FORMULA_UNRESOLVED",

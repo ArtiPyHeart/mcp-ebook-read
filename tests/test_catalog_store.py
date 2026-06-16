@@ -537,7 +537,7 @@ def test_document_graph_rebuilds_from_persisted_evidence(tmp_path: Path) -> None
     assert stats["reference_nodes_count"] == 1
     assert stats["citation_nodes_count"] == 1
     assert stats["artifacts_count"] == 3
-    assert stats["diagnostics_count"] == 3
+    assert stats["diagnostics_count"] == 0
 
     nodes = store.list_graph_nodes(doc_id=doc_id)
     kinds = {node["kind"] for node in nodes}
@@ -572,16 +572,9 @@ def test_document_graph_rebuilds_from_persisted_evidence(tmp_path: Path) -> None
     assert summary["documents_count"] == 1
     assert summary["artifacts_count"] == 3
     assert summary["nodes_count"] == stats["nodes_count"]
-    assert summary["diagnostics_count"] == 3
+    assert summary["diagnostics_count"] == 0
     diagnostics = store.list_diagnostics(doc_id=doc_id)
-    assert {diagnostic["metadata"]["source_ref"] for diagnostic in diagnostics} == {
-        "image-1",
-        "table-1",
-        "figure-1",
-    }
-    assert {diagnostic["code"] for diagnostic in diagnostics} == {
-        "ARTIFACT_FILE_MISSING"
-    }
+    assert diagnostics == []
     reference_hits = store.search_local(
         query="graph retrieval", doc_ids=[doc_id], top_k=5
     )
@@ -592,7 +585,18 @@ def test_document_graph_rebuilds_from_persisted_evidence(tmp_path: Path) -> None
     diagnostic_hits = store.search_local(
         query="ARTIFACT_FILE_MISSING", doc_ids=[doc_id], top_k=5
     )
-    assert any(hit["source_type"] == "diagnostic" for hit in diagnostic_hits)
+    assert not any(hit["source_type"] == "diagnostic" for hit in diagnostic_hits)
+
+    validation_issues = store.validate_document_graph(doc_id)
+    missing_artifact_issues = [
+        issue for issue in validation_issues if issue["code"] == "ARTIFACT_FILE_MISSING"
+    ]
+    assert len(missing_artifact_issues) == 3
+    assert {issue["metadata"]["artifact_id"] for issue in missing_artifact_issues} == {
+        f"{doc_id}:image:image-1",
+        f"{doc_id}:table:table-1",
+        f"{doc_id}:figure:figure-1",
+    }
 
 
 def test_validate_document_graph_reports_structural_errors(tmp_path: Path) -> None:
@@ -808,6 +812,66 @@ def test_local_search_supports_fuzzy_title_and_intent_ranking(tmp_path: Path) ->
     )
     assert figure_hits[0]["source_type"] == "pdf_figure"
     assert "query_intent_figure" in figure_hits[0]["why_included"]["reason"]
+
+
+def test_formula_fallback_text_is_not_unresolved_diagnostic(tmp_path: Path) -> None:
+    store = CatalogStore(tmp_path / "catalog.db")
+    doc_id = "formula-diagnostics-doc"
+    path = (tmp_path / "formula.pdf").resolve()
+    path.write_bytes(b"pdf")
+    store.upsert_scanned_document(
+        DocumentRecord(
+            doc_id=doc_id,
+            path=str(path),
+            type=DocumentType.PDF,
+            sha256="f" * 64,
+            mtime=1.0,
+        )
+    )
+    store.save_document_parse_output(
+        doc_id=doc_id,
+        title="Formula Diagnostics",
+        parser_chain=["docling"],
+        metadata={},
+        outline=[],
+        overall_confidence=0.9,
+        status="ready",
+    )
+
+    store.replace_formulas(
+        doc_id,
+        [
+            FormulaRecord(
+                formula_id="formula-fallback",
+                doc_id=doc_id,
+                section_path=["S"],
+                page=1,
+                bbox=[1.0, 2.0, 3.0, 4.0],
+                latex="x+y",
+                source="docling_formula_text",
+                status="fallback_text",
+            ),
+            FormulaRecord(
+                formula_id="formula-unresolved",
+                doc_id=doc_id,
+                section_path=["S"],
+                page=2,
+                bbox=[2.0, 3.0, 4.0, 5.0],
+                latex="[Formula unresolved. Use render_pdf_page for verification.]",
+                source="none",
+                status="unresolved",
+            ),
+        ],
+    )
+
+    diagnostics = store.list_diagnostics(doc_id=doc_id)
+    unresolved_diagnostics = [
+        diagnostic
+        for diagnostic in diagnostics
+        if diagnostic["code"] == "FORMULA_UNRESOLVED"
+    ]
+    assert len(unresolved_diagnostics) == 1
+    assert unresolved_diagnostics[0]["metadata"]["formula_id"] == "formula-unresolved"
 
 
 def test_delete_documents_by_paths_cascades_related_rows(tmp_path: Path) -> None:

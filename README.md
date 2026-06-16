@@ -10,7 +10,7 @@ The server is designed around outline-first navigation, precise node reads, form
 uvx mcp-ebook-read
 ```
 
-The server starts without required environment variables. It does not create `.mcp-ebook-read` in the current working directory during startup. Sidecars are created only when a specific EPUB/PDF document is discovered, ingested, or read, and they are created under the source document directory.
+The server starts without required environment variables. It does not create `.mcp-ebook-read` during startup. The root sidecar is created only when EPUB/PDF documents are scanned or ingested under the selected library root.
 
 ### First Run Recommendation
 
@@ -62,24 +62,28 @@ Optional:
 - `GROBID_URL` (for example `http://127.0.0.1:8070`) enables optional PDF paper metadata enrichment.
 - `GROBID_TIMEOUT_SECONDS` (default `20`; recommended `120` for large papers).
 - `MCP_EBOOK_INGEST_WORKERS` (`auto` by default; parallel eager ingest workers for multiple new documents).
-- `DOCLING_FORMULA_ENRICHMENT` (`true` by default).
-- `PDF_FORMULA_REQUIRE_ENGINE` (`true` by default).
+- `DOCLING_FORMULA_ENRICHMENT` (`false` by default; opt in for Docling CodeFormulaV2 VLM enrichment).
+- `PDF_FORMULA_REQUIRE_ENGINE` (`false` by default; opt in to fail fast when Pix2Text is unavailable).
 - `PDF_FORMULA_BATCH_SIZE` (`auto` by default; dynamically scaled across concurrent PDF parses, or an explicit integer).
 - `PDF_DOCLING_NUM_THREADS` (auto-derived from CPU cores by default; override Docling CPU threads).
 - `PDF_DOCLING_BATCH_SIZE` (auto-derived from CPU/memory by default; override Docling OCR/layout/table batch sizes together).
-- `PDF_DOCLING_DEVICE` (override Docling accelerator device, for example `auto` or `cpu`).
+- `PDF_DOCLING_DEVICE` (override Docling accelerator device, for example `auto`, `cpu`, or `mps` on Apple Silicon).
 - `PDF_DOCLING_TUNING_PROFILE_PATH` (override the local autotune profile JSON path).
 - `PDF_PARSE_TIMEOUT_SECONDS` (default `1800`; timeout for isolated Docling/Pix2Text PDF parse and visual extraction workers).
+- `MCP_EBOOK_CAPTURE_READING_SESSION` (`false` by default; set to `1` to capture read/search tool outputs for retrieval drift evaluation).
+- `MCP_EBOOK_CAPTURE_INCLUDE_QUERY` (`false` by default; set to `1` only for local evaluation when replay needs raw query text).
 
 ## Persistence Model
 
-Persistence is local sidecar-based and routed by document location.
+Persistence is local sidecar-based and routed by library root.
 
-For each document, the MCP writes state to:
+For each library root, the MCP writes all nested EPUB/PDF state to one root sidecar:
 
 ```text
-<document_dir>/.mcp-ebook-read/
+<library_root>/.mcp-ebook-read/
 ```
+
+`library_scan(root=...)` always uses the provided scan root as the library root. Direct `document_ingest_*` tools also accept `root`; if omitted, the MCP process project root is used. The default project root is discovered from the current working directory by walking upward to `.git` or `pyproject.toml`, falling back to the current working directory.
 
 The sidecar contains:
 - `catalog.db`, a SQLite database with documents, chunks, formulas, images, tables, figures, page/reference/citation/artifact graph nodes, local FTS, graph edges, diagnostics, and ingest jobs.
@@ -88,32 +92,33 @@ The sidecar contains:
 - `docs/<doc_id>/assets/...`.
 - `docs/<doc_id>/evidence/...`.
 
-Sidecars are visible and explicitly maintainable through storage tools:
+The root sidecar is visible and explicitly maintainable through storage tools:
 - `storage_list_sidecars`
 - `storage_delete_document`
 - `storage_cleanup_sidecars`
 
-`storage_list_sidecars` returns graph-aware summaries, including document count, node count, edge count, artifact count, diagnostics count, database bytes, and total sidecar bytes.
+`storage_list_sidecars` returns a graph-aware summary for the selected root sidecar, including document count, node count, edge count, artifact count, diagnostics count, database bytes, and total sidecar bytes.
 
 Ready documents include freshness diagnostics. If the source file disappears or its mtime/hash changes, MCP tools report `source_path_missing` or `source_file_changed` and suggest the matching reingest call.
 
-If an existing `catalog.db` has an incompatible schema, the server does not attempt legacy migrations. It renames the old database to `catalog.db.incompatible-<reason>-<timestamp>.bak` and creates a fresh current-schema catalog. Run `library_scan` again to rediscover documents in that folder.
+If an existing `catalog.db` has an incompatible schema, the server does not attempt legacy migrations. It renames the old database to `catalog.db.incompatible-<reason>-<timestamp>.bak` and creates a fresh current-schema catalog. Run `library_scan` again to rediscover documents under that library root.
 
 Ingest finalization is staged. New parse artifacts are first written under a temporary `docs/.<doc_id>.staging-*` workspace and database updates are applied to a temporary SQLite copy. The active document workspace and `catalog.db` are replaced only after graph validation succeeds.
 
 ## Recommended Reading Workflow
 
-1. For one known file, call the correct ingest tool directly with `path`.
-2. For bulk discovery or doc_id-only workflows after restart, use `library_scan` or `storage_list_sidecars`.
-3. Use the correct ingest tool:
+1. Choose a library root. For nested libraries, pass the top-level folder as `root`.
+2. For one known file, call the correct ingest tool directly with `path` and preferably `root`.
+3. For bulk discovery or doc_id-only workflows after restart, use `library_scan(root=...)` or `storage_list_sidecars(root=...)`; omit `root` only when the project root is the intended library root.
+4. Use the correct ingest tool:
    - `document_ingest_epub_book`
    - `document_ingest_pdf_book`
    - `document_ingest_pdf_paper`
-4. Poll `document_ingest_status` until the job succeeds or fails.
-5. For cross-document questions, start with `library_explore(root, query)`.
-6. For one known ingested document, use `document_explore(doc_id, query)`.
-7. Use `document_node(doc_id, node_id)` for precise graph-node reads.
-8. Use specialized evidence tools when needed:
+5. Poll `document_ingest_status` until the job succeeds or fails.
+6. For cross-document questions, start with `library_explore(query=..., root=...)`.
+7. For one known ingested document, use `document_explore(doc_id, query)`.
+8. Use `document_node(doc_id, node_id)` for precise graph-node reads.
+9. Use specialized evidence tools when needed:
    - `get_outline`
    - `read_outline_node`
    - `search_in_outline_node`
@@ -139,19 +144,21 @@ For PDF papers, GROBID-provided TEI references and in-text citations are persist
 
 ## PDF Formula Pipeline
 
-PDF ingest uses a mixed formula pipeline:
-- Docling structure extraction with formula enrichment;
-- Docling-native `$$...$$` LaTeX blocks are registered directly in the formula catalog;
-- Pix2Text runs as a marker fallback when Docling emits unresolved formula markers;
-- Pix2Text runs on CPU by default to avoid platform accelerator instability;
-- true Docling/Pix2Text PDF parsing runs in an isolated worker process with `PDF_PARSE_TIMEOUT_SECONDS` as the timeout guard;
-- formula reads render visual evidence and register it as an addressable artifact graph node when an evidence image is produced;
-- fail-fast when formula markers exist but the required formula engine is unavailable.
+PDF ingest uses a staged formula pipeline:
+- Docling-native `$$...$$` LaTeX blocks are registered directly in the formula catalog.
+- When Docling emits unresolved formula markers, the default path uses Docling `FormulaItem` text plus page/bbox provenance so formulas remain complete and addressable without invoking slow VLM recovery.
+- Deep formula recovery is opt-in: enable Docling CodeFormulaV2 VLM enrichment and/or require Pix2Text when a math-heavy document needs stronger LaTeX reconstruction.
+- Pix2Text runs on CPU by default to avoid platform accelerator instability.
+- Docling/Pix2Text PDF parsing runs in an isolated worker process with `PDF_PARSE_TIMEOUT_SECONDS` as the timeout guard.
+- Formula reads render visual evidence and register it as an addressable artifact graph node when an evidence image is produced.
+- If `PDF_FORMULA_REQUIRE_ENGINE=true`, ingest fails fast when formula markers exist but Pix2Text is unavailable.
 
 Optional formula controls:
-- `DOCLING_FORMULA_ENRICHMENT`
-- `PDF_FORMULA_REQUIRE_ENGINE`
-- `PDF_FORMULA_BATCH_SIZE`
+- `DOCLING_FORMULA_ENRICHMENT` (`false` by default; set to `true` only for explicit deep VLM enrichment).
+- `PDF_FORMULA_REQUIRE_ENGINE` (`false` by default; set to `true` when unresolved markers must be escalated to Pix2Text or fail).
+- `PDF_FORMULA_BATCH_SIZE` (`auto` by default; dynamically scaled across concurrent PDF parses).
+
+On Apple Silicon, the package installs the MLX VLM backend (`mlx-vlm`) via a macOS/arm64 dependency marker. Docling can use MPS/MLX for some VLM workloads, and the standard Docling pipeline can be forced to MPS with `PDF_DOCLING_DEVICE=mps`. The current CodeFormulaV2 formula enrichment path is still treated as an explicit slow path because it may not use MLX reliably; use CUDA hardware for large deep-formula batches when latency matters.
 
 ## PDF Visual Evidence
 
@@ -172,6 +179,7 @@ Eager PDF ingest uses local resource-aware defaults:
 - `PDF_DOCLING_NUM_THREADS` and `PDF_DOCLING_BATCH_SIZE` are auto-derived when no tuning profile or explicit env override is present.
 - Concurrent PDF parses dynamically divide Docling threads/batches and formula batch size across active PDF workers to avoid oversubscription.
 - Docling table/figure extraction reuses the parse worker's in-memory Docling document when possible, avoiding a second Docling conversion for the same PDF.
+- Apple Silicon installs `mlx-vlm` automatically and can use `PDF_DOCLING_DEVICE=mps`; full Docling VLM/MLX parsing remains a separate profile to benchmark before making it part of default ingest.
 - `library_scan` computes document SHA256 hashes in parallel and returns `scan_performance` with candidate counts, hash worker count, and timing diagnostics.
 
 Use `document_autotune_pdf_parser` before long PDF ingest runs when you want to benchmark a sampled subset of one PDF and persist the best local profile.
@@ -192,23 +200,55 @@ Use your own non-scanned PDF corpus as a no-label regression baseline.
 
 ```bash
 uvx mcp-ebook-formula-benchmark \
-  --samples-dir /ABSOLUTE/PATH/TO/pdf-formula-benchmark-corpus \
+  --manifest /ABSOLUTE/PATH/TO/pdf-formula-smoke.manifest \
   --passes 2 \
   --max-unresolved-rate 0.15 \
   --min-latex-valid-rate 0.85 \
   --min-stability-rate 1.0
 ```
 
+Use `--samples-dir /ABSOLUTE/PATH/TO/pdf-formula-benchmark-corpus` instead of `--manifest` when you want to recursively benchmark every PDF under a directory.
+
 ### No-Label Reading Benchmark
 
-Use a public/sample EPUB/PDF corpus to track outline, chunk, formula, image, table, and local search replay stability.
+Use a public/sample EPUB/PDF corpus to track parser-level outline, chunk, formula, image, and local search replay stability. This mode parses source files directly; use the service-side mode below to verify eager PDF table/figure/image evidence persisted in the root sidecar.
 
 ```bash
 uvx mcp-ebook-reading-benchmark \
-  --samples-dir /ABSOLUTE/PATH/TO/reading-benchmark-corpus \
+  --manifest /ABSOLUTE/PATH/TO/reading-smoke.manifest \
   --passes 2 \
   --min-stability-rate 1.0
 ```
+
+Manifest files are newline-delimited paths. Relative paths resolve from the manifest file directory. Blank lines and `#` comments are ignored.
+
+To verify the actual reading-companion MCP workflow over an existing root sidecar, run the service-side mode:
+
+```bash
+uvx mcp-ebook-reading-benchmark \
+  --service-root /ABSOLUTE/PATH/TO/LIBRARY_ROOT \
+  --query "formula figure table introduction method results" \
+  --top-k 8 \
+  --max-docs 20 \
+  --min-task-pass-rate 1.0
+```
+
+This mode uses `storage_list_sidecars`, `library_explore`, `document_explore`, `document_node`, `read_outline_node`, and the format/profile-specific formula/image/table/figure tools against the selected root sidecar. It does not reparse source files.
+
+### Service-Level Ingest Benchmark
+
+Use this benchmark when you need product-path performance evidence. It drives the same eager ingest tools as MCP clients, polls `document_ingest_status`, and records sidecar size, job progress, result counts, PDF phase timings when available, parser-lane summaries, and elapsed time.
+
+```bash
+uvx mcp-ebook-ingest-benchmark \
+  --profile-manifest /ABSOLUTE/PATH/TO/reading-smoke.profile.manifest \
+  --root /ABSOLUTE/PATH/TO/LIBRARY_ROOT \
+  --delete-sidecars \
+  --timeout-seconds 1800 \
+  --output .tmp/eval-results/ingest-smoke.json
+```
+
+Use `--pdf-profile book` or `--pdf-profile paper` with `--manifest` when benchmarking a homogeneous PDF set. For mixed PDF books/papers, prefer `--profile-manifest` with one `paper|book|epub <path>` entry per line. `--pdf-profile auto` is only a benchmark convenience; normal MCP usage should still call the explicit `document_ingest_pdf_book` or `document_ingest_pdf_paper` tool.
 
 ### Parser Engine Benchmark
 
@@ -231,7 +271,7 @@ Compare parser-task scheduling backends before changing the default ingest sched
 
 ```bash
 uvx mcp-ebook-concurrency-benchmark \
-  --samples-dir /ABSOLUTE/PATH/TO/reading-benchmark-corpus \
+  --manifest /ABSOLUTE/PATH/TO/reading-smoke.manifest \
   --workload pdf_fast \
   --backends sequential,thread,process,bocpy \
   --max-workers 4 \
@@ -243,7 +283,7 @@ uvx mcp-ebook-concurrency-benchmark \
 
 ```bash
 uvx --with bocpy mcp-ebook-concurrency-benchmark \
-  --samples-dir /ABSOLUTE/PATH/TO/reading-benchmark-corpus \
+  --manifest /ABSOLUTE/PATH/TO/reading-smoke.manifest \
   --workload epub_full \
   --backends sequential,thread,bocpy \
   --max-workers 4
@@ -252,8 +292,8 @@ uvx --with bocpy mcp-ebook-concurrency-benchmark \
 Supported workloads:
 - `epub_full`: EbookLib full EPUB parsing.
 - `pdf_fast`: pypdfium2 fast PDF lane.
-- `pdf_fidelity`: Docling + Pix2Text PDF fidelity lane.
-- `auto`: EbookLib for EPUB and Docling + Pix2Text for PDF.
+- `pdf_fidelity`: Docling PDF lane with default FormulaItem text/provenance recovery.
+- `auto`: EbookLib for EPUB and Docling PDF parsing for PDF.
 
 This benchmark does not write sidecars. Treat its output as evidence for whether a concurrency backend is worth promoting into the main ingest scheduler; do not enable new scheduling backends by default without corpus evidence.
 

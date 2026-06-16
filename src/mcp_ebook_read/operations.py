@@ -53,16 +53,20 @@ def _service() -> Any:
     return _service_provider()
 
 
-def library_scan(root: str, patterns: list[str] | None = None) -> dict[str, Any]:
+def library_scan(
+    root: str | None = None, patterns: list[str] | None = None
+) -> dict[str, Any]:
     effective_patterns = patterns or ["**/*.pdf", "**/*.epub"]
     return _service().library_scan(root=root, patterns=effective_patterns)
 
 
-def library_explore(root: str, query: str, top_k: int = 12) -> dict[str, Any]:
+def library_explore(
+    query: str, root: str | None = None, top_k: int = 12
+) -> dict[str, Any]:
     return _service().library_explore(root=root, query=query, top_k=top_k)
 
 
-def storage_list_sidecars(root: str, limit: int = 100) -> dict[str, Any]:
+def storage_list_sidecars(root: str | None = None, limit: int = 100) -> dict[str, Any]:
     return _service().storage_list_sidecars(root=root, limit=limit)
 
 
@@ -79,7 +83,7 @@ def storage_delete_document(
 
 
 def storage_cleanup_sidecars(
-    root: str,
+    root: str | None = None,
     remove_missing_documents: bool = True,
     remove_orphan_artifacts: bool = True,
     compact_catalog: bool = True,
@@ -95,25 +99,34 @@ def storage_cleanup_sidecars(
 def document_ingest_pdf_book(
     doc_id: str | None = None,
     path: str | None = None,
+    root: str | None = None,
     force: bool = False,
 ) -> dict[str, Any]:
-    return _service().document_ingest_pdf_book(doc_id=doc_id, path=path, force=force)
+    return _service().document_ingest_pdf_book(
+        doc_id=doc_id, path=path, root=root, force=force
+    )
 
 
 def document_ingest_epub_book(
     doc_id: str | None = None,
     path: str | None = None,
+    root: str | None = None,
     force: bool = False,
 ) -> dict[str, Any]:
-    return _service().document_ingest_epub_book(doc_id=doc_id, path=path, force=force)
+    return _service().document_ingest_epub_book(
+        doc_id=doc_id, path=path, root=root, force=force
+    )
 
 
 def document_ingest_pdf_paper(
     doc_id: str | None = None,
     path: str | None = None,
+    root: str | None = None,
     force: bool = False,
 ) -> dict[str, Any]:
-    return _service().document_ingest_pdf_paper(doc_id=doc_id, path=path, force=force)
+    return _service().document_ingest_pdf_paper(
+        doc_id=doc_id, path=path, root=root, force=force
+    )
 
 
 def document_ingest_status(doc_id: str, job_id: str | None = None) -> dict[str, Any]:
@@ -284,11 +297,15 @@ def render_pdf_page(doc_id: str, page: int, dpi: int = 200) -> dict[str, Any]:
     return _service().render_pdf_page(doc_id=doc_id, page=page, dpi=dpi)
 
 
-def eval_export_reading_sessions(root: str, limit: int = 500) -> dict[str, Any]:
+def eval_export_reading_sessions(
+    root: str | None = None, limit: int = 500
+) -> dict[str, Any]:
     return _service().eval_export_reading_sessions(root=root, limit=limit)
 
 
-def eval_replay_reading_sessions(root: str, limit: int = 100) -> dict[str, Any]:
+def eval_replay_reading_sessions(
+    root: str | None = None, limit: int = 100
+) -> dict[str, Any]:
     return _service().eval_replay_reading_sessions(root=root, limit=limit)
 
 

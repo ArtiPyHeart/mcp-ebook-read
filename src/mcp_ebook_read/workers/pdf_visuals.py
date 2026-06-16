@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import redirect_stdout
 import json
 import sys
 import traceback
@@ -41,18 +42,19 @@ def main() -> int:
         for chunk in config.get("chunks", [])
         if isinstance(chunk, dict)
     ]
-    extractor = DoclingPdfVisualExtractor(
-        performance_config=performance_config,
-        images_scale=float(config.get("images_scale") or 2.0),
-    )
     try:
-        extracted = extractor.extract(
-            pdf_path=args.pdf_path,
-            doc_id=args.doc_id,
-            chunks=chunks,
-            tables_dir=Path(args.tables_dir),
-            figures_dir=Path(args.figures_dir),
-        )
+        with redirect_stdout(sys.stderr):
+            extractor = DoclingPdfVisualExtractor(
+                performance_config=performance_config,
+                images_scale=float(config.get("images_scale") or 2.0),
+            )
+            extracted = extractor.extract(
+                pdf_path=args.pdf_path,
+                doc_id=args.doc_id,
+                chunks=chunks,
+                tables_dir=Path(args.tables_dir),
+                figures_dir=Path(args.figures_dir),
+            )
         sys.stdout.write(
             json.dumps(
                 {

@@ -14,6 +14,7 @@ dependencies = [
   "lxml>=6.1.1",
   "pymupdf>=1.27.2.3",
   "pypdfium2>=4.30.1",
+  "mlx-vlm>=0.6.3; platform_system == 'Darwin' and platform_machine == 'arm64'",
 ]
 
 [project.scripts]
@@ -22,6 +23,7 @@ mcp-ebook-formula-benchmark = "mcp_ebook_read.benchmark.pdf_formula:main"
 mcp-ebook-parser-engine-benchmark = "mcp_ebook_read.benchmark.parser_engines:main"
 mcp-ebook-reading-benchmark = "mcp_ebook_read.benchmark.reading:main"
 mcp-ebook-concurrency-benchmark = "mcp_ebook_read.benchmark.concurrency:main"
+mcp-ebook-ingest-benchmark = "mcp_ebook_read.benchmark.ingest:main"
 
 [dependency-groups]
 dev = [
@@ -36,6 +38,18 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/mcp_ebook_read"]
+
+[tool.hatch.build.targets.sdist]
+exclude = [
+  "/.mcp-ebook-read",
+  "/.tmp",
+  "/.codegraph",
+  "/docs/codegraph-reuse-checklist.md",
+  "/docs/evaluation-plan.md",
+  "/docs/gbrain-reuse-checklist.md",
+  "/extern",
+  "/tests/samples",
+]
 
 [tool.ruff]
 target-version = "py313"

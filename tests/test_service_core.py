@@ -383,6 +383,7 @@ def _build_service(
 ) -> AppService:
     return AppService(
         sidecar_dir_name=".mcp-ebook-read",
+        default_library_root=tmp_path,
         pdf_parser=pdf_parser,
         pdf_image_extractor=pdf_image_extractor,
         pdf_visual_extractor=pdf_visual_extractor,
@@ -394,9 +395,14 @@ def _build_service(
 
 
 def _register_doc(
-    service: AppService, doc_id: str, path: Path, doc_type: DocumentType
+    service: AppService,
+    doc_id: str,
+    path: Path,
+    doc_type: DocumentType,
+    *,
+    root: Path | None = None,
 ) -> None:
-    catalog = service._catalog_for_document_path(path)
+    catalog = service._catalog_for_document_path(path, root=root)
     catalog.upsert_scanned_document(
         DocumentRecord(
             doc_id=doc_id,
@@ -425,7 +431,11 @@ def _wait_for_ingest_job(
             IngestJobStatus.FAILED,
             IngestJobStatus.CANCELED,
         }:
-            return last
+            if (
+                last["status"] != IngestJobStatus.SUCCEEDED
+                or last.get("result") is not None
+            ):
+                return last
         time.sleep(0.01)
     raise AssertionError(f"Timed out waiting for ingest job {job_id}: {last}")
 
@@ -796,7 +806,7 @@ def test_library_scan_hash_worker_count_scales_with_safe_limits(
     assert service._scan_worker_count(100) == 8
 
 
-def test_library_scan_routes_documents_to_per_folder_sidecars(tmp_path: Path) -> None:
+def test_library_scan_routes_nested_documents_to_root_sidecar(tmp_path: Path) -> None:
     root = tmp_path / "library"
     books_dir = root / "books"
     papers_dir = root / "papers"
@@ -820,14 +830,63 @@ def test_library_scan_routes_documents_to_per_folder_sidecars(tmp_path: Path) ->
 
     book_catalog = service._catalog_for_document_path(book_pdf)
     paper_catalog = service._catalog_for_document_path(paper_pdf)
-    assert book_catalog.db_path.parent == books_dir / ".mcp-ebook-read"
-    assert paper_catalog.db_path.parent == papers_dir / ".mcp-ebook-read"
+    assert book_catalog.db_path.parent == root / ".mcp-ebook-read"
+    assert paper_catalog.db_path.parent == root / ".mcp-ebook-read"
+    assert not (books_dir / ".mcp-ebook-read").exists()
+    assert not (papers_dir / ".mcp-ebook-read").exists()
     assert book_catalog.get_document_by_path(str(book_pdf.resolve())) is not None
     assert paper_catalog.get_document_by_path(str(paper_pdf.resolve())) is not None
 
     sidecars = service.storage_list_sidecars(root=str(root), limit=20)
-    assert sidecars["sidecars_count"] == 2
+    assert sidecars["sidecars_count"] == 1
     assert sidecars["documents_count"] == 2
+
+
+def test_storage_list_defaults_to_root_sidecar_and_ignores_nested_legacy_sidecar(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "library"
+    nested = root / "nested"
+    nested.mkdir(parents=True)
+    root_doc_path = root / "root-book.pdf"
+    legacy_doc_path = nested / "legacy-book.pdf"
+    root_doc_path.write_bytes(b"root")
+    legacy_doc_path.write_bytes(b"legacy")
+
+    service = _build_service(
+        root,
+        pdf_parser=RecordingParser(result=_parsed("x", title="X", method="docling")),
+        epub_parser=RecordingParser(result=_parsed("x", title="X", method="ebooklib")),
+        grobid=RecordingGrobid(),
+    )
+    root_catalog = service._catalog_for_library_root()
+    root_catalog.upsert_scanned_document(
+        DocumentRecord(
+            doc_id="doc-root-sidecar",
+            path=str(root_doc_path.resolve()),
+            type=DocumentType.PDF,
+            sha256="a" * 64,
+            mtime=1.0,
+        )
+    )
+    legacy_catalog = CatalogStore(nested / ".mcp-ebook-read" / "catalog.db")
+    legacy_catalog.upsert_scanned_document(
+        DocumentRecord(
+            doc_id="doc-legacy-nested-sidecar",
+            path=str(legacy_doc_path.resolve()),
+            type=DocumentType.PDF,
+            sha256="b" * 64,
+            mtime=1.0,
+        )
+    )
+
+    sidecars = service.storage_list_sidecars(limit=20)
+
+    assert sidecars["root"] == str(root.resolve())
+    assert sidecars["sidecars_count"] == 1
+    assert sidecars["documents_count"] == 1
+    assert sidecars["sidecars"][0]["sidecar_path"] == str(root / ".mcp-ebook-read")
+    assert sidecars["sidecars"][0]["documents"][0]["doc_id"] == "doc-root-sidecar"
 
 
 def test_library_scan_cleans_catalog_when_folder_becomes_empty(tmp_path: Path) -> None:
@@ -908,6 +967,7 @@ def test_document_ingest_pdf_book_persists_fast_preflight_metadata(
         "formula_unresolved": 0,
         "pdf_tables_count": 1,
         "pdf_figures_count": 1,
+        "pdf_parse_phase_seconds": {"total": 0.5, "docling_convert": 0.3},
     }
     service = _build_service(
         tmp_path,
@@ -985,6 +1045,10 @@ def test_document_ingest_pdf_book_persists_fast_preflight_metadata(
 
     result = completed["result"]
     lanes = result["pdf_parser_lanes"]
+    assert result["pdf_parse_phase_seconds"] == {
+        "total": 0.5,
+        "docling_convert": 0.3,
+    }
     assert lanes["strategy"]["fast_lane"] == "pypdfium2_pdf"
     assert lanes["strategy"]["diagnostic_lane"] == "pymupdf"
     assert lanes["strategy"]["canonical_content_source"] == "docling"
@@ -1010,6 +1074,12 @@ def test_document_ingest_pdf_book_persists_fast_preflight_metadata(
         loaded.metadata["pdf_parser_lanes"]["diagnostic_preflight"]["parser"]
         == "pymupdf"
     )
+    cached = service.document_ingest_pdf_book(doc_id=doc_id, path=None, force=False)
+    assert cached["cached"] is True
+    assert cached["result"]["pdf_parse_phase_seconds"] == {
+        "total": 0.5,
+        "docling_convert": 0.3,
+    }
 
 
 def test_document_ingest_pdf_book_keeps_docling_when_fast_preflight_fails(
@@ -1289,7 +1359,7 @@ def test_pdf_diagnostic_preflight_reports_errors(
     assert result["details"]["doc_id"] == "doc-diag"
 
 
-def test_document_ingest_path_creates_sidecar_next_to_source_not_cwd(
+def test_document_ingest_path_creates_sidecar_under_default_root_not_cwd(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -1327,10 +1397,41 @@ def test_document_ingest_path_creates_sidecar_next_to_source_not_cwd(
     assert result["doc_id"] == doc_id
     assert epub_parser.calls == [(str(epub_path), doc_id)]
     assert not (cwd / ".mcp-ebook-read").exists()
-    assert (book_dir / ".mcp-ebook-read" / "catalog.db").exists()
+    assert not (book_dir / ".mcp-ebook-read").exists()
+    assert (tmp_path / ".mcp-ebook-read" / "catalog.db").exists()
     assert (
-        book_dir / ".mcp-ebook-read" / "docs" / doc_id / "reading" / "reading.md"
+        tmp_path / ".mcp-ebook-read" / "docs" / doc_id / "reading" / "reading.md"
     ).exists()
+
+
+def test_document_ingest_path_uses_explicit_root_sidecar(tmp_path: Path) -> None:
+    library_root = tmp_path / "library"
+    book_dir = library_root / "nested" / "epub-books"
+    book_dir.mkdir(parents=True)
+    epub_bytes = b"epub"
+    epub_path = book_dir / "book.epub"
+    epub_path.write_bytes(epub_bytes)
+    doc_id = hashlib.sha256(epub_bytes).hexdigest()[:16]
+
+    service = _build_service(
+        tmp_path,
+        pdf_parser=RecordingParser(result=_parsed("x", title="X", method="docling")),
+        epub_parser=RecordingParser(
+            result=_parsed(doc_id, title="EPUB Book", method="ebooklib")
+        ),
+        grobid=RecordingGrobid(),
+    )
+
+    queued = service.document_ingest_epub_book(
+        doc_id=None,
+        path=str(epub_path),
+        root=str(library_root),
+        force=True,
+    )
+    _wait_for_ingest_job(service, doc_id=queued["doc_id"], job_id=queued["job_id"])
+
+    assert (library_root / ".mcp-ebook-read" / "catalog.db").exists()
+    assert not (book_dir / ".mcp-ebook-read").exists()
 
 
 def test_document_ingest_stage_log_uses_safe_extra_key(
@@ -1873,19 +1974,27 @@ def test_document_ingest_worker_uses_queued_catalog_for_duplicate_doc_ids(
         epub_parser=RecordingParser(result=_parsed("x", title="X", method="ebooklib")),
         grobid=RecordingGrobid(),
     )
-    _register_doc(service, doc_id, first_path, DocumentType.PDF)
-    first_catalog = service._catalog_for_document_path(first_path)
-    _register_doc(service, doc_id, second_path, DocumentType.PDF)
-    second_catalog = service._catalog_for_document_path(second_path)
+    _register_doc(service, doc_id, first_path, DocumentType.PDF, root=first_path.parent)
+    first_catalog = service._catalog_for_document_path(
+        first_path, root=first_path.parent
+    )
+    _register_doc(
+        service, doc_id, second_path, DocumentType.PDF, root=second_path.parent
+    )
+    second_catalog = service._catalog_for_document_path(
+        second_path, root=second_path.parent
+    )
 
     first = service.document_ingest_pdf_book(
         path=str(first_path.resolve()),
         doc_id=None,
+        root=str(first_path.parent),
         force=True,
     )
     second = service.document_ingest_pdf_book(
         path=str(second_path.resolve()),
         doc_id=None,
+        root=str(second_path.parent),
         force=True,
     )
 
@@ -2110,7 +2219,7 @@ def test_source_file_change_marks_ready_document_stale_and_reingests(
     assert len(parser.calls) == 2
 
 
-def test_search_uses_local_fts_when_vector_has_no_hits(tmp_path: Path) -> None:
+def test_search_uses_local_fts_without_external_vector_backend(tmp_path: Path) -> None:
     doc_id = "doc-local-search"
     pdf_path = tmp_path / "local-search.pdf"
     pdf_path.write_bytes(b"pdf")
@@ -2234,7 +2343,7 @@ def test_document_explore_and_node_use_document_graph(tmp_path: Path) -> None:
     assert sidecars["sidecars"][0]["documents"][0]["graph"]["page_nodes_count"] == 1
 
 
-def test_library_explore_searches_across_ingested_sidecars(tmp_path: Path) -> None:
+def test_library_explore_searches_root_sidecar(tmp_path: Path) -> None:
     root = tmp_path / "library"
     pdf_dir = root / "pdf-books"
     epub_dir = root / "epub-books"
@@ -2298,30 +2407,28 @@ def test_library_explore_searches_across_ingested_sidecars(tmp_path: Path) -> No
         overall_confidence=0.9,
     )
     service = _build_service(
-        tmp_path,
+        root,
         pdf_parser=RecordingParser(result=pdf_parsed),
         epub_parser=RecordingParser(result=epub_parsed),
         grobid=RecordingGrobid(),
     )
-    _register_doc(service, pdf_doc_id, pdf_path, DocumentType.PDF)
-    _register_doc(service, epub_doc_id, epub_path, DocumentType.EPUB)
-    pdf_job = service.document_ingest_pdf_book(doc_id=pdf_doc_id, path=None, force=True)
-    epub_job = service.document_ingest_epub_book(
-        doc_id=epub_doc_id, path=None, force=True
-    )
+    _register_doc(service, pdf_doc_id, pdf_path, DocumentType.PDF, root=root)
+    _register_doc(service, epub_doc_id, epub_path, DocumentType.EPUB, root=root)
+    pdf_job = service.document_ingest_pdf_book(doc_id=pdf_doc_id, force=True)
+    epub_job = service.document_ingest_epub_book(doc_id=epub_doc_id, force=True)
     _wait_for_ingest_job(service, doc_id=pdf_doc_id, job_id=pdf_job["job_id"])
     _wait_for_ingest_job(service, doc_id=epub_doc_id, job_id=epub_job["job_id"])
 
     explored = service.library_explore(
-        root=str(root),
         query="persistent homology",
         top_k=5,
     )
 
+    assert explored["root"] == str(root.resolve())
     assert explored["retrieval"]["mode"] == (
-        "cross_sidecar_sqlite_fts5_plus_document_graph"
+        "root_sidecar_sqlite_fts5_plus_document_graph"
     )
-    assert explored["retrieval"]["sidecars_count"] == 2
+    assert explored["retrieval"]["sidecars_count"] == 1
     assert explored["selected_results"][0]["document"]["doc_id"] == pdf_doc_id
     assert explored["selected_results"][0]["node"]["kind"] == "chunk"
     assert {
@@ -2594,6 +2701,8 @@ def test_reading_session_capture_export_and_replay(
         grobid=RecordingGrobid(),
     )
     _register_doc(service, doc_id, pdf_path, DocumentType.PDF)
+    ingest = service.document_ingest_pdf_book(doc_id=doc_id, path=None, force=True)
+    _wait_for_ingest_job(service, doc_id=doc_id, job_id=ingest["job_id"])
 
     monkeypatch.setenv("MCP_EBOOK_CAPTURE_READING_SESSION", "1")
     monkeypatch.delenv("MCP_EBOOK_CAPTURE_INCLUDE_QUERY", raising=False)
@@ -2617,6 +2726,7 @@ def test_reading_session_capture_export_and_replay(
     replay = service.eval_replay_reading_sessions(root=str(tmp_path), limit=10)
     assert replay["replayed_count"] == 0
     assert replay["skipped_count"] == 1
+    assert replay["skipped"][0]["reason"] == "query_not_captured"
 
     monkeypatch.setenv("MCP_EBOOK_CAPTURE_INCLUDE_QUERY", "1")
     service.capture_tool_call(
@@ -2626,12 +2736,35 @@ def test_reading_session_capture_export_and_replay(
         result={"hits": [{"doc_id": doc_id, "chunk_id": "old-hit"}]},
         latency_ms=9,
     )
+    document_result = service.document_explore(doc_id=doc_id, query="Section", top_k=3)
+    service.capture_tool_call(
+        tool_name="document_explore",
+        use_case="search",
+        kwargs={"doc_id": doc_id, "query": "Section", "top_k": 3},
+        result=document_result,
+        latency_ms=7,
+    )
+    library_result = service.library_explore(
+        root=str(tmp_path), query="Section", top_k=3
+    )
+    service.capture_tool_call(
+        tool_name="library_explore",
+        use_case="search",
+        kwargs={"root": str(tmp_path), "query": "Section", "top_k": 3},
+        result=library_result,
+        latency_ms=8,
+    )
     replay_with_query = service.eval_replay_reading_sessions(
         root=str(tmp_path),
         limit=10,
     )
-    assert replay_with_query["replayed_count"] == 1
+    assert replay_with_query["replayed_count"] == 3
     assert replay_with_query["drifted_count"] == 1
+    assert {item["tool_name"] for item in replay_with_query["replayed"]} == {
+        "search",
+        "document_explore",
+        "library_explore",
+    }
 
 
 def test_doctor_health_check_reports_sidecar_findings(tmp_path: Path) -> None:

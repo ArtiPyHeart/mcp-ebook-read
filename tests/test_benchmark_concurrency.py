@@ -4,8 +4,8 @@ from pathlib import Path
 import sys
 from typing import Any
 
+from mcp_ebook_read.benchmark.paths import DOCUMENT_SUFFIXES, collect_documents
 from mcp_ebook_read.benchmark.concurrency import (
-    _collect_documents,
     _parse_backends,
     run_concurrency_benchmark,
 )
@@ -38,8 +38,15 @@ def test_collect_documents_filters_epub_and_pdf(tmp_path: Path) -> None:
     pdf = _write_sample(tmp_path / "b.pdf")
     _write_sample(tmp_path / "c.txt")
 
-    assert _collect_documents(tmp_path) == [epub, pdf]
-    assert _collect_documents(tmp_path, max_documents=1) == [epub]
+    assert collect_documents(samples_dir=tmp_path, suffixes=DOCUMENT_SUFFIXES) == [
+        epub.resolve(),
+        pdf.resolve(),
+    ]
+    assert collect_documents(
+        samples_dir=tmp_path,
+        suffixes=DOCUMENT_SUFFIXES,
+        max_documents=1,
+    ) == [epub.resolve()]
 
 
 def test_parse_backends_trims_empty_items() -> None:

@@ -94,17 +94,57 @@ class CountingLoadPagePdfDoc(FakePdfDoc):
         return FakeRenderedPage()
 
 
+class FakeBbox:
+    def __init__(
+        self,
+        left: float,
+        top: float,
+        right: float,
+        bottom: float,
+    ) -> None:
+        self.l = left
+        self.t = top
+        self.r = right
+        self.b = bottom
+
+
+class FakeProvenance:
+    def __init__(self, *, page_no: int, bbox: FakeBbox | None = None) -> None:
+        self.page_no = page_no
+        self.bbox = bbox
+
+
+class FakeFormulaItem:
+    label = "formula"
+
+    def __init__(
+        self,
+        *,
+        orig: str,
+        page_no: int,
+        bbox: FakeBbox | None = None,
+    ) -> None:
+        self.orig = orig
+        self.text = ""
+        self.prov = [FakeProvenance(page_no=page_no, bbox=bbox)]
+
+
 class FakeDocument:
-    def __init__(self, markdown: str) -> None:
+    def __init__(self, markdown: str, items: list[object] | None = None) -> None:
         self._markdown = markdown
+        self._items = items or []
 
     def export_to_markdown(self) -> str:
         return self._markdown
 
+    def iterate_items(self):
+        for item in self._items:
+            yield item, 1
+
 
 class FakeConvertResult:
-    def __init__(self, markdown: str) -> None:
-        self.document = FakeDocument(markdown)
+    def __init__(self, markdown: str, items: list[object] | None = None) -> None:
+        self.document = FakeDocument(markdown, items=items)
 
 
 def install_fake_docling(monkeypatch: pytest.MonkeyPatch, converter_cls: type) -> None:
@@ -232,6 +272,20 @@ class TransientThenSuccessfulConverter:
 class FormulaConverter:
     def convert(self, _path: str) -> FakeConvertResult:
         return FakeConvertResult("# Intro\nx(t) = sin(t)\n<!-- formula-not-decoded -->")
+
+
+class FormulaItemConverter:
+    def convert(self, _path: str) -> FakeConvertResult:
+        return FakeConvertResult(
+            "# Intro\nFormula follows\n<!-- formula-not-decoded -->",
+            items=[
+                FakeFormulaItem(
+                    orig="dS u = σdW u (2.1)",
+                    page_no=3,
+                    bbox=FakeBbox(1.0, 2.0, 3.0, 4.0),
+                )
+            ],
+        )
 
 
 class NativeLatexFormulaConverter:
@@ -481,10 +535,47 @@ def test_docling_parse_records_native_latex_blocks_without_pix2text(
     )
 
 
-def test_docling_parse_replaces_formula_marker(
+def test_docling_parse_uses_formula_item_text_by_default(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     parser = DoclingPdfParser()
+    pdf = tmp_path / "formula_item.pdf"
+    pdf.write_bytes(b"pdf")
+
+    install_fake_docling(monkeypatch, FormulaItemConverter)
+    fake_doc = CountingLoadPagePdfDoc(
+        title="Formula Item PDF",
+        page_count=4,
+        toc=[[1, "Intro", 1]],
+    )
+    monkeypatch.setattr(
+        "mcp_ebook_read.parsers.pdf_docling.fitz.open",
+        lambda _path: fake_doc,
+    )
+
+    parsed = parser.parse(str(pdf), "doc-formula-item")
+
+    assert parsed.parser_chain == ["docling", "docling_formula_text"]
+    assert parsed.metadata["formula_markers_total"] == 1
+    assert parsed.metadata["formula_replaced_by_docling_text"] == 1
+    assert parsed.metadata["formula_replaced_by_pix2text"] == 0
+    assert parsed.metadata["formula_unresolved"] == 0
+    assert parsed.metadata["formula_pages_rendered"] == 0
+    assert parsed.metadata["docling_formula_text_candidates_total"] == 1
+    assert fake_doc.load_page_calls == 0
+    assert len(parsed.formulas) == 1
+    assert parsed.formulas[0].status == "fallback_text"
+    assert parsed.formulas[0].source == "docling_formula_text"
+    assert parsed.formulas[0].page == 3
+    assert parsed.formulas[0].bbox == [1.0, 2.0, 3.0, 4.0]
+    assert parsed.formulas[0].latex == "dS u = σdW u (2.1)"
+    assert "dS u = σdW u" in parsed.chunks[0].text
+
+
+def test_docling_parse_replaces_formula_marker(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    parser = DoclingPdfParser(require_formula_engine=True)
     pdf = tmp_path / "f.pdf"
     pdf.write_bytes(b"pdf")
 
@@ -531,7 +622,7 @@ def test_docling_parse_replaces_formula_marker(
 def test_docling_parse_formula_fallback_uses_page_text(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    parser = DoclingPdfParser()
+    parser = DoclingPdfParser(require_formula_engine=True)
     pdf = tmp_path / "formula_fallback.pdf"
     pdf.write_bytes(b"pdf")
 
@@ -561,7 +652,7 @@ def test_docling_parse_formula_fallback_uses_page_text(
 def test_docling_parse_formula_unresolved_when_no_fallback(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    parser = DoclingPdfParser()
+    parser = DoclingPdfParser(require_formula_engine=True)
     pdf = tmp_path / "formula_unresolved.pdf"
     pdf.write_bytes(b"pdf")
 
@@ -688,7 +779,7 @@ def test_docling_parse_passes_formula_batch_size_to_pix2text(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     state: dict[str, object] = {}
-    parser = DoclingPdfParser(formula_batch_size=5)
+    parser = DoclingPdfParser(require_formula_engine=True, formula_batch_size=5)
     pdf = tmp_path / "formula_batch.pdf"
     pdf.write_bytes(b"pdf")
 
@@ -719,7 +810,7 @@ def test_docling_parse_passes_formula_batch_size_to_pix2text(
 def test_docling_parse_caches_formula_candidates_per_page(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    parser = DoclingPdfParser()
+    parser = DoclingPdfParser(require_formula_engine=True)
     pdf = tmp_path / "formula_cache.pdf"
     pdf.write_bytes(b"pdf")
 

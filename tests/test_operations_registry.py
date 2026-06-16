@@ -63,7 +63,7 @@ def test_llm_descriptions_pin_reading_routing_language() -> None:
     assert "PDF book" in descriptions["document_ingest_pdf_book"]
     assert "PDF paper" in descriptions["document_ingest_pdf_paper"]
     assert "EPUB book" in descriptions["document_ingest_epub_book"]
-    assert "already-ingested sidecars" in descriptions["library_explore"]
+    assert "already-ingested root sidecar" in descriptions["library_explore"]
     assert "infers EPUB/PDF/book/paper mode" in descriptions["document_explore"]
     assert "DocumentGraph node" in descriptions["document_node"]
     assert "outline-first" in descriptions["get_outline"]

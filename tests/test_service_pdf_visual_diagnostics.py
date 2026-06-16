@@ -96,6 +96,7 @@ def _build_service(
 ) -> AppService:
     return AppService(
         sidecar_dir_name=".mcp-ebook-read",
+        default_library_root=tmp_path,
         pdf_parser=_DummyParser(),
         pdf_visual_extractor=visual_extractor,
         grobid_client=_DummyGrobid(),

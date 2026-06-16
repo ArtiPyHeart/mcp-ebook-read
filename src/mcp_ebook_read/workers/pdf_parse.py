@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import redirect_stdout
 import json
 from pathlib import Path
 import sys
@@ -35,40 +36,44 @@ def main() -> int:
         if isinstance(performance_config_payload, dict)
         else PdfParserPerformanceConfig()
     )
-    visual_config = config.get("visual_extraction")
-    visual_extractor = None
-    visual_tables_dir = None
-    visual_figures_dir = None
-    visual_images_scale = 2.0
-    if isinstance(visual_config, dict):
-        visual_tables_dir = visual_config.get("tables_dir")
-        visual_figures_dir = visual_config.get("figures_dir")
-        visual_images_scale = float(visual_config.get("images_scale") or 2.0)
-        if visual_tables_dir and visual_figures_dir:
-            visual_tables_dir = Path(str(visual_tables_dir))
-            visual_figures_dir = Path(str(visual_figures_dir))
-            visual_extractor = DoclingPdfVisualExtractor(
-                performance_config=performance_config,
-                images_scale=visual_images_scale,
-            )
-    pdf_parser = DoclingPdfParser(
-        enable_docling_formula_enrichment=bool(
-            config.get("enable_docling_formula_enrichment", True)
-        ),
-        require_formula_engine=bool(config.get("require_formula_engine", True)),
-        formula_batch_size=int(config.get("formula_batch_size") or 1),
-        performance_config=performance_config,
-        enable_visual_images=visual_extractor is not None,
-        visual_images_scale=visual_images_scale,
-    )
+    pdf_parser = None
     try:
-        parsed = pdf_parser.parse(
-            args.pdf_path,
-            args.doc_id,
-            visual_extractor=visual_extractor,
-            visual_tables_dir=visual_tables_dir,
-            visual_figures_dir=visual_figures_dir,
-        )
+        with redirect_stdout(sys.stderr):
+            visual_config = config.get("visual_extraction")
+            visual_extractor = None
+            visual_tables_dir = None
+            visual_figures_dir = None
+            visual_images_scale = 2.0
+            if isinstance(visual_config, dict):
+                visual_tables_dir = visual_config.get("tables_dir")
+                visual_figures_dir = visual_config.get("figures_dir")
+                visual_images_scale = float(visual_config.get("images_scale") or 2.0)
+                if visual_tables_dir and visual_figures_dir:
+                    visual_tables_dir = Path(str(visual_tables_dir))
+                    visual_figures_dir = Path(str(visual_figures_dir))
+                    visual_extractor = DoclingPdfVisualExtractor(
+                        performance_config=performance_config,
+                        images_scale=visual_images_scale,
+                    )
+            pdf_parser = DoclingPdfParser(
+                enable_docling_formula_enrichment=bool(
+                    config.get("enable_docling_formula_enrichment", False)
+                ),
+                require_formula_engine=bool(
+                    config.get("require_formula_engine", False)
+                ),
+                formula_batch_size=int(config.get("formula_batch_size") or 1),
+                performance_config=performance_config,
+                enable_visual_images=visual_extractor is not None,
+                visual_images_scale=visual_images_scale,
+            )
+            parsed = pdf_parser.parse(
+                args.pdf_path,
+                args.doc_id,
+                visual_extractor=visual_extractor,
+                visual_tables_dir=visual_tables_dir,
+                visual_figures_dir=visual_figures_dir,
+            )
         sys.stdout.write(
             json.dumps(
                 {
@@ -92,7 +97,9 @@ def main() -> int:
         )
         return 1
     finally:
-        pdf_parser.close()
+        if pdf_parser is not None:
+            with redirect_stdout(sys.stderr):
+                pdf_parser.close()
 
 
 if __name__ == "__main__":

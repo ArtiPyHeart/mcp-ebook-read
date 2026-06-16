@@ -71,7 +71,7 @@ _PIPELINE_METADATA_KEY = "mcp_ebook_read_pipeline"
 _PIPELINE_SCHEMA_VERSION = 1
 _CHUNKER_VERSION = "chunker-v2-outline-aware"
 _SEARCH_TEXT_VERSION = "search-text-v2-fts5"
-_PDF_FORMULA_PIPELINE_VERSION = "docling-formula-enrichment-pix2text-v1"
+_PDF_FORMULA_PIPELINE_VERSION = "docling-formula-text-provenance-v2"
 _PDF_VISUAL_PIPELINE_VERSION = "docling-visuals-eager-v2"
 _PDF_DIAGNOSTIC_PIPELINE_VERSION = "pymupdf-diagnostic-lane-v1"
 _EPUB_IMAGE_PIPELINE_VERSION = "ebooklib-image-extraction-v1"
@@ -91,6 +91,7 @@ class AppService:
         self,
         *,
         sidecar_dir_name: str,
+        default_library_root: str | Path | None = None,
         pdf_parser: DoclingPdfParser,
         pdf_image_extractor: PdfImageExtractor | None = None,
         pdf_visual_extractor: DoclingPdfVisualExtractor | None = None,
@@ -100,6 +101,9 @@ class AppService:
         ingest_worker_count: int = 1,
     ) -> None:
         self.sidecar_dir_name = sidecar_dir_name
+        self.default_library_root = self._resolve_default_library_root(
+            default_library_root
+        )
         self.pdf_parser = pdf_parser
         self.pdf_image_extractor = pdf_image_extractor
         self.pdf_visual_extractor = pdf_visual_extractor
@@ -149,6 +153,22 @@ class AppService:
         close_visual_extractor = getattr(self.pdf_visual_extractor, "close", None)
         if callable(close_visual_extractor):
             close_visual_extractor()
+
+    @staticmethod
+    def _find_project_root(start: Path) -> Path:
+        resolved = start.expanduser().resolve()
+        if resolved.is_file():
+            resolved = resolved.parent
+        for candidate in (resolved, *resolved.parents):
+            if (candidate / ".git").exists() or (candidate / "pyproject.toml").exists():
+                return candidate
+        return resolved
+
+    @classmethod
+    def _resolve_default_library_root(cls, root: str | Path | None) -> Path:
+        if root is not None:
+            return Path(root).expanduser().resolve()
+        return cls._find_project_root(Path.cwd())
 
     @staticmethod
     def _detect_total_memory_bytes() -> int | None:
@@ -478,9 +498,9 @@ class AppService:
             sidecar_dir_name=".mcp-ebook-read",
             pdf_parser=DoclingPdfParser(
                 enable_docling_formula_enrichment=env_bool(
-                    "DOCLING_FORMULA_ENRICHMENT", True
+                    "DOCLING_FORMULA_ENRICHMENT", False
                 ),
-                require_formula_engine=env_bool("PDF_FORMULA_REQUIRE_ENGINE", True),
+                require_formula_engine=env_bool("PDF_FORMULA_REQUIRE_ENGINE", False),
                 formula_batch_size=formula_batch_size,
                 performance_config=docling_performance_config,
             ),
@@ -505,6 +525,54 @@ class AppService:
         self._known_roots.add(normalized)
         return normalized
 
+    def _resolve_library_root(self, root: str | Path | None = None) -> Path:
+        resolved = (
+            Path(root).expanduser().resolve()
+            if root is not None
+            else self.default_library_root
+        )
+        if not resolved.exists() or not resolved.is_dir():
+            raise AppError(
+                ErrorCode.SCAN_INVALID_ROOT,
+                f"Invalid library root: {resolved}",
+                details={"root": str(resolved)},
+            )
+        self._register_root(resolved)
+        return resolved
+
+    def _catalog_for_library_root(self, root: str | Path | None = None) -> CatalogStore:
+        root_path = self._resolve_library_root(root)
+        return self._get_or_create_catalog(root_path / self.sidecar_dir_name)
+
+    def _library_root_for_path(
+        self, path: Path, root: str | Path | None = None
+    ) -> Path:
+        if root is not None:
+            root_path = self._resolve_library_root(root)
+            self._ensure_path_under_root(path, root_path)
+            return root_path
+
+        matching_roots: list[Path] = []
+        for known_root in self._known_roots:
+            root_path = Path(known_root)
+            if path == root_path or path.is_relative_to(root_path):
+                matching_roots.append(root_path)
+        if matching_roots:
+            return max(matching_roots, key=lambda item: len(item.parts))
+
+        root_path = self.default_library_root
+        self._ensure_path_under_root(path, root_path)
+        return root_path
+
+    def _ensure_path_under_root(self, path: Path, root: Path) -> None:
+        if path == root or path.is_relative_to(root):
+            return
+        raise AppError(
+            ErrorCode.INGEST_DOC_NOT_FOUND,
+            "Document path is outside the selected library root.",
+            details={"path": str(path), "root": str(root)},
+        )
+
     def _get_or_create_catalog(self, sidecar_dir: Path) -> CatalogStore:
         key = str((sidecar_dir / "catalog.db").resolve())
         catalog = self._catalogs.get(key)
@@ -514,10 +582,12 @@ class AppService:
         self._catalogs[key] = catalog
         return catalog
 
-    def _catalog_for_document_path(self, path: str | Path) -> CatalogStore:
+    def _catalog_for_document_path(
+        self, path: str | Path, root: str | Path | None = None
+    ) -> CatalogStore:
         resolved = Path(path).expanduser().resolve()
-        self._register_root(resolved.parent)
-        return self._get_or_create_catalog(resolved.parent / self.sidecar_dir_name)
+        root_path = self._library_root_for_path(resolved, root)
+        return self._catalog_for_library_root(root_path)
 
     def _lookup_doc_in_loaded_catalogs(self, doc_id: str) -> CatalogStore | None:
         cached_key = self._doc_catalog_index.get(doc_id)
@@ -606,7 +676,7 @@ class AppService:
         return doc, catalog
 
     def _resolve_doc(
-        self, doc_id: str | None, path: str | None
+        self, doc_id: str | None, path: str | None, root: str | None = None
     ) -> tuple[DocumentRecord, CatalogStore]:
         if path:
             resolved_path = Path(path).expanduser().resolve()
@@ -617,7 +687,8 @@ class AppService:
                     details={"doc_id": doc_id, "path": str(resolved_path)},
                 )
             doc_type = self._doc_type_from_path(resolved_path)
-            catalog = self._catalog_for_document_path(resolved_path)
+            root_path = self._library_root_for_path(resolved_path, root)
+            catalog = self._catalog_for_library_root(root_path)
             doc = catalog.get_document_by_path(str(resolved_path))
             if doc:
                 self._bind_doc_catalog(doc.doc_id, catalog)
@@ -657,6 +728,17 @@ class AppService:
             return doc, catalog
 
         if doc_id:
+            if root is not None:
+                catalog = self._catalog_for_library_root(root)
+                doc = catalog.get_document_by_id(doc_id)
+                if doc is None:
+                    raise AppError(
+                        ErrorCode.INGEST_DOC_NOT_FOUND,
+                        "Document not found by doc_id under selected library root",
+                        details={"doc_id": doc_id, "root": str(Path(root).resolve())},
+                    )
+                self._bind_doc_catalog(doc.doc_id, catalog)
+                return doc, catalog
             return self._require_doc(
                 doc_id,
                 error_code=ErrorCode.INGEST_DOC_NOT_FOUND,
@@ -782,6 +864,7 @@ class AppService:
     ) -> dict[str, Any]:
         chunks = catalog.list_chunks(doc.doc_id)
         pdf_parser_lanes = doc.metadata.get("pdf_parser_lanes")
+        pdf_parse_phase_seconds = doc.metadata.get("pdf_parse_phase_seconds")
         return {
             "doc_id": doc.doc_id,
             "profile": doc.profile,
@@ -797,6 +880,11 @@ class AppService:
             **(
                 {"pdf_parser_lanes": pdf_parser_lanes}
                 if isinstance(pdf_parser_lanes, dict)
+                else {}
+            ),
+            **(
+                {"pdf_parse_phase_seconds": pdf_parse_phase_seconds}
+                if isinstance(pdf_parse_phase_seconds, dict)
                 else {}
             ),
         }
@@ -964,13 +1052,21 @@ class AppService:
         }
 
     def _reingest_hint(self, doc: DocumentRecord) -> str:
+        call = self._reingest_call(doc)
+        tool_name = call["tool"]
+        return f"Run {tool_name}(doc_id='{doc.doc_id}', force=true) to refresh persisted artifacts."
+
+    def _reingest_call(self, doc: DocumentRecord) -> dict[str, Any]:
         if doc.type == DocumentType.EPUB:
             tool_name = "document_ingest_epub_book"
         elif doc.profile == Profile.PAPER:
             tool_name = "document_ingest_pdf_paper"
         else:
             tool_name = "document_ingest_pdf_book"
-        return f"Run {tool_name}(doc_id='{doc.doc_id}', force=true) to refresh persisted artifacts."
+        return {
+            "tool": tool_name,
+            "args": {"doc_id": doc.doc_id, "force": True},
+        }
 
     def _serialize_ingest_job(self, job: IngestJobRecord) -> dict[str, Any]:
         return {
@@ -1108,6 +1204,7 @@ class AppService:
     def _capture_input_payload(self, kwargs: dict[str, Any]) -> dict[str, Any]:
         payload: dict[str, Any] = {}
         for key in (
+            "root",
             "doc_id",
             "doc_ids",
             "node_id",
@@ -1146,6 +1243,7 @@ class AppService:
 
     def _returned_ids(self, result: Any) -> dict[str, list[str]]:
         buckets = {
+            "node_ids": set(),
             "chunk_ids": set(),
             "formula_ids": set(),
             "image_ids": set(),
@@ -1153,6 +1251,7 @@ class AppService:
             "figure_ids": set(),
         }
         key_to_bucket = {
+            "node_id": "node_ids",
             "chunk_id": "chunk_ids",
             "formula_id": "formula_ids",
             "image_id": "image_ids",
@@ -1244,18 +1343,13 @@ class AppService:
             return output
 
     def _read_reading_session_events(
-        self, root: str, limit: int
+        self, root: str | Path | None, limit: int
     ) -> list[dict[str, Any]]:
         if limit <= 0:
             return []
-        root_path = Path(root).expanduser().resolve()
-        self._discover_sidecar_catalogs(str(root_path))
+        catalogs = self._discover_sidecar_catalogs(root)
         events: list[dict[str, Any]] = []
-        for catalog in self._catalogs.values():
-            try:
-                catalog.db_path.resolve().relative_to(root_path)
-            except ValueError:
-                continue
+        for catalog in catalogs:
             log_path = self._reading_session_log_path(catalog)
             if not log_path.exists():
                 continue
@@ -1269,12 +1363,13 @@ class AppService:
     def eval_export_reading_sessions(
         self,
         *,
-        root: str,
+        root: str | None = None,
         limit: int = 500,
     ) -> dict[str, Any]:
-        events = self._read_reading_session_events(root, limit)
+        root_path = self._resolve_library_root(root)
+        events = self._read_reading_session_events(root_path, limit)
         return {
-            "root": str(Path(root).expanduser().resolve()),
+            "root": str(root_path),
             "capture_enabled": self._reading_capture_enabled(),
             "query_capture_enabled": self._reading_capture_include_query(),
             "events_count": len(events),
@@ -1288,39 +1383,83 @@ class AppService:
     def eval_replay_reading_sessions(
         self,
         *,
-        root: str,
+        root: str | None = None,
         limit: int = 100,
     ) -> dict[str, Any]:
-        events = self._read_reading_session_events(root, limit)
+        root_path = self._resolve_library_root(root)
+        events = self._read_reading_session_events(root_path, limit)
         replayed: list[dict[str, Any]] = []
         skipped: list[dict[str, Any]] = []
         for event in events:
             tool_name = event.get("tool_name")
             event_input = event.get("input") or {}
             query = event_input.get("query")
-            if tool_name not in {"search", "search_in_outline_node"} or not query:
+            if tool_name not in {
+                "library_explore",
+                "document_explore",
+                "search",
+                "search_in_outline_node",
+            }:
                 skipped.append(
                     {
                         "event_id": event.get("event_id"),
                         "tool_name": tool_name,
-                        "reason": "not_replayable_without_captured_query",
+                        "reason": "tool_not_replayable",
                     }
                 )
                 continue
 
-            if tool_name == "search":
-                current = self.search(
-                    query=query,
-                    doc_ids=event_input.get("doc_ids"),
-                    top_k=int(event_input.get("top_k") or 20),
+            if not query:
+                skipped.append(
+                    {
+                        "event_id": event.get("event_id"),
+                        "tool_name": tool_name,
+                        "reason": "query_not_captured",
+                    }
                 )
-            else:
-                current = self.search_in_outline_node(
-                    doc_id=event_input["doc_id"],
-                    node_id=event_input["node_id"],
-                    query=query,
-                    top_k=int(event_input.get("top_k") or 20),
+                continue
+
+            try:
+                if tool_name == "library_explore":
+                    replay_root = event_input.get("root")
+                    if not isinstance(replay_root, str) or not replay_root:
+                        raise ValueError(
+                            "library_explore replay requires captured root"
+                        )
+                    current = self.library_explore(
+                        root=replay_root,
+                        query=query,
+                        top_k=int(event_input.get("top_k") or 12),
+                    )
+                elif tool_name == "document_explore":
+                    current = self.document_explore(
+                        doc_id=event_input["doc_id"],
+                        query=query,
+                        top_k=int(event_input.get("top_k") or 8),
+                    )
+                elif tool_name == "search":
+                    current = self.search(
+                        query=query,
+                        doc_ids=event_input.get("doc_ids"),
+                        top_k=int(event_input.get("top_k") or 20),
+                    )
+                else:
+                    current = self.search_in_outline_node(
+                        doc_id=event_input["doc_id"],
+                        node_id=event_input["node_id"],
+                        query=query,
+                        top_k=int(event_input.get("top_k") or 20),
+                    )
+            except Exception as exc:  # noqa: BLE001
+                skipped.append(
+                    {
+                        "event_id": event.get("event_id"),
+                        "tool_name": tool_name,
+                        "reason": "replay_failed",
+                        "error": to_error_payload(exc),
+                    }
                 )
+                continue
             current_ids = self._returned_ids(current)
             original_ids = event.get("returned_ids") or {}
             replayed.append(
@@ -1334,7 +1473,7 @@ class AppService:
             )
 
         return {
-            "root": str(Path(root).expanduser().resolve()),
+            "root": str(root_path),
             "events_count": len(events),
             "replayed_count": len(replayed),
             "skipped_count": len(skipped),
@@ -1442,7 +1581,7 @@ class AppService:
                 status="ok",
                 details={
                     "backend": "sqlite_fts5",
-                    "scope": "per-document-folder sidecar",
+                    "scope": "library-root sidecar",
                 },
             )
         )
@@ -1606,17 +1745,18 @@ class AppService:
     ) -> None:
         if progress is None and stage is not None:
             progress = self._ingest_progress(stage=stage, message=message)
-        catalog.update_ingest_job(
-            job_id,
-            status=status,
-            stage=stage,
-            message=message,
-            progress=progress,
-            result=result,
-            error=error,
-            started_at=started_at,
-            finished_at=finished_at,
-        )
+        with self._ingest_lock:
+            catalog.update_ingest_job(
+                job_id,
+                status=status,
+                stage=stage,
+                message=message,
+                progress=progress,
+                result=result,
+                error=error,
+                started_at=started_at,
+                finished_at=finished_at,
+            )
 
     def _submit_ingest_job(
         self,
@@ -1638,59 +1778,60 @@ class AppService:
                     "supported_doc_types": [expected_doc_type],
                 },
             )
-        active = catalog.get_active_ingest_job(doc.doc_id)
-        if active is not None and active.profile == profile:
-            return self._ingest_job_payload(active, deduplicated=True)
+        with self._ingest_lock:
+            active = catalog.get_active_ingest_job(doc.doc_id)
+            if active is not None and active.profile == profile:
+                return self._ingest_job_payload(active, deduplicated=True)
 
-        if (
-            doc.status == DocumentStatus.READY
-            and not force
-            and doc.profile == profile
-            and not self._document_pipeline_status(doc)["is_stale"]
-        ):
+            if (
+                doc.status == DocumentStatus.READY
+                and not force
+                and doc.profile == profile
+                and not self._document_pipeline_status(doc)["is_stale"]
+            ):
+                now = self._now_iso()
+                message = "Cached READY document reused; no ingest work was scheduled."
+                job = IngestJobRecord(
+                    job_id=uuid4().hex,
+                    doc_id=doc.doc_id,
+                    path=doc.path,
+                    profile=profile,
+                    status=IngestJobStatus.SUCCEEDED,
+                    stage=IngestStage.CACHED,
+                    force=force,
+                    message=message,
+                    progress=self._ingest_progress(
+                        stage=IngestStage.CACHED,
+                        message=message,
+                    ),
+                    result=self._ingest_result_from_doc(doc, catalog),
+                    created_at=now,
+                    updated_at=now,
+                    started_at=now,
+                    finished_at=now,
+                )
+                catalog.create_ingest_job(job)
+                return self._ingest_job_payload(job, cached=True)
+
             now = self._now_iso()
-            message = "Cached READY document reused; no ingest work was scheduled."
+            message = f"{ingest_mode} queued for background execution."
             job = IngestJobRecord(
                 job_id=uuid4().hex,
                 doc_id=doc.doc_id,
                 path=doc.path,
                 profile=profile,
-                status=IngestJobStatus.SUCCEEDED,
-                stage=IngestStage.CACHED,
+                status=IngestJobStatus.QUEUED,
+                stage=IngestStage.QUEUED,
                 force=force,
                 message=message,
                 progress=self._ingest_progress(
-                    stage=IngestStage.CACHED,
+                    stage=IngestStage.QUEUED,
                     message=message,
                 ),
-                result=self._ingest_result_from_doc(doc, catalog),
                 created_at=now,
                 updated_at=now,
-                started_at=now,
-                finished_at=now,
             )
             catalog.create_ingest_job(job)
-            return self._ingest_job_payload(job, cached=True)
-
-        now = self._now_iso()
-        message = f"{ingest_mode} queued for background execution."
-        job = IngestJobRecord(
-            job_id=uuid4().hex,
-            doc_id=doc.doc_id,
-            path=doc.path,
-            profile=profile,
-            status=IngestJobStatus.QUEUED,
-            stage=IngestStage.QUEUED,
-            force=force,
-            message=message,
-            progress=self._ingest_progress(
-                stage=IngestStage.QUEUED,
-                message=message,
-            ),
-            created_at=now,
-            updated_at=now,
-        )
-        catalog.create_ingest_job(job)
         catalog_key = self._catalog_key(catalog)
         self._ingest_queue.put(
             _IngestQueueItem(
@@ -1859,15 +2000,10 @@ class AppService:
             },
         )
 
-    def library_scan(self, root: str, patterns: list[str]) -> dict[str, Any]:
+    def library_scan(self, root: str | None, patterns: list[str]) -> dict[str, Any]:
         scan_started = time.perf_counter()
-        root_path = Path(root).expanduser().resolve()
-        if not root_path.exists() or not root_path.is_dir():
-            raise AppError(
-                ErrorCode.SCAN_INVALID_ROOT,
-                f"Invalid scan root: {root}",
-            )
-        self._register_root(root_path)
+        root_path = self._resolve_library_root(root)
+        root_catalog = self._catalog_for_library_root(root_path)
 
         found_paths: set[str] = set()
         found_paths_by_catalog: dict[str, set[str]] = defaultdict(set)
@@ -1875,11 +2011,7 @@ class AppService:
         updated: list[dict[str, Any]] = []
         unchanged_count = 0
         candidate_paths: list[Path] = []
-        for existing_catalog in self._discover_sidecar_catalogs(str(root_path)):
-            found_paths_by_catalog.setdefault(
-                self._catalog_key(existing_catalog),
-                set(),
-            )
+        found_paths_by_catalog.setdefault(self._catalog_key(root_catalog), set())
 
         for pattern in patterns:
             for path in sorted(root_path.glob(pattern)):
@@ -1917,61 +2049,63 @@ class AppService:
             scanned_documents.sort(key=lambda item: str(item["path"]))
         hash_seconds = time.perf_counter() - hash_started
 
-        for scanned in scanned_documents:
-            path_obj = scanned["path_obj"]
-            abs_path = str(scanned["path"])
-            catalog = self._catalog_for_document_path(path_obj)
-            found_paths_by_catalog[self._catalog_key(catalog)].add(abs_path)
-
-            doc = DocumentRecord(
-                doc_id=str(scanned["doc_id"]),
-                path=abs_path,
-                type=scanned["type"],
-                sha256=str(scanned["sha256"]),
-                mtime=float(scanned["mtime"]),
-            )
-            state = catalog.upsert_scanned_document(doc)
-            self._bind_doc_catalog(doc.doc_id, catalog)
-            payload = {
-                "doc_id": doc.doc_id,
-                "path": abs_path,
-                "sha256": doc.sha256,
-                "mtime": doc.mtime,
-                "type": doc.type,
-            }
-            if state == "added":
-                added.append(payload)
-            elif state == "updated":
-                updated.append(payload)
-            else:
-                unchanged_count += 1
-
         removed: list[str] = []
         removed_deleted_count = 0
         maintenance_rows: list[dict[str, Any]] = []
-        for catalog_key, paths in found_paths_by_catalog.items():
-            catalog = self._catalogs[catalog_key]
-            known = set(catalog.list_document_paths_under_root(str(root_path)))
-            removed_paths = sorted(list(known - paths))
-            if removed_paths:
-                for removed_path in removed_paths:
-                    removed_doc = catalog.get_document_by_path(removed_path)
-                    if removed_doc is not None:
-                        self._doc_catalog_index.pop(removed_doc.doc_id, None)
-                        shutil.rmtree(
-                            catalog.db_path.parent / "docs" / removed_doc.doc_id,
-                            ignore_errors=True,
-                        )
-                removed_deleted_count += catalog.delete_documents_by_paths(
-                    removed_paths
+        with self._ingest_lock:
+            for scanned in scanned_documents:
+                path_obj = scanned["path_obj"]
+                abs_path = str(scanned["path"])
+                self._ensure_path_under_root(path_obj, root_path)
+                catalog = root_catalog
+                found_paths_by_catalog[self._catalog_key(catalog)].add(abs_path)
+
+                doc = DocumentRecord(
+                    doc_id=str(scanned["doc_id"]),
+                    path=abs_path,
+                    type=scanned["type"],
+                    sha256=str(scanned["sha256"]),
+                    mtime=float(scanned["mtime"]),
                 )
-                removed.extend(removed_paths)
-            maintenance_rows.append(
-                {
-                    "catalog_path": str(catalog.db_path),
-                    "db_size_bytes": catalog.db_size_bytes(),
+                state = catalog.upsert_scanned_document(doc)
+                self._bind_doc_catalog(doc.doc_id, catalog)
+                payload = {
+                    "doc_id": doc.doc_id,
+                    "path": abs_path,
+                    "sha256": doc.sha256,
+                    "mtime": doc.mtime,
+                    "type": doc.type,
                 }
-            )
+                if state == "added":
+                    added.append(payload)
+                elif state == "updated":
+                    updated.append(payload)
+                else:
+                    unchanged_count += 1
+
+            for catalog_key, paths in found_paths_by_catalog.items():
+                catalog = self._catalogs[catalog_key]
+                known = set(catalog.list_document_paths_under_root(str(root_path)))
+                removed_paths = sorted(list(known - paths))
+                if removed_paths:
+                    for removed_path in removed_paths:
+                        removed_doc = catalog.get_document_by_path(removed_path)
+                        if removed_doc is not None:
+                            self._doc_catalog_index.pop(removed_doc.doc_id, None)
+                            shutil.rmtree(
+                                catalog.db_path.parent / "docs" / removed_doc.doc_id,
+                                ignore_errors=True,
+                            )
+                    removed_deleted_count += catalog.delete_documents_by_paths(
+                        removed_paths
+                    )
+                    removed.extend(removed_paths)
+                maintenance_rows.append(
+                    {
+                        "catalog_path": str(catalog.db_path),
+                        "db_size_bytes": catalog.db_size_bytes(),
+                    }
+                )
 
         return {
             "added": added,
@@ -2325,10 +2459,10 @@ class AppService:
             )
         config = {
             "enable_docling_formula_enrichment": bool(
-                getattr(self.pdf_parser, "enable_docling_formula_enrichment", True)
+                getattr(self.pdf_parser, "enable_docling_formula_enrichment", False)
             ),
             "require_formula_engine": bool(
-                getattr(self.pdf_parser, "require_formula_engine", True)
+                getattr(self.pdf_parser, "require_formula_engine", False)
             ),
             "formula_batch_size": int(formula_batch_size or 1),
             "performance_config": performance_config.model_dump(mode="json"),
@@ -2514,6 +2648,15 @@ class AppService:
             **self._parsed_text_summary(parsed),
             "pages": parsed.metadata.get("pages"),
             "formula_markers_total": parsed.metadata.get("formula_markers_total"),
+            "formula_replaced_by_docling_text": parsed.metadata.get(
+                "formula_replaced_by_docling_text"
+            ),
+            "formula_replaced_by_pix2text": parsed.metadata.get(
+                "formula_replaced_by_pix2text"
+            ),
+            "docling_formula_text_candidates_total": parsed.metadata.get(
+                "docling_formula_text_candidates_total"
+            ),
             "formula_unresolved": parsed.metadata.get("formula_unresolved"),
             "tables": parsed.metadata.get("pdf_tables_count"),
             "figures": parsed.metadata.get("pdf_figures_count"),
@@ -3360,6 +3503,18 @@ class AppService:
                     if isinstance(parsed.metadata.get("pdf_parser_lanes"), dict)
                     else {}
                 ),
+                **(
+                    {
+                        "pdf_parse_phase_seconds": parsed.metadata[
+                            "pdf_parse_phase_seconds"
+                        ]
+                    }
+                    if isinstance(
+                        parsed.metadata.get("pdf_parse_phase_seconds"),
+                        dict,
+                    )
+                    else {}
+                ),
             }
         except Exception:
             shutil.rmtree(staging_workspace_dir, ignore_errors=True)
@@ -3532,9 +3687,14 @@ class AppService:
         }
 
     def document_ingest_pdf_book(
-        self, *, doc_id: str | None, path: str | None, force: bool
+        self,
+        *,
+        doc_id: str | None = None,
+        path: str | None = None,
+        root: str | None = None,
+        force: bool = False,
     ) -> dict[str, Any]:
-        doc, catalog = self._resolve_doc(doc_id, path)
+        doc, catalog = self._resolve_doc(doc_id, path, root)
         return self._submit_ingest_job(
             doc=doc,
             catalog=catalog,
@@ -3582,9 +3742,14 @@ class AppService:
         }
 
     def document_ingest_epub_book(
-        self, *, doc_id: str | None, path: str | None, force: bool
+        self,
+        *,
+        doc_id: str | None = None,
+        path: str | None = None,
+        root: str | None = None,
+        force: bool = False,
     ) -> dict[str, Any]:
-        doc, catalog = self._resolve_doc(doc_id, path)
+        doc, catalog = self._resolve_doc(doc_id, path, root)
         return self._submit_ingest_job(
             doc=doc,
             catalog=catalog,
@@ -3595,9 +3760,14 @@ class AppService:
         )
 
     def document_ingest_pdf_paper(
-        self, *, doc_id: str | None, path: str | None, force: bool
+        self,
+        *,
+        doc_id: str | None = None,
+        path: str | None = None,
+        root: str | None = None,
+        force: bool = False,
     ) -> dict[str, Any]:
-        doc, catalog = self._resolve_doc(doc_id, path)
+        doc, catalog = self._resolve_doc(doc_id, path, root)
         return self._submit_ingest_job(
             doc=doc,
             catalog=catalog,
@@ -4013,9 +4183,10 @@ class AppService:
         return {key: value for key, value in bucket.items() if not key.startswith("_")}
 
     def library_explore(
-        self, *, root: str, query: str, top_k: int = 12
+        self, *, root: str | None = None, query: str, top_k: int = 12
     ) -> dict[str, Any]:
-        catalogs = self._discover_sidecar_catalogs(root)
+        root_path = self._resolve_library_root(root)
+        catalogs = self._discover_sidecar_catalogs(root_path)
         selected_limit = max(1, min(top_k, 50))
         search_limit = max(selected_limit * 4, 40)
         doc_catalogs: dict[str, tuple[DocumentRecord, CatalogStore]] = {}
@@ -4029,6 +4200,7 @@ class AppService:
             for doc in docs:
                 doc_catalogs[doc.doc_id] = (doc, catalog)
                 if doc.status != DocumentStatus.READY:
+                    suggested_next_call = self._reingest_call(doc)
                     unready_documents.append(
                         {
                             "doc_id": doc.doc_id,
@@ -4037,10 +4209,7 @@ class AppService:
                             "profile": doc.profile,
                             "status": doc.status,
                             "path": doc.path,
-                            "suggested_next_call": {
-                                "tool": self._reingest_hint(doc).get("tool"),
-                                "args": self._reingest_hint(doc).get("args"),
-                            },
+                            "suggested_next_call": suggested_next_call,
                         }
                     )
             all_hits.extend(
@@ -4201,7 +4370,7 @@ class AppService:
             )
 
         return {
-            "root": str(Path(root).expanduser().resolve()),
+            "root": str(root_path),
             "query": query,
             "documents": sorted(
                 [
@@ -4214,7 +4383,7 @@ class AppService:
             "selected_results": selected_results,
             "hits": hits,
             "retrieval": {
-                "mode": "cross_sidecar_sqlite_fts5_plus_document_graph",
+                "mode": "root_sidecar_sqlite_fts5_plus_document_graph",
                 "sidecars_count": len(catalogs),
                 "searched_documents_count": searched_documents_count,
                 "hits_count": len(all_hits),
@@ -4228,7 +4397,7 @@ class AppService:
                 "next_call": {
                     "tool": "library_explore",
                     "args": {
-                        "root": str(Path(root).expanduser().resolve()),
+                        "root": str(root_path),
                         "query": query,
                         "top_k": min(selected_limit * 2, 50),
                     },
@@ -5646,32 +5815,21 @@ class AppService:
             "page": page,
         }
 
-    def _discover_sidecar_catalogs(self, root: str) -> list[CatalogStore]:
-        root_path = Path(root).expanduser().resolve()
-        if not root_path.exists() or not root_path.is_dir():
-            raise AppError(
-                ErrorCode.SCAN_INVALID_ROOT,
-                f"Invalid scan root: {root}",
-            )
-        self._register_root(root_path)
+    def _discover_sidecar_catalogs(
+        self, root: str | Path | None = None
+    ) -> list[CatalogStore]:
+        root_path = self._resolve_library_root(root)
+        sidecar_dir = root_path / self.sidecar_dir_name
+        db_path = sidecar_dir / "catalog.db"
+        if not db_path.exists():
+            return []
+        return [self._get_or_create_catalog(sidecar_dir)]
 
-        catalogs: list[CatalogStore] = []
-        seen: set[str] = set()
-        for sidecar_dir in root_path.rglob(self.sidecar_dir_name):
-            if not sidecar_dir.is_dir():
-                continue
-            db_path = sidecar_dir / "catalog.db"
-            if not db_path.exists():
-                continue
-            key = str(db_path.resolve())
-            if key in seen:
-                continue
-            seen.add(key)
-            catalogs.append(self._get_or_create_catalog(sidecar_dir))
-        return catalogs
-
-    def storage_list_sidecars(self, *, root: str, limit: int) -> dict[str, Any]:
-        catalogs = self._discover_sidecar_catalogs(root)
+    def storage_list_sidecars(
+        self, *, root: str | None = None, limit: int
+    ) -> dict[str, Any]:
+        root_path = self._resolve_library_root(root)
+        catalogs = self._discover_sidecar_catalogs(root_path)
         max_items = max(1, min(limit, 1000))
         items: list[dict[str, Any]] = []
         total_docs = 0
@@ -5715,7 +5873,7 @@ class AppService:
                 }
             )
         return {
-            "root": str(Path(root).expanduser().resolve()),
+            "root": str(root_path),
             "sidecars_count": len(catalogs),
             "documents_count": total_docs,
             "sidecars": sorted(items, key=lambda item: item["sidecar_path"]),
@@ -5728,14 +5886,15 @@ class AppService:
         path: str | None,
         remove_artifacts: bool,
     ) -> dict[str, Any]:
-        doc, catalog = self._resolve_doc(doc_id, path)
-        deleted_records = catalog.delete_documents_by_paths([doc.path])
-        self._doc_catalog_index.pop(doc.doc_id, None)
-        workspace_dir = catalog.db_path.parent / "docs" / doc.doc_id
-        artifacts_removed = False
-        if remove_artifacts:
-            shutil.rmtree(workspace_dir, ignore_errors=True)
-            artifacts_removed = not workspace_dir.exists()
+        with self._ingest_lock:
+            doc, catalog = self._resolve_doc(doc_id, path)
+            deleted_records = catalog.delete_documents_by_paths([doc.path])
+            self._doc_catalog_index.pop(doc.doc_id, None)
+            workspace_dir = catalog.db_path.parent / "docs" / doc.doc_id
+            artifacts_removed = False
+            if remove_artifacts:
+                shutil.rmtree(workspace_dir, ignore_errors=True)
+                artifacts_removed = not workspace_dir.exists()
         return {
             "doc_id": doc.doc_id,
             "path": doc.path,
@@ -5746,87 +5905,91 @@ class AppService:
     def storage_cleanup_sidecars(
         self,
         *,
-        root: str,
-        remove_missing_documents: bool,
-        remove_orphan_artifacts: bool,
-        compact_catalog: bool,
+        root: str | None = None,
+        remove_missing_documents: bool = True,
+        remove_orphan_artifacts: bool = True,
+        compact_catalog: bool = True,
     ) -> dict[str, Any]:
-        catalogs = self._discover_sidecar_catalogs(root)
+        root_path = self._resolve_library_root(root)
         sidecar_rows: list[dict[str, Any]] = []
         removed_paths_total: list[str] = []
         removed_docs_total = 0
         removed_artifacts_total = 0
         reclaimed_bytes_total = 0
 
-        for catalog in catalogs:
-            docs = catalog.list_documents()
-            for doc in docs:
-                self._bind_doc_catalog(doc.doc_id, catalog)
-            docs_by_id = {doc.doc_id: doc for doc in docs}
-            sidecar_root = catalog.db_path.parent
-            removed_paths: list[str] = []
-            removed_doc_ids: list[str] = []
-            if remove_missing_documents:
+        with self._ingest_lock:
+            catalogs = self._discover_sidecar_catalogs(root_path)
+            for catalog in catalogs:
+                docs = catalog.list_documents()
                 for doc in docs:
-                    if not Path(doc.path).exists():
-                        removed_paths.append(doc.path)
-                        removed_doc_ids.append(doc.doc_id)
+                    self._bind_doc_catalog(doc.doc_id, catalog)
+                docs_by_id = {doc.doc_id: doc for doc in docs}
+                sidecar_root = catalog.db_path.parent
+                removed_paths: list[str] = []
+                removed_doc_ids: list[str] = []
+                if remove_missing_documents:
+                    for doc in docs:
+                        if not Path(doc.path).exists():
+                            removed_paths.append(doc.path)
+                            removed_doc_ids.append(doc.doc_id)
 
-            removed_deleted_count = 0
-            if removed_paths:
-                removed_deleted_count = catalog.delete_documents_by_paths(removed_paths)
-                for doc_id_item in removed_doc_ids:
-                    self._doc_catalog_index.pop(doc_id_item, None)
-                    shutil.rmtree(
-                        sidecar_root / "docs" / doc_id_item,
-                        ignore_errors=True,
+                removed_deleted_count = 0
+                if removed_paths:
+                    removed_deleted_count = catalog.delete_documents_by_paths(
+                        removed_paths
                     )
-                removed_paths_total.extend(removed_paths)
-                removed_docs_total += removed_deleted_count
+                    for doc_id_item in removed_doc_ids:
+                        self._doc_catalog_index.pop(doc_id_item, None)
+                        shutil.rmtree(
+                            sidecar_root / "docs" / doc_id_item,
+                            ignore_errors=True,
+                        )
+                    removed_paths_total.extend(removed_paths)
+                    removed_docs_total += removed_deleted_count
 
-            orphan_artifacts_deleted = 0
-            docs_dir = sidecar_root / "docs"
-            if remove_orphan_artifacts and docs_dir.exists():
-                live_doc_ids = {doc.doc_id for doc in catalog.list_documents()}
-                for candidate in docs_dir.iterdir():
-                    if not candidate.is_dir():
-                        continue
-                    if candidate.name in live_doc_ids:
-                        continue
-                    shutil.rmtree(candidate, ignore_errors=True)
-                    orphan_artifacts_deleted += 1
-                    removed_artifacts_total += 1
+                orphan_artifacts_deleted = 0
+                docs_dir = sidecar_root / "docs"
+                if remove_orphan_artifacts and docs_dir.exists():
+                    live_doc_ids = {doc.doc_id for doc in catalog.list_documents()}
+                    for candidate in docs_dir.iterdir():
+                        if not candidate.is_dir():
+                            continue
+                        if candidate.name in live_doc_ids:
+                            continue
+                        shutil.rmtree(candidate, ignore_errors=True)
+                        orphan_artifacts_deleted += 1
+                        removed_artifacts_total += 1
 
-            compact_info: dict[str, Any] = {
-                "requested": compact_catalog,
-                "performed": False,
-                "before_bytes": catalog.db_size_bytes(),
-                "after_bytes": catalog.db_size_bytes(),
-                "reclaimed_bytes": 0,
-            }
-            if compact_catalog:
-                compact_stats = catalog.compact()
-                compact_info = {
-                    "requested": True,
-                    "performed": True,
-                    **compact_stats,
+                compact_info: dict[str, Any] = {
+                    "requested": compact_catalog,
+                    "performed": False,
+                    "before_bytes": catalog.db_size_bytes(),
+                    "after_bytes": catalog.db_size_bytes(),
+                    "reclaimed_bytes": 0,
                 }
-                reclaimed_bytes_total += int(compact_info["reclaimed_bytes"])
+                if compact_catalog:
+                    compact_stats = catalog.compact()
+                    compact_info = {
+                        "requested": True,
+                        "performed": True,
+                        **compact_stats,
+                    }
+                    reclaimed_bytes_total += int(compact_info["reclaimed_bytes"])
 
-            sidecar_rows.append(
-                {
-                    "sidecar_path": str(sidecar_root),
-                    "catalog_path": str(catalog.db_path),
-                    "documents_before": len(docs_by_id),
-                    "removed_deleted_count": removed_deleted_count,
-                    "removed_paths": sorted(removed_paths),
-                    "orphan_artifacts_deleted": orphan_artifacts_deleted,
-                    "compact": compact_info,
-                }
-            )
+                sidecar_rows.append(
+                    {
+                        "sidecar_path": str(sidecar_root),
+                        "catalog_path": str(catalog.db_path),
+                        "documents_before": len(docs_by_id),
+                        "removed_deleted_count": removed_deleted_count,
+                        "removed_paths": sorted(removed_paths),
+                        "orphan_artifacts_deleted": orphan_artifacts_deleted,
+                        "compact": compact_info,
+                    }
+                )
 
         return {
-            "root": str(Path(root).expanduser().resolve()),
+            "root": str(root_path),
             "sidecars_count": len(catalogs),
             "removed_deleted_count": removed_docs_total,
             "removed_paths": sorted(set(removed_paths_total)),

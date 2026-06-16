@@ -1,4 +1,4 @@
-"""PDF parser using Docling for structure and Pix2Text for formula recovery."""
+"""PDF parser using Docling structure plus formula text/provenance recovery."""
 
 from __future__ import annotations
 
@@ -33,6 +33,7 @@ from mcp_ebook_read.schema.models import (
 
 _FORMULA_MARKER = "<!-- formula-not-decoded -->"
 _DOCLING_LATEX_SOURCE = "docling_latex"
+_DOCLING_FORMULA_TEXT_SOURCE = "docling_formula_text"
 _DOCLING_LATEX_BLOCK_PATTERN = re.compile(r"\$\$(.*?)\$\$", re.DOTALL)
 _MAX_HEADING_LENGTH = 160
 _CODE_LIKE_TOKENS = ("def ", "class ", "return ", "import ", "while ", "for ")
@@ -77,6 +78,7 @@ class _FormulaCandidate:
 class _FormulaReplacementStats:
     markers_total: int = 0
     extracted_by_docling_latex: int = 0
+    replaced_by_docling_text: int = 0
     replaced_by_engine: int = 0
     replaced_by_fallback: int = 0
     unresolved: int = 0
@@ -396,6 +398,54 @@ def _coerce_bbox(position: Any) -> list[float] | None:
     return [min(xs), min(ys), max(xs), max(ys)]
 
 
+def _bbox_object_to_list(bbox: Any) -> list[float] | None:
+    try:
+        return [
+            float(getattr(bbox, "l")),
+            float(getattr(bbox, "t")),
+            float(getattr(bbox, "r")),
+            float(getattr(bbox, "b")),
+        ]
+    except (TypeError, ValueError, AttributeError):
+        return None
+
+
+def _extract_docling_formula_text_candidates(document: Any) -> list[_FormulaCandidate]:
+    iterate_items = getattr(document, "iterate_items", None)
+    if not callable(iterate_items):
+        return []
+
+    candidates: list[_FormulaCandidate] = []
+    for raw_item in iterate_items():
+        item = raw_item[0] if isinstance(raw_item, tuple) and raw_item else raw_item
+        label = str(getattr(item, "label", "") or "").lower()
+        if "formula" not in label and type(item).__name__.lower() != "formulaitem":
+            continue
+
+        text = _sanitize_text(
+            str(getattr(item, "text", "") or getattr(item, "orig", "") or "")
+        )
+        if not text:
+            continue
+
+        prov = list(getattr(item, "prov", []) or [])
+        first_prov = prov[0] if prov else None
+        try:
+            page = int(getattr(first_prov, "page_no", 1) or 1)
+        except (TypeError, ValueError):
+            page = 1
+        candidates.append(
+            _FormulaCandidate(
+                latex=text,
+                page=page,
+                score=None,
+                bbox=_bbox_object_to_list(getattr(first_prov, "bbox", None)),
+                source=_DOCLING_FORMULA_TEXT_SOURCE,
+            )
+        )
+    return candidates
+
+
 def _configure_docling_runtime_logging() -> None:
     """Patch Docling table post-processing logging to avoid hot-path logger churn."""
 
@@ -559,8 +609,8 @@ class DoclingPdfParser:
     def __init__(
         self,
         *,
-        enable_docling_formula_enrichment: bool = True,
-        require_formula_engine: bool = True,
+        enable_docling_formula_enrichment: bool = False,
+        require_formula_engine: bool = False,
         formula_batch_size: int = 1,
         performance_config: PdfParserPerformanceConfig | None = None,
         enable_visual_images: bool = False,
@@ -981,6 +1031,9 @@ class DoclingPdfParser:
         pdf_doc: fitz.Document,
         formula_cache: dict[int, list[_FormulaCandidate]],
         formula_offsets: dict[int, int],
+        docling_formula_candidates: list[_FormulaCandidate],
+        docling_formula_offset: list[int],
+        try_pix2text: bool,
     ) -> tuple[str, _FormulaReplacementStats, list[_ResolvedFormula]]:
         stats = _FormulaReplacementStats(markers_total=text.count(_FORMULA_MARKER))
         if stats.markers_total == 0:
@@ -989,15 +1042,28 @@ class DoclingPdfParser:
         replaced = text
         formulas: list[_ResolvedFormula] = []
         for _ in range(stats.markers_total):
-            candidate = self._pop_formula_candidate(
-                pdf_doc=pdf_doc,
-                page_range=page_range,
-                formula_cache=formula_cache,
-                formula_offsets=formula_offsets,
-            )
+            candidate = None
+            if docling_formula_offset[0] < len(docling_formula_candidates):
+                candidate = docling_formula_candidates[docling_formula_offset[0]]
+                docling_formula_offset[0] += 1
+                stats.replaced_by_docling_text += 1
+            elif try_pix2text:
+                candidate = self._pop_formula_candidate(
+                    pdf_doc=pdf_doc,
+                    page_range=page_range,
+                    formula_cache=formula_cache,
+                    formula_offsets=formula_offsets,
+                )
+                if candidate is not None:
+                    stats.replaced_by_engine += 1
+
             if candidate is not None:
                 replacement = self._format_formula_candidate(candidate)
-                stats.replaced_by_engine += 1
+                status = (
+                    "fallback_text"
+                    if candidate.source == _DOCLING_FORMULA_TEXT_SOURCE
+                    else "resolved"
+                )
                 formulas.append(
                     _ResolvedFormula(
                         latex=candidate.latex,
@@ -1005,7 +1071,7 @@ class DoclingPdfParser:
                         bbox=candidate.bbox,
                         source=candidate.source,
                         confidence=candidate.score,
-                        status="resolved",
+                        status=status,
                     )
                 )
             else:
@@ -1123,6 +1189,11 @@ class DoclingPdfParser:
         formula_markers_total = sum(
             section.text.count(_FORMULA_MARKER) for section in sections
         )
+        docling_formula_text_candidates = (
+            _extract_docling_formula_text_candidates(document)
+            if formula_markers_total > 0
+            else []
+        )
         record_phase("split_sections_and_count_formula_markers", phase_started)
 
         if formula_markers_total > 0 and self.require_formula_engine:
@@ -1185,6 +1256,7 @@ class DoclingPdfParser:
 
             formula_cache: dict[int, list[_FormulaCandidate]] = {}
             formula_offsets: dict[int, int] = {}
+            docling_formula_offset = [0]
             formula_stats = _FormulaReplacementStats()
             enhanced_sections: list[_SectionBlock] = []
             section_formulas: list[list[_ResolvedFormula]] = []
@@ -1203,10 +1275,16 @@ class DoclingPdfParser:
                         pdf_doc=pdf_doc,
                         formula_cache=formula_cache,
                         formula_offsets=formula_offsets,
+                        docling_formula_candidates=docling_formula_text_candidates,
+                        docling_formula_offset=docling_formula_offset,
+                        try_pix2text=self.require_formula_engine,
                     )
                 )
                 formula_stats.markers_total += section_stats.markers_total
                 formula_stats.extracted_by_docling_latex += len(native_formulas)
+                formula_stats.replaced_by_docling_text += (
+                    section_stats.replaced_by_docling_text
+                )
                 formula_stats.replaced_by_engine += section_stats.replaced_by_engine
                 formula_stats.replaced_by_fallback += section_stats.replaced_by_fallback
                 formula_stats.unresolved += section_stats.unresolved
@@ -1294,7 +1372,9 @@ class DoclingPdfParser:
         record_phase("formula_record_assembly", phase_started)
 
         parser_chain = [self.method]
-        if formula_stats.markers_total > 0:
+        if formula_stats.replaced_by_docling_text:
+            parser_chain.append(_DOCLING_FORMULA_TEXT_SOURCE)
+        if formula_stats.replaced_by_engine:
             parser_chain.append(_FORMULA_SOURCE)
 
         phase_seconds["total"] = time.perf_counter() - parse_started
@@ -1310,15 +1390,26 @@ class DoclingPdfParser:
             "formula_extracted_by_docling_latex": (
                 formula_stats.extracted_by_docling_latex
             ),
+            "formula_replaced_by_docling_text": formula_stats.replaced_by_docling_text,
             "formula_replaced_by_pix2text": formula_stats.replaced_by_engine,
             "formula_replaced_by_fallback": formula_stats.replaced_by_fallback,
             "formula_unresolved": formula_stats.unresolved,
             "formula_records_total": len(formulas),
-            "formula_engine": _FORMULA_SOURCE if formula_stats.markers_total else None,
+            "formula_engine": (
+                _FORMULA_SOURCE
+                if formula_stats.replaced_by_engine
+                else _DOCLING_FORMULA_TEXT_SOURCE
+                if formula_stats.replaced_by_docling_text
+                else None
+            ),
             "formula_pages_rendered": len(formula_cache),
             "formula_candidates_total": formula_candidates_total,
+            "docling_formula_text_candidates_total": len(
+                docling_formula_text_candidates
+            ),
             "pdf_parse_phase_seconds": rounded_phase_seconds,
             "docling_formula_enrichment_enabled": self.enable_docling_formula_enrichment,
+            "pix2text_formula_fallback_enabled": self.require_formula_engine,
         }
         if (
             visual_extractor is not None

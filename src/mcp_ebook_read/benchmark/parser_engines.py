@@ -25,7 +25,6 @@ EPUB_SUFFIX = ".epub"
 SUPPORTED_SUFFIXES = {PDF_SUFFIX, EPUB_SUFFIX}
 ALL_ENGINES = (
     "project_pdf_docling",
-    "project_pdf_docling_no_formula",
     "docling_raw_pdf_no_formula",
     "project_epub_ebooklib",
     "pymupdf_pdf",
@@ -286,6 +285,7 @@ def _parsed_document_metrics(
                 "toc_nodes_raw",
                 "toc_nodes_clean",
                 "docling_formula_enrichment_enabled",
+                "formula_replaced_by_docling_text",
                 "formula_replaced_by_pix2text",
                 "formula_replaced_by_fallback",
                 "formula_records_total",
@@ -310,27 +310,6 @@ def _run_project_pdf_docling(
     from mcp_ebook_read.parsers.pdf_docling import DoclingPdfParser
 
     parser = DoclingPdfParser()
-    try:
-        parsed = parser.parse(str(path), f"bench-{_sha1_short(str(path))}")
-        return {
-            "status": "ok",
-            "metrics": _parsed_document_metrics(parsed, queries=queries),
-        }
-    finally:
-        parser.close()
-
-
-def _run_project_pdf_docling_no_formula(
-    path: Path, queries: list[str] | None = None
-) -> dict[str, Any]:
-    if path.suffix.lower() != PDF_SUFFIX:
-        return {"status": "skipped", "reason": "PDF-only engine"}
-    from mcp_ebook_read.parsers.pdf_docling import DoclingPdfParser
-
-    parser = DoclingPdfParser(
-        enable_docling_formula_enrichment=False,
-        require_formula_engine=False,
-    )
     try:
         parsed = parser.parse(str(path), f"bench-{_sha1_short(str(path))}")
         return {
@@ -550,7 +529,6 @@ def _run_epub_zip_lxml(path: Path, queries: list[str] | None = None) -> dict[str
 
 ENGINE_RUNNERS: dict[str, Callable[[Path, list[str] | None], dict[str, Any]]] = {
     "project_pdf_docling": _run_project_pdf_docling,
-    "project_pdf_docling_no_formula": _run_project_pdf_docling_no_formula,
     "docling_raw_pdf_no_formula": _run_docling_raw_pdf_no_formula,
     "project_epub_ebooklib": _run_project_epub_ebooklib,
     "pymupdf_pdf": _run_pymupdf_pdf,
