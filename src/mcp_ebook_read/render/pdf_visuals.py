@@ -23,8 +23,12 @@ from mcp_ebook_read.schema.models import (
 )
 
 
+_XML_INCOMPATIBLE_CONTROL_RE = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F]")
+
+
 def _normalize_text(value: str) -> str:
-    return " ".join(str(value).split()).strip()
+    safe_value = _XML_INCOMPATIBLE_CONTROL_RE.sub(" ", str(value))
+    return " ".join(safe_value.split()).strip()
 
 
 def _stringify_cell(value: Any) -> str:
@@ -53,6 +57,9 @@ def _render_markdown_table(
     *,
     caption: str | None = None,
 ) -> str:
+    caption = _normalize_text(caption) if caption else None
+    headers = [_normalize_text(header) for header in headers]
+    rows = [[_normalize_text(value) for value in row] for row in rows]
     column_count = max(len(headers), max((len(row) for row in rows), default=0))
     if column_count == 0:
         return caption or ""
@@ -81,6 +88,9 @@ def _render_html_table(
     *,
     caption: str | None = None,
 ) -> str:
+    caption = _normalize_text(caption) if caption else None
+    headers = [_normalize_text(header) for header in headers]
+    rows = [[_normalize_text(value) for value in row] for row in rows]
     column_count = max(len(headers), max((len(row) for row in rows), default=0))
     effective_headers = headers or [f"column_{idx + 1}" for idx in range(column_count)]
     if len(effective_headers) < column_count:

@@ -714,6 +714,19 @@ class CatalogStore:
         graph_edges: list[tuple[Any, ...]] = []
         artifact_rows: list[tuple[Any, ...]] = []
         diagnostic_rows: list[tuple[Any, ...]] = []
+        stable_ref_counts: dict[str, int] = {}
+        used_stable_refs: set[str] = set()
+
+        def unique_stable_ref(stable_ref: str) -> str:
+            count = stable_ref_counts.get(stable_ref, 0) + 1
+            stable_ref_counts[stable_ref] = count
+            candidate = stable_ref if count == 1 else f"{stable_ref}#dup-{count}"
+            while candidate in used_stable_refs:
+                count += 1
+                stable_ref_counts[stable_ref] = count
+                candidate = f"{stable_ref}#dup-{count}"
+            used_stable_refs.add(candidate)
+            return candidate
 
         def add_node(
             *,
@@ -725,17 +738,24 @@ class CatalogStore:
             metadata: dict[str, Any] | None = None,
             order_index: int | None = None,
         ) -> str:
-            node_id = self._graph_node_id(doc_id, kind, stable_ref)
+            effective_stable_ref = unique_stable_ref(stable_ref)
+            node_metadata = dict(metadata or {})
+            if effective_stable_ref != stable_ref:
+                node_metadata["original_stable_ref"] = stable_ref
+                node_metadata["stable_ref_collision_index"] = stable_ref_counts[
+                    stable_ref
+                ]
+            node_id = self._graph_node_id(doc_id, kind, effective_stable_ref)
             graph_nodes.append(
                 (
                     node_id,
                     doc_id,
                     kind,
-                    stable_ref,
+                    effective_stable_ref,
                     title,
                     text,
                     json.dumps(locator),
-                    json.dumps(metadata or {}),
+                    json.dumps(node_metadata),
                     order_index,
                     now,
                 )
@@ -1321,16 +1341,22 @@ class CatalogStore:
                 add_edge(node_id, chunk_node_id, "near")
 
         grobid_enrichment = doc.metadata.get("grobid_enrichment")
-        if (
-            isinstance(grobid_enrichment, dict)
-            and grobid_enrichment.get("status") == "skipped"
-        ):
-            add_diagnostic(
-                severity="info",
-                code="GROBID_ENRICHMENT_SKIPPED",
-                message="Optional GROBID paper enrichment was skipped.",
-                metadata=grobid_enrichment,
-            )
+        if isinstance(grobid_enrichment, dict):
+            grobid_status = grobid_enrichment.get("status")
+            if grobid_status == "skipped":
+                add_diagnostic(
+                    severity="info",
+                    code="GROBID_ENRICHMENT_SKIPPED",
+                    message="Optional GROBID paper enrichment was skipped.",
+                    metadata=grobid_enrichment,
+                )
+            elif grobid_status == "failed":
+                add_diagnostic(
+                    severity="warning",
+                    code="GROBID_ENRICHMENT_FAILED",
+                    message="Optional GROBID paper enrichment failed.",
+                    metadata=grobid_enrichment,
+                )
 
         with self._conn() as conn:
             conn.execute("DELETE FROM diagnostics WHERE doc_id = ?", (doc_id,))

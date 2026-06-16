@@ -204,6 +204,7 @@ class EbooklibEpubParser:
 
         outline: list[OutlineNode] = []
         toc_paths: dict[str, list[str]] = {}
+        toc_id_counts: dict[str, int] = {}
         toc_counter = 0
 
         def register_toc_entry(
@@ -212,8 +213,15 @@ class EbooklibEpubParser:
             nonlocal toc_counter
             href_path, fragment = _split_href(node_href)
             spine_ref = spine_href_to_id.get(href_path, href_path or None)
-            node_id = node_href or f"toc-{toc_counter}"
+            base_node_id = node_href or f"toc-{toc_counter}"
             toc_counter += 1
+            toc_id_count = toc_id_counts.get(base_node_id, 0) + 1
+            toc_id_counts[base_node_id] = toc_id_count
+            node_id = (
+                base_node_id
+                if toc_id_count == 1
+                else f"{base_node_id}::toc-{toc_id_count}"
+            )
             if href_path:
                 if href_path not in toc_paths:
                     toc_paths[href_path] = path

@@ -5,7 +5,11 @@ from pathlib import Path
 
 from PIL import Image
 
-from mcp_ebook_read.render.pdf_visuals import DoclingPdfVisualExtractor
+from mcp_ebook_read.render.pdf_visuals import (
+    DoclingPdfVisualExtractor,
+    _render_html_table,
+    _render_markdown_table,
+)
 from mcp_ebook_read.schema.models import ChunkRecord, Locator
 
 
@@ -47,6 +51,25 @@ class _FakeFrame:
     @property
     def values(self) -> _FakeValues:
         return _FakeValues(self._rows)
+
+
+def test_table_renderers_strip_xml_incompatible_control_chars() -> None:
+    headers = ["bad\x00header"]
+    rows = [["bad\x01cell"]]
+    caption = "bad\x02caption"
+
+    markdown = _render_markdown_table(headers, rows, caption=caption)
+    html = _render_html_table(headers, rows, caption=caption)
+
+    assert "\x00" not in markdown
+    assert "\x01" not in markdown
+    assert "\x02" not in markdown
+    assert "\x00" not in html
+    assert "\x01" not in html
+    assert "\x02" not in html
+    assert "bad header" in html
+    assert "bad cell" in html
+    assert "bad caption" in html
 
 
 class _FakeBBox:

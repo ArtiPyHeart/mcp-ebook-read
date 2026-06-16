@@ -7,6 +7,7 @@ import sqlite3
 from mcp_ebook_read.schema.models import (
     ChunkRecord,
     DocumentRecord,
+    DocumentStatus,
     DocumentType,
     FormulaRecord,
     ImageRecord,
@@ -350,6 +351,42 @@ def test_ingest_job_claim_and_expired_lease(tmp_path: Path) -> None:
     assert loaded.status == IngestJobStatus.FAILED
     assert loaded.stage == IngestStage.FAILED
     assert loaded.message == "Ingest job lease expired before completion."
+
+
+def test_document_graph_deduplicates_repeated_stable_refs(tmp_path: Path) -> None:
+    store = CatalogStore(tmp_path / "catalog.db")
+    doc_id = "duplicate-outline-doc"
+    store.upsert_scanned_document(
+        DocumentRecord(
+            doc_id=doc_id,
+            path=str((tmp_path / "duplicate.epub").resolve()),
+            type=DocumentType.EPUB,
+            sha256="a" * 64,
+            mtime=1.0,
+        )
+    )
+
+    store.save_document_parse_output(
+        doc_id=doc_id,
+        title="Duplicate Outline",
+        parser_chain=["test"],
+        metadata={},
+        outline=[
+            OutlineNode(id="shared-anchor", title="First", level=1),
+            OutlineNode(id="shared-anchor", title="Second", level=1),
+        ],
+        overall_confidence=None,
+        status=DocumentStatus.READY,
+    )
+
+    nodes = store.list_graph_nodes(doc_id=doc_id, kind="outline_node")
+
+    assert [node["stable_ref"] for node in nodes] == [
+        "outline:shared-anchor",
+        "outline:shared-anchor#dup-2",
+    ]
+    assert nodes[1]["metadata"]["original_stable_ref"] == "outline:shared-anchor"
+    assert nodes[1]["metadata"]["stable_ref_collision_index"] == 2
 
 
 def test_replace_chunks_and_window(tmp_path: Path) -> None:

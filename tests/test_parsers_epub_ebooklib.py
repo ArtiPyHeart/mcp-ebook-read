@@ -239,6 +239,55 @@ def test_epub_parse_splits_toc_anchor_sections_without_headings(
     assert "Second chapter body." in parsed.chunks[2].text
 
 
+def test_epub_parse_makes_duplicate_toc_hrefs_unique(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    parser = EbooklibEpubParser()
+    epub_path = tmp_path / "book.epub"
+    epub_path.write_bytes(b"epub")
+
+    chapter_html = b"""
+    <html><body>
+      <span id="filepos0001"></span>
+      <p>Shared anchor body.</p>
+    </body></html>
+    """
+    book = FakeEpubBook(
+        title="Duplicate TOC EPUB",
+        spine=[("text00000", "yes")],
+        items={
+            "text00000": FakeEpubItem(chapter_html, name="text00000.html"),
+        },
+        toc=[
+            epub.Link("text00000.html#filepos0001", "First", None),
+            epub.Link("text00000.html#filepos0001", "Second", None),
+            (
+                epub.Link("text00000.html#filepos0001", "Third", None),
+                [epub.Link("text00000.html#filepos0001", "Fourth", None)],
+            ),
+        ],
+    )
+    monkeypatch.setattr(
+        "mcp_ebook_read.parsers.epub_ebooklib.epub.read_epub", lambda _path: book
+    )
+
+    parsed = parser.parse(str(epub_path), "doc-duplicate-toc")
+
+    ids = [
+        parsed.outline[0].id,
+        parsed.outline[1].id,
+        parsed.outline[2].id,
+        parsed.outline[2].children[0].id,
+    ]
+    assert ids == [
+        "text00000.html#filepos0001",
+        "text00000.html#filepos0001::toc-2",
+        "text00000.html#filepos0001::toc-3",
+        "text00000.html#filepos0001::toc-4",
+    ]
+    assert len(ids) == len(set(ids))
+
+
 def test_epub_parse_extracts_images(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

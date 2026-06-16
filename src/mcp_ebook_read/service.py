@@ -3454,14 +3454,31 @@ class AppService:
                         },
                     )
                 grobid_metadata: dict[str, Any] = {}
+                grobid_succeeded = False
                 if self.grobid_client.base_url:
                     if stage_callback is not None:
                         stage_callback(
                             IngestStage.GROBID,
                             "Parsing optional PDF paper metadata with GROBID.",
                         )
-                    grobid_result = self.grobid_client.parse_fulltext(doc.path)
-                    grobid_metadata = dict(grobid_result.metadata)
+                    try:
+                        grobid_result = self.grobid_client.parse_fulltext(doc.path)
+                        grobid_metadata = dict(grobid_result.metadata)
+                        grobid_succeeded = True
+                    except Exception as exc:  # noqa: BLE001
+                        grobid_metadata = {
+                            "grobid_enrichment": {
+                                "status": "failed",
+                                "reason": "GROBID optional paper metadata parsing failed.",
+                                "impact": (
+                                    "Docling PDF ingest will still run; paper title, "
+                                    "abstract, DOI, bibliography count, and reference "
+                                    "enrichment fall back to lower-confidence local evidence."
+                                ),
+                                "base_url": self.grobid_client.base_url,
+                                "error": to_error_payload(exc),
+                            }
+                        }
                 else:
                     grobid_metadata = {
                         "grobid_enrichment": {
@@ -3501,7 +3518,7 @@ class AppService:
                     fast_preflight=pdf_fast_preflight,
                     diagnostic_preflight=pdf_diagnostic_preflight,
                 )
-                if self.grobid_client.base_url:
+                if grobid_succeeded:
                     parsed.parser_chain.append("grobid")
                     paper_metadata = grobid_metadata
                 else:

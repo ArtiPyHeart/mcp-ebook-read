@@ -1729,6 +1729,54 @@ def test_document_ingest_without_grobid_succeeds_with_diagnostic(
     )
 
 
+def test_document_ingest_with_grobid_failure_uses_local_fallback(
+    tmp_path: Path,
+) -> None:
+    doc_id = "docpaper-grobid-failed"
+    pdf_path = tmp_path / "paper-grobid-failed.pdf"
+    pdf_path.write_bytes(b"pdf")
+
+    grobid = RecordingGrobid(error=RuntimeError("grobid unavailable"))
+    fallback_parsed = _parsed(doc_id, title="Docling Fallback Paper", method="docling")
+    service = _build_service(
+        tmp_path,
+        pdf_parser=RecordingParser(result=fallback_parsed),
+        epub_parser=RecordingParser(result=_parsed("x", title="X", method="ebooklib")),
+        grobid=grobid,
+    )
+    _register_doc(service, doc_id, pdf_path, DocumentType.PDF, profile=Profile.PAPER)
+
+    queued = service.document_ingest(doc_id=doc_id, path=None, force=True)
+    result = _wait_for_ingest_job(
+        service,
+        doc_id=doc_id,
+        job_id=queued["job_id"],
+    )["result"]
+
+    assert result["parser_chain"] == ["docling"]
+    assert grobid.calls == [str(pdf_path.resolve())]
+
+    loaded_catalog = service._catalog_for_document_path(pdf_path)
+    loaded = loaded_catalog.get_document_by_id(doc_id)
+    assert loaded is not None
+    assert loaded.title == "Docling Fallback Paper"
+    assert loaded.metadata["grobid_enrichment"]["status"] == "failed"
+    assert (
+        loaded.metadata["grobid_enrichment"]["error"]["message"] == "grobid unavailable"
+    )
+    assert loaded.metadata["local_paper_metadata_fallback"]["status"] == "used"
+    assert loaded.metadata["paper_title"] == "Docling Fallback Paper"
+
+    explored = service.document_explore(
+        doc_id=doc_id, query="Docling Fallback", top_k=3
+    )
+    assert any(
+        diagnostic["code"] == "GROBID_ENRICHMENT_FAILED"
+        and diagnostic["severity"] == "warning"
+        for diagnostic in explored["diagnostics"]
+    )
+
+
 def test_document_ingest_failure_sets_failed_status(tmp_path: Path) -> None:
     doc_id = "docepub1"
     epub_path = tmp_path / "book.epub"
