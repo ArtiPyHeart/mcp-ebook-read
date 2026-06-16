@@ -435,8 +435,7 @@ class EbooklibEpubParser:
 
                 anchor_path = resolve_anchor_path(node_anchor)
                 if anchor_path and (
-                    anchor_path != current_section_path
-                    or node_anchor != current_anchor
+                    anchor_path != current_section_path or node_anchor != current_anchor
                 ):
                     flush_section()
                     current_section_path = anchor_path

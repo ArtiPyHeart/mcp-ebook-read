@@ -218,22 +218,21 @@ def test_epub_parse_splits_toc_anchor_sections_without_headings(
         ["Chapter One", "Section 1.1"],
         ["Chapter Two"],
     ]
-    assert [chunk.locator.epub_locator for chunk in parsed.chunks] == [
-        {
-            "spine_id": "text00000",
-            "href": "text00000.html",
-            "anchor": "filepos0001",
-        },
-        {
-            "spine_id": "text00000",
-            "href": "text00000.html",
-            "anchor": "filepos0002",
-        },
-        {
-            "spine_id": "text00000",
-            "href": "text00000.html",
-            "anchor": "filepos0003",
-        },
+    locators = [chunk.locator.epub_locator for chunk in parsed.chunks]
+    assert [
+        (locator["spine_id"], locator["href"], locator["anchor"])
+        for locator in locators
+    ] == [
+        ("text00000", "text00000.html", "filepos0001"),
+        ("text00000", "text00000.html", "filepos0002"),
+        ("text00000", "text00000.html", "filepos0003"),
+    ]
+    assert [locator["spine_index"] for locator in locators] == ["0", "0", "0"]
+    assert [locator["section_index"] for locator in locators] == ["0", "1", "2"]
+    assert [locator["cfi_like"] for locator in locators] == [
+        "epubcfi-like(/spine[1]/text00000.html/section[1]#filepos0001)",
+        "epubcfi-like(/spine[1]/text00000.html/section[2]#filepos0002)",
+        "epubcfi-like(/spine[1]/text00000.html/section[3]#filepos0003)",
     ]
     assert "First chapter body." in parsed.chunks[0].text
     assert "Nested section body." in parsed.chunks[1].text
