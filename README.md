@@ -109,7 +109,7 @@ Ingest finalization is staged. New parse artifacts are first written under a tem
 1. Choose a library root. For nested libraries, pass the top-level folder as `root`.
 2. For one known file, call `document_ingest` directly with `path` and preferably `root`.
 3. For bulk discovery or doc_id-only workflows after restart, use `library_scan(root=...)` or `storage_list_sidecars(root=...)`; omit `root` only when the project root is the intended library root.
-4. Use `document_ingest`; EPUB/PDF and book/paper mode are inferred from document metadata.
+4. Use `document_ingest`; `profile="auto"` infers EPUB/PDF and PDF book/paper mode from document metadata. Pass `profile="paper"` for PDF papers outside a `paper/` or `papers/` path, and `profile="book"` for PDF books that would otherwise be misclassified.
 5. Poll `document_ingest_status` until the job succeeds or fails.
 6. For cross-document questions, start with `library_explore(query=..., root=...)`.
 7. For one known ingested document, use `document_explore(doc_id, query)`.
@@ -237,7 +237,7 @@ uvx mcp-ebook-ingest-benchmark \
   --output .tmp/eval-results/ingest-smoke.json
 ```
 
-Use `--pdf-profile book` or `--pdf-profile paper` with `--manifest` when benchmarking a homogeneous PDF set. For mixed PDF books/papers, prefer `--profile-manifest` with one `paper|book|epub <path>` entry per line. `--pdf-profile auto` is only a benchmark reporting convenience; normal MCP usage should call `document_ingest`.
+Use `--pdf-profile book` or `--pdf-profile paper` with `--manifest` when benchmarking a homogeneous PDF set. For mixed PDF books/papers, prefer `--profile-manifest` with one `paper|book|epub <path>` entry per line. These profile hints are passed to the same `document_ingest(profile=...)` path used by MCP clients.
 
 ### Parser Engine Benchmark
 

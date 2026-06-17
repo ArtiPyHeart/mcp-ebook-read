@@ -774,6 +774,22 @@ class AppService:
                 return Profile.PAPER
         return Profile.BOOK
 
+    @staticmethod
+    def _parse_ingest_profile_override(profile: str | None) -> Profile | None:
+        requested = "auto" if profile is None else str(profile).strip().lower()
+        if requested == "auto":
+            return None
+        if requested in {Profile.BOOK.value, Profile.PAPER.value}:
+            return Profile(requested)
+        raise AppError(
+            ErrorCode.INGEST_UNSUPPORTED_TYPE,
+            "Unsupported document_ingest profile.",
+            details={
+                "profile": profile,
+                "supported_profiles": ["auto", Profile.BOOK.value, Profile.PAPER.value],
+            },
+        )
+
     def _compute_sha256(self, path: Path) -> str:
         h = hashlib.sha256()
         with path.open("rb") as f:
@@ -3837,13 +3853,26 @@ class AppService:
         path: str | None = None,
         root: str | None = None,
         force: bool = False,
+        profile: str | None = "auto",
     ) -> dict[str, Any]:
         doc, catalog = self._resolve_doc(doc_id, path, root)
+        profile_override = self._parse_ingest_profile_override(profile)
         if doc.type == DocumentType.EPUB:
+            if profile_override == Profile.PAPER:
+                raise AppError(
+                    ErrorCode.INGEST_UNSUPPORTED_TYPE,
+                    "EPUB ingest only supports the book profile.",
+                    details={
+                        "doc_id": doc.doc_id,
+                        "path": doc.path,
+                        "requested_profile": profile,
+                        "supported_profiles": ["auto", Profile.BOOK.value],
+                    },
+                )
             profile = Profile.BOOK
             expected_doc_type = DocumentType.EPUB
         elif doc.type == DocumentType.PDF:
-            profile = doc.profile
+            profile = profile_override or doc.profile
             expected_doc_type = DocumentType.PDF
         else:
             raise AppError(

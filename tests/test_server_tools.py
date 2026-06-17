@@ -9,7 +9,7 @@ from mcp_ebook_read import server
 def test_document_ingest_tool_wraps_success(
     monkeypatch,
 ) -> None:
-    calls: list[tuple[str | None, str | None, str | None, bool]] = []
+    calls: list[tuple[str | None, str | None, str | None, bool, str]] = []
 
     def ingest(
         *,
@@ -17,8 +17,9 @@ def test_document_ingest_tool_wraps_success(
         path: str | None,
         root: str | None,
         force: bool,
+        profile: str,
     ):
-        calls.append((doc_id, path, root, force))
+        calls.append((doc_id, path, root, force, profile))
         return {"doc_id": doc_id, "job_id": "job-1"}
 
     monkeypatch.setattr(
@@ -33,6 +34,7 @@ def test_document_ingest_tool_wraps_success(
         path="/tmp/book.pdf",
         root="/tmp/library",
         force=True,
+        profile="paper",
     )
 
     assert payload == {
@@ -41,7 +43,7 @@ def test_document_ingest_tool_wraps_success(
         "error": None,
         "trace_id": "trace-ingest",
     }
-    assert calls == [("doc1", "/tmp/book.pdf", "/tmp/library", True)]
+    assert calls == [("doc1", "/tmp/book.pdf", "/tmp/library", True, "paper")]
 
 
 def test_document_ingest_tool_wraps_error(monkeypatch) -> None:
@@ -51,11 +53,18 @@ def test_document_ingest_tool_wraps_error(monkeypatch) -> None:
         path: str | None,
         root: str | None,
         force: bool,
+        profile: str,
     ):
         raise AppError(
             ErrorCode.INGEST_DOC_NOT_FOUND,
             "document missing",
-            details={"path": path, "root": root, "doc_id": doc_id, "force": force},
+            details={
+                "path": path,
+                "root": root,
+                "doc_id": doc_id,
+                "force": force,
+                "profile": profile,
+            },
         )
 
     monkeypatch.setattr(
@@ -78,6 +87,7 @@ def test_document_ingest_tool_wraps_error(monkeypatch) -> None:
             "root": None,
             "doc_id": None,
             "force": False,
+            "profile": "auto",
         },
     }
 

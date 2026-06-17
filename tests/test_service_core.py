@@ -1031,6 +1031,80 @@ def test_document_ingest_success(tmp_path: Path) -> None:
     assert loaded.title == "PDF Book"
 
 
+def test_document_ingest_profile_override_paper_for_pdf_path_without_hint(
+    tmp_path: Path,
+) -> None:
+    pdf_path = tmp_path / "research" / "attention.pdf"
+    pdf_path.parent.mkdir()
+    pdf_path.write_bytes(b"pdf")
+    sha256 = hashlib.sha256(b"pdf").hexdigest()
+    doc_id = AppService._scanned_doc_id(pdf_path, sha256)
+    grobid = RecordingGrobid(metadata={"paper_title": "Explicit Paper"})
+    service = _build_service(
+        tmp_path,
+        pdf_parser=RecordingParser(
+            result=_parsed(doc_id, title="PDF Document", method="docling")
+        ),
+        epub_parser=RecordingParser(result=_parsed("x", title="X", method="ebooklib")),
+        grobid=grobid,
+    )
+
+    queued = service.document_ingest(
+        path=str(pdf_path),
+        force=True,
+        profile="paper",
+    )
+    result = _wait_for_ingest_job(
+        service,
+        doc_id=queued["doc_id"],
+        job_id=queued["job_id"],
+    )["result"]
+
+    assert queued["doc_id"] == doc_id
+    assert queued["profile"] == Profile.PAPER
+    assert result["profile"] == Profile.PAPER
+    assert grobid.calls == [str(pdf_path)]
+    catalog = service._catalog_for_document_path(pdf_path)
+    loaded = catalog.get_document_by_id(doc_id)
+    assert loaded is not None
+    assert loaded.profile == Profile.PAPER
+    assert loaded.title == "Explicit Paper"
+
+
+def test_document_ingest_rejects_invalid_profile(tmp_path: Path) -> None:
+    pdf_path = tmp_path / "book.pdf"
+    pdf_path.write_bytes(b"pdf")
+    service = _build_service(
+        tmp_path,
+        pdf_parser=RecordingParser(result=_parsed("x", title="X", method="docling")),
+        epub_parser=RecordingParser(result=_parsed("x", title="X", method="ebooklib")),
+        grobid=RecordingGrobid(),
+    )
+
+    with pytest.raises(AppError) as exc:
+        service.document_ingest(path=str(pdf_path), profile="article")
+
+    assert exc.value.code == ErrorCode.INGEST_UNSUPPORTED_TYPE
+    assert exc.value.details["supported_profiles"] == ["auto", "book", "paper"]
+
+
+def test_document_ingest_rejects_paper_profile_for_epub(tmp_path: Path) -> None:
+    epub_path = tmp_path / "book.epub"
+    epub_path.write_bytes(b"epub")
+    service = _build_service(
+        tmp_path,
+        pdf_parser=RecordingParser(result=_parsed("x", title="X", method="docling")),
+        epub_parser=RecordingParser(result=_parsed("x", title="X", method="ebooklib")),
+        grobid=RecordingGrobid(),
+    )
+
+    with pytest.raises(AppError) as exc:
+        service.document_ingest(path=str(epub_path), profile="paper")
+
+    assert exc.value.code == ErrorCode.INGEST_UNSUPPORTED_TYPE
+    assert exc.value.details["supported_profiles"] == ["auto", "book"]
+
+
 def test_document_ingest_persists_fast_preflight_metadata(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

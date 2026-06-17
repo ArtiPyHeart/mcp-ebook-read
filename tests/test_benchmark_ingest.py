@@ -10,10 +10,15 @@ from mcp_ebook_read.benchmark.ingest import (
 class FakeIngestService:
     def __init__(self) -> None:
         self.default_library_root = Path.cwd()
-        self.calls: list[tuple[str, str, str | None, bool]] = []
+        self.calls: list[tuple[str, str, str | None, bool, str]] = []
 
     def _submit(
-        self, operation: str, path: str | None, root: str | None, force: bool
+        self,
+        operation: str,
+        path: str | None,
+        root: str | None,
+        force: bool,
+        profile: str,
     ) -> dict[str, Any]:
         assert path is not None
         source = Path(path)
@@ -21,7 +26,7 @@ class FakeIngestService:
         sidecar.mkdir(exist_ok=True)
         (sidecar / "catalog.db").write_text("fake", encoding="utf-8")
         doc_id = source.stem
-        self.calls.append((operation, str(source), root, force))
+        self.calls.append((operation, str(source), root, force, profile))
         return {
             "doc_id": doc_id,
             "job_id": f"job-{doc_id}",
@@ -31,10 +36,16 @@ class FakeIngestService:
         }
 
     def document_ingest(
-        self, *, doc_id: str | None, path: str | None, root: str | None, force: bool
+        self,
+        *,
+        doc_id: str | None,
+        path: str | None,
+        root: str | None,
+        force: bool,
+        profile: str = "auto",
     ) -> dict[str, Any]:
         assert doc_id is None
-        return self._submit("document_ingest", path, root, force)
+        return self._submit("document_ingest", path, root, force, profile)
 
     def document_ingest_status(
         self, doc_id: str, job_id: str | None = None
@@ -171,6 +182,12 @@ def test_profile_manifest_routes_mixed_pdf_profiles_with_space_paths(
         "market making paper.pdf": "paper",
         "book.pdf": "book",
         "book with spaces.epub": "epub",
+    }
+    submitted_profiles = {Path(call[1]).name: call[4] for call in service.calls}
+    assert submitted_profiles == {
+        "market making paper.pdf": "paper",
+        "book.pdf": "book",
+        "book with spaces.epub": "auto",
     }
 
 

@@ -35,7 +35,13 @@ class ProfiledDocument:
 
 class IngestServiceProtocol(Protocol):
     def document_ingest(
-        self, *, doc_id: str | None, path: str | None, root: str | None, force: bool
+        self,
+        *,
+        doc_id: str | None,
+        path: str | None,
+        root: str | None,
+        force: bool,
+        profile: str = "auto",
     ) -> dict[str, Any]: ...
 
     def document_ingest_status(
@@ -113,10 +119,12 @@ def _submit_ingest(
     path: Path,
     root: Path,
     force: bool,
+    profile: str = "auto",
 ) -> tuple[str, dict[str, Any]]:
     suffix = path.suffix.lower()
     if suffix not in {".epub", ".pdf"}:
         raise ValueError(f"Unsupported ingest benchmark document type: {suffix}")
+    ingest_profile = profile if suffix == ".pdf" else "auto"
     return (
         "document_ingest",
         service.document_ingest(
@@ -124,6 +132,7 @@ def _submit_ingest(
             path=str(path),
             root=str(root),
             force=force,
+            profile=ingest_profile,
         ),
     )
 
@@ -218,6 +227,7 @@ def run_service_ingest_benchmark(
                     path=path,
                     root=effective_root,
                     force=force,
+                    profile=path_profile or pdf_profile,
                 )
                 doc_id = str(submitted["doc_id"])
                 job_id = str(submitted["job_id"])

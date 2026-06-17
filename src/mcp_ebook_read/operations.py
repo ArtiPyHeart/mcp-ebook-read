@@ -127,8 +127,15 @@ def document_ingest(
     path: str | None = None,
     root: str | None = None,
     force: bool = False,
+    profile: Literal["auto", "book", "paper"] = "auto",
 ) -> dict[str, Any]:
-    return _service().document_ingest(doc_id=doc_id, path=path, root=root, force=force)
+    return _service().document_ingest(
+        doc_id=doc_id,
+        path=path,
+        root=root,
+        force=force,
+        profile=profile,
+    )
 
 
 def document_ingest_status(doc_id: str, job_id: str | None = None) -> dict[str, Any]:

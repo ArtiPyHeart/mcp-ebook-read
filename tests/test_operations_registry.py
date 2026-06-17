@@ -72,7 +72,7 @@ def test_llm_descriptions_pin_reading_routing_language() -> None:
     assert "EPUB/PDF document" in descriptions["document_ingest"]
     assert "whole-library initialization" in descriptions["library_ingest_documents"]
     assert "whole-library ingest dashboard" in descriptions["library_ingest_status"]
-    assert "inferred from document metadata" in descriptions["document_ingest"]
+    assert "profile='paper'" in descriptions["document_ingest"]
     assert "already-ingested root sidecar" in descriptions["library_explore"]
     assert "infers EPUB/PDF/book/paper mode" in descriptions["document_explore"]
     assert "DocumentGraph node" in descriptions["document_node"]
