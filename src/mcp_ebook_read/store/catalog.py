@@ -2314,13 +2314,21 @@ class CatalogStore:
         self, doc_id: str, job_id: str | None = None
     ) -> IngestJobRecord | None:
         with self._conn() as conn:
-            if job_id:
+            if job_id and doc_id:
                 row = conn.execute(
                     """
                     SELECT * FROM ingest_jobs
                     WHERE doc_id = ? AND job_id = ?
                     """,
                     (doc_id, job_id),
+                ).fetchone()
+            elif job_id:
+                row = conn.execute(
+                    """
+                    SELECT * FROM ingest_jobs
+                    WHERE job_id = ?
+                    """,
+                    (job_id,),
                 ).fetchone()
             else:
                 row = conn.execute(
@@ -2477,6 +2485,74 @@ class CatalogStore:
                     finished_at,
                 ),
             )
+            return cursor.rowcount
+
+    def cancel_active_ingest_jobs_for_owner(
+        self,
+        *,
+        owner_id: str,
+        now: str | None = None,
+        message: str = "MCP service closed before ingest completed.",
+        progress: dict[str, Any] | None = None,
+    ) -> int:
+        finished_at = now or datetime.now(UTC).isoformat()
+        with self._conn() as conn:
+            canceled_rows = conn.execute(
+                """
+                SELECT doc_id FROM ingest_jobs
+                WHERE owner_id = ?
+                  AND status IN (?, ?)
+                """,
+                (
+                    owner_id,
+                    IngestJobStatus.QUEUED,
+                    IngestJobStatus.RUNNING,
+                ),
+            ).fetchall()
+            cursor = conn.execute(
+                """
+                UPDATE ingest_jobs
+                SET status = ?,
+                    stage = ?,
+                    message = ?,
+                    progress_json = COALESCE(?, progress_json),
+                    updated_at = ?,
+                    finished_at = ?,
+                    heartbeat_at = ?,
+                    lease_expires_at = NULL
+                WHERE owner_id = ?
+                  AND status IN (?, ?)
+                """,
+                (
+                    IngestJobStatus.CANCELED,
+                    IngestStage.CANCELED,
+                    message,
+                    json.dumps(progress) if progress is not None else None,
+                    finished_at,
+                    finished_at,
+                    finished_at,
+                    owner_id,
+                    IngestJobStatus.QUEUED,
+                    IngestJobStatus.RUNNING,
+                ),
+            )
+            canceled_doc_ids = [row["doc_id"] for row in canceled_rows]
+            if canceled_doc_ids:
+                placeholders = ", ".join("?" for _ in canceled_doc_ids)
+                conn.execute(
+                    f"""
+                    UPDATE documents
+                    SET status = ?, updated_at = ?
+                    WHERE doc_id IN ({placeholders})
+                      AND status = ?
+                    """,
+                    (
+                        DocumentStatus.FAILED,
+                        finished_at,
+                        *canceled_doc_ids,
+                        DocumentStatus.INGESTING,
+                    ),
+                )
             return cursor.rowcount
 
     def update_ingest_job(

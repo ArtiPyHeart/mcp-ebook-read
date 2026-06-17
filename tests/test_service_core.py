@@ -1646,6 +1646,80 @@ def test_service_close_closes_pdf_parser_once(tmp_path: Path) -> None:
     assert parser.close_calls == 1
 
 
+def test_service_close_cancels_owned_active_ingest_jobs(tmp_path: Path) -> None:
+    doc_id = "doc-close-cancel"
+    pdf_path = tmp_path / "close-cancel.pdf"
+    pdf_path.write_bytes(b"pdf")
+    parser = BlockingParser(result=_parsed(doc_id, title="Queued", method="docling"))
+    service = _build_service(
+        tmp_path,
+        pdf_parser=parser,
+        epub_parser=RecordingParser(result=_parsed("x", title="X", method="ebooklib")),
+        grobid=RecordingGrobid(),
+    )
+    _register_doc(service, doc_id, pdf_path, DocumentType.PDF)
+
+    queued = service.document_ingest(doc_id=doc_id, path=None, force=True)
+    assert parser.started.wait(timeout=2.0)
+
+    service.close()
+    canceled = service.document_ingest_status(doc_id=doc_id, job_id=queued["job_id"])
+    assert canceled["status"] == IngestJobStatus.CANCELED
+    assert canceled["stage"] == IngestStage.CANCELED
+    assert canceled["lease_expires_at"] is None
+    assert canceled["progress"]["stage"] == IngestStage.CANCELED
+
+    parser.release.set()
+    time.sleep(0.1)
+    still_canceled = service.document_ingest_status(
+        doc_id=doc_id,
+        job_id=queued["job_id"],
+    )
+    assert still_canceled["status"] == IngestJobStatus.CANCELED
+    loaded = service._catalog_for_document_path(pdf_path).get_document_by_id(doc_id)
+    assert loaded is not None
+    assert loaded.status == DocumentStatus.FAILED
+
+
+def test_service_close_during_finalize_does_not_leave_ready_document(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    doc_id = "doc-close-finalize"
+    pdf_path = tmp_path / "close-finalize.pdf"
+    pdf_path.write_bytes(b"pdf")
+    service = _build_service(
+        tmp_path,
+        pdf_parser=RecordingParser(
+            result=_parsed(doc_id, title="Should Not Be Ready", method="docling")
+        ),
+        epub_parser=RecordingParser(result=_parsed("x", title="X", method="ebooklib")),
+        grobid=RecordingGrobid(),
+    )
+    _register_doc(service, doc_id, pdf_path, DocumentType.PDF)
+    original_set_job_stage = service._set_job_stage
+
+    def closing_set_job_stage(*args: Any, **kwargs: Any) -> None:
+        original_set_job_stage(*args, **kwargs)
+        if kwargs.get("stage") == IngestStage.FINALIZE:
+            service.close()
+
+    monkeypatch.setattr(service, "_set_job_stage", closing_set_job_stage)
+
+    queued = service.document_ingest(doc_id=doc_id, path=None, force=True)
+    canceled = _wait_for_ingest_job(
+        service,
+        doc_id=doc_id,
+        job_id=queued["job_id"],
+    )
+
+    assert canceled["status"] == IngestJobStatus.CANCELED
+    loaded = service._catalog_for_document_path(pdf_path).get_document_by_id(doc_id)
+    assert loaded is not None
+    assert loaded.status == DocumentStatus.FAILED
+    assert loaded.title != "Should Not Be Ready"
+
+
 def test_document_ingest_cached_ready_without_force(tmp_path: Path) -> None:
     doc_id = "docpdf2"
     pdf_path = tmp_path / "cached.pdf"
@@ -2004,6 +2078,55 @@ def test_document_ingest_jobs_deduplicate_and_list_status(tmp_path: Path) -> Non
     assert listed["doc_id"] == doc_id
     assert listed["jobs"][0]["job_id"] == first["job_id"]
     assert listed["jobs"][0]["progress"]["stage"] == IngestStage.COMPLETED
+
+
+def test_document_ingest_rejects_conflicting_active_profile(tmp_path: Path) -> None:
+    doc_id = "doc-job-profile-conflict"
+    pdf_path = tmp_path / "profile-conflict.pdf"
+    pdf_path.write_bytes(b"pdf")
+
+    parser = BlockingParser(result=_parsed(doc_id, title="Queued", method="docling"))
+    service = _build_service(
+        tmp_path,
+        pdf_parser=parser,
+        epub_parser=RecordingParser(result=_parsed("x", title="X", method="ebooklib")),
+        grobid=RecordingGrobid(),
+    )
+    _register_doc(service, doc_id, pdf_path, DocumentType.PDF)
+
+    first = service.document_ingest(
+        doc_id=doc_id,
+        path=None,
+        force=True,
+        profile="paper",
+    )
+    assert parser.started.wait(timeout=2.0)
+
+    try:
+        with pytest.raises(AppError) as exc:
+            service.document_ingest(
+                doc_id=doc_id,
+                path=None,
+                force=True,
+                profile="book",
+            )
+
+        assert exc.value.code == ErrorCode.INGEST_JOB_CONFLICT
+        assert exc.value.details["doc_id"] == doc_id
+        assert exc.value.details["requested_profile"] == Profile.BOOK
+        assert exc.value.details["active_profile"] == Profile.PAPER
+        assert exc.value.details["active_job_id"] == first["job_id"]
+    finally:
+        parser.release.set()
+
+    completed = _wait_for_ingest_job(
+        service,
+        doc_id=doc_id,
+        job_id=first["job_id"],
+    )
+    assert completed["status"] == IngestJobStatus.SUCCEEDED
+    listed = service.document_ingest_list_jobs(doc_id=doc_id, limit=10)
+    assert [job["job_id"] for job in listed["jobs"]] == [first["job_id"]]
 
 
 def test_document_ingest_worker_uses_queued_catalog_for_duplicate_doc_ids(
@@ -2772,6 +2895,11 @@ def test_doctor_health_check_reports_sidecar_findings(tmp_path: Path) -> None:
         status=DocumentStatus.READY,
     )
     catalog.set_document_status(doc_id, DocumentStatus.READY, profile=Profile.BOOK)
+    catalog.update_document_source_metadata(
+        doc_id=doc_id,
+        sha256=hashlib.sha256(pdf_path.read_bytes()).hexdigest(),
+        mtime=pdf_path.stat().st_mtime,
+    )
     catalog.replace_images(
         doc_id,
         [
@@ -2799,9 +2927,49 @@ def test_doctor_health_check_reports_sidecar_findings(tmp_path: Path) -> None:
     }
     finding_codes = {finding["code"] for finding in result["findings"]}
     assert "READY_DOCUMENT_HAS_NO_CHUNKS" in finding_codes
-    assert "DOCUMENT_PIPELINE_STALE" in finding_codes
+    assert "DOCUMENT_PIPELINE_STALE" not in finding_codes
     assert "MISSING_IMAGE_ARTIFACT" in finding_codes
     assert "ORPHAN_DOC_ARTIFACT_DIR" in finding_codes
+
+
+def test_doctor_health_check_reports_source_file_changed(tmp_path: Path) -> None:
+    doc_id = "doc-doctor-source-changed"
+    pdf_path = tmp_path / "doctor-source.pdf"
+    pdf_path.write_bytes(b"pdf")
+    service = _build_service(
+        tmp_path,
+        pdf_parser=RecordingParser(
+            result=_parsed(doc_id, title="PDF", method="docling")
+        ),
+        epub_parser=RecordingParser(result=_parsed("x", title="X", method="ebooklib")),
+        grobid=RecordingGrobid(),
+    )
+    _register_doc(service, doc_id, pdf_path, DocumentType.PDF)
+    catalog = service._catalog_for_document_path(pdf_path)
+    catalog.save_document_parse_output(
+        doc_id=doc_id,
+        title="Doctor",
+        parser_chain=["docling"],
+        metadata={},
+        outline=[OutlineNode(id="n", title="N", level=1)],
+        overall_confidence=0.8,
+        status=DocumentStatus.READY,
+    )
+    catalog.set_document_status(doc_id, DocumentStatus.READY, profile=Profile.BOOK)
+    catalog.update_document_source_metadata(
+        doc_id=doc_id,
+        sha256=hashlib.sha256(pdf_path.read_bytes()).hexdigest(),
+        mtime=pdf_path.stat().st_mtime,
+    )
+
+    previous_mtime = pdf_path.stat().st_mtime
+    pdf_path.write_bytes(b"changed")
+    os.utime(pdf_path, (previous_mtime + 10, previous_mtime + 10))
+
+    result = service.doctor_health_check(root=str(tmp_path))
+
+    finding_codes = {finding["code"] for finding in result["findings"]}
+    assert "DOCUMENT_PIPELINE_STALE" in finding_codes
 
 
 def test_get_outline_and_render_errors(tmp_path: Path) -> None:

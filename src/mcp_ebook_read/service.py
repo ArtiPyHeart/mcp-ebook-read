@@ -150,6 +150,17 @@ class AppService:
         if self._closed:
             return
         self._closed = True
+        cancel_progress = self._ingest_progress(
+            stage=IngestStage.CANCELED,
+            message="MCP service closed before ingest completed.",
+        )
+        with self._ingest_lock:
+            for catalog in self._catalogs.values():
+                catalog.cancel_active_ingest_jobs_for_owner(
+                    owner_id=self._ingest_owner_id,
+                    message="MCP service closed before ingest completed.",
+                    progress=cancel_progress,
+                )
         self.pdf_parser.close()
         close_visual_extractor = getattr(self.pdf_visual_extractor, "close", None)
         if callable(close_visual_extractor):
@@ -1665,7 +1676,14 @@ class AppService:
                                 "hint": "Run storage_cleanup_sidecars(root=...) to prune missing documents.",
                             }
                         )
-                    if pipeline_status["is_stale"]:
+                    # Doctor should report user-visible readability risks, not every
+                    # internal pipeline version drift. Re-enable digest/version
+                    # staleness findings only when a future breaking migration makes
+                    # old sidecars unsafe to read.
+                    if (
+                        pipeline_status["is_stale"]
+                        and pipeline_status.get("reason") == "source_file_changed"
+                    ):
                         findings.append(
                             {
                                 "severity": "warning",
@@ -1738,6 +1756,18 @@ class AppService:
         }
         heartbeat_at = self._now_iso()
         with self._ingest_lock:
+            current = catalog.get_ingest_job("", job_id)
+            if (
+                current is not None
+                and current.status
+                in {
+                    IngestJobStatus.SUCCEEDED,
+                    IngestJobStatus.FAILED,
+                    IngestJobStatus.CANCELED,
+                }
+                and current.status != status
+            ):
+                return
             catalog.update_ingest_job(
                 job_id,
                 status=status,
@@ -1780,6 +1810,24 @@ class AppService:
             active = catalog.get_active_ingest_job(doc.doc_id)
             if active is not None and active.profile == profile:
                 return self._ingest_job_payload(active, deduplicated=True)
+            if active is not None:
+                raise AppError(
+                    ErrorCode.INGEST_JOB_CONFLICT,
+                    "Document already has an active ingest job with a different profile.",
+                    details={
+                        "doc_id": doc.doc_id,
+                        "path": doc.path,
+                        "requested_profile": profile,
+                        "active_profile": active.profile,
+                        "active_job_id": active.job_id,
+                        "active_status": active.status,
+                        "active_stage": active.stage,
+                        "hint": (
+                            "Poll document_ingest_status for the active job and "
+                            "retry with force=true after it reaches a terminal state."
+                        ),
+                    },
+                )
 
             if (
                 doc.status == DocumentStatus.READY
@@ -1826,6 +1874,7 @@ class AppService:
                     stage=IngestStage.QUEUED,
                     message=message,
                 ),
+                owner_id=self._ingest_owner_id,
                 created_at=now,
                 updated_at=now,
             )
@@ -1940,6 +1989,8 @@ class AppService:
         )
 
         def stage_callback(stage: IngestStage, message: str) -> None:
+            if self._closed:
+                raise RuntimeError("MCP service closed before ingest completed.")
             self._set_job_stage(
                 catalog=catalog,
                 job_id=item.job_id,
@@ -1971,6 +2022,14 @@ class AppService:
                 stage_callback=stage_callback,
             )
         except Exception as exc:  # noqa: BLE001
+            current = catalog.get_ingest_job(item.doc_id, item.job_id)
+            if current is not None and current.status == IngestJobStatus.CANCELED:
+                catalog.set_document_status(
+                    item.doc_id,
+                    DocumentStatus.FAILED,
+                    profile=current.profile,
+                )
+                return
             error = to_error_payload(exc)
             error["traceback"] = traceback.format_exc()
             self._set_job_stage(
@@ -1997,6 +2056,14 @@ class AppService:
             )
             return
 
+        current = catalog.get_ingest_job(item.doc_id, item.job_id)
+        if current is not None and current.status == IngestJobStatus.CANCELED:
+            catalog.set_document_status(
+                item.doc_id,
+                DocumentStatus.FAILED,
+                profile=current.profile,
+            )
+            return
         self._set_job_stage(
             catalog=catalog,
             job_id=item.job_id,
@@ -3759,6 +3826,8 @@ class AppService:
             staged_catalog: CatalogStore | None = None
             backup_workspace_dir: Path | None = None
             with self._ingest_lock:
+                if self._closed:
+                    raise RuntimeError("MCP service closed before ingest finalized.")
                 staged_catalog = catalog.create_staging_copy(
                     suffix=f"{doc.doc_id}-{uuid4().hex}"
                 )
